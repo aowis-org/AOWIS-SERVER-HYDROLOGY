@@ -31,10 +31,12 @@ add_library(aowis-hydrology-core STATIC
     src/core/depression_archive.cpp
     src/core/rainfall.cpp
     src/core/redistribution.cpp
+    src/core/spill_geometry.cpp
     src/core/redistribution_archive.cpp
     src/core/inundation.cpp
     include/aowis/hydrology/rainfall.h
     include/aowis/hydrology/redistribution.h
+    include/aowis/hydrology/spill_geometry.h
     include/aowis/hydrology/redistribution_archive.h
     include/aowis/hydrology/inundation.h
     include/aowis/hydrology/depression_archive.h
@@ -145,6 +147,11 @@ if(BUILD_TESTING)
     target_link_libraries(aowis-hydrology-sibling-allocation-test PRIVATE AOWIS::Hydrology)
     add_test(NAME aowis-hydrology-sibling-allocation COMMAND aowis-hydrology-sibling-allocation-test)
     set_tests_properties(aowis-hydrology-sibling-allocation PROPERTIES LABELS "hydrology;aowis")
+
+    add_executable(aowis-hydrology-spill-geometry-test tests/test_spill_geometry.cpp)
+    target_link_libraries(aowis-hydrology-spill-geometry-test PRIVATE AOWIS::Hydrology)
+    add_test(NAME aowis-hydrology-spill-geometry COMMAND aowis-hydrology-spill-geometry-test)
+    set_tests_properties(aowis-hydrology-spill-geometry PROPERTIES LABELS "hydrology;aowis")
 
     add_executable(aowis-hydrology-inundation-test tests/test_inundation.cpp)
     target_link_libraries(aowis-hydrology-inundation-test PRIVATE AOWIS::Hydrology)
