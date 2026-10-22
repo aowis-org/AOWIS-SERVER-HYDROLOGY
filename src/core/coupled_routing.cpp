@@ -12,6 +12,7 @@ namespace Aowis::Hydrology
 namespace
 {
 constexpr double BalanceTolerance = 1e-9;
+constexpr double GravityMPerSecondSquared = 9.80665;
 
 void require(bool valid, const char *message)
 {
@@ -56,6 +57,19 @@ double levelAt(const SpillReservoirCurve &curve, double volume)
         (upper->water_level_m - lower.water_level_m);
 }
 
+// Free broad-crested outlet rating (same rectangular critical-flow formula
+// as rateBroadCrestedSpill). It is deliberately NOT a DEM junction: boundary
+// geometry and the permanently free downstream condition are supplied.
+double outletDischarge(const CoupledBoundaryOutlet &outlet, double level)
+{
+    if (level <= outlet.crest_elevation_m) return 0.0;
+    const double depth = (2.0 / 3.0) * (level - outlet.crest_elevation_m);
+    const double rate = outlet.discharge_factor * outlet.effective_width_m *
+        std::sqrt(GravityMPerSecondSquared) * depth * std::sqrt(depth);
+    require(std::isfinite(rate), "Boundary discharge exceeds numeric range");
+    return rate;
+}
+
 struct ConnectionIndices
 {
     std::size_t first = 0;
@@ -66,14 +80,18 @@ CoupledRoutingSnapshot snapshot(double elapsed_seconds,
                                 const std::vector<double> &storage,
                                 const std::vector<CoupledReservoir> &reservoirs,
                                 const std::vector<double> &transfer,
+                                const std::vector<double> &outflow,
                                 long double initial_total,
-                                long double cumulative_inflow)
+                                long double cumulative_inflow,
+                                long double cumulative_outflow)
 {
     CoupledRoutingSnapshot result;
     result.elapsed_seconds = elapsed_seconds;
     result.storage_m3 = storage;
     result.connection_transfer_m3 = transfer;
     result.cumulative_inflow_m3 = static_cast<double>(cumulative_inflow);
+    result.boundary_outflow_m3 = outflow;
+    result.cumulative_boundary_outflow_m3 = static_cast<double>(cumulative_outflow);
     result.water_level_m.reserve(storage.size());
     long double total = 0.0L;
     for (std::size_t i = 0; i < storage.size(); ++i)
@@ -82,8 +100,9 @@ CoupledRoutingSnapshot snapshot(double elapsed_seconds,
         total += static_cast<long double>(storage[i]);
     }
     result.total_storage_m3 = static_cast<double>(total);
-    result.mass_balance_error_m3 = static_cast<double>(total - initial_total - cumulative_inflow);
-    const long double scale = std::max({1.0L, initial_total, cumulative_inflow});
+    result.mass_balance_error_m3 = static_cast<double>(
+        total + cumulative_outflow - initial_total - cumulative_inflow);
+    const long double scale = std::max({1.0L, initial_total, cumulative_inflow, cumulative_outflow});
     if (!std::isfinite(result.mass_balance_error_m3) ||
         std::abs(static_cast<long double>(result.mass_balance_error_m3)) >
             static_cast<long double>(BalanceTolerance) * scale)
@@ -92,15 +111,17 @@ CoupledRoutingSnapshot snapshot(double elapsed_seconds,
 }
 } // namespace
 
-CoupledRoutingResult routeCoupledReservoirs(
+CoupledRoutingResult routeCoupledReservoirsWithOutlets(
     const std::vector<CoupledReservoir> &reservoirs,
     const std::vector<CoupledConnection> &connections,
+    const std::vector<CoupledBoundaryOutlet> &boundary_outlets,
     const std::vector<CoupledInflowInterval> &inflow_intervals,
     const CoupledRoutingOptions &options,
     const std::atomic<bool> *cancel_requested)
 {
     require(!reservoirs.empty() && reservoirs.size() <= 100000 &&
             connections.size() <= 200000 &&
+            boundary_outlets.size() <= 200000 - connections.size() &&
             inflow_intervals.size() <= options.maximum_output_intervals &&
             inflow_intervals.size() <= 100000,
             "Coupled routing configuration exceeds size limits");
@@ -171,6 +192,30 @@ CoupledRoutingResult routeCoupledReservoirs(
         indices.push_back({first->second, second->second});
     }
 
+    // The exterior is a one-way mass sink, not an artificial reservoir with
+    // an unlimited or inferred stage-storage curve. A free downstream water
+    // surface is essential; reverse flow and backwater are not approximated.
+    std::vector<std::size_t> outlet_indices;
+    outlet_indices.reserve(boundary_outlets.size());
+    for (const CoupledBoundaryOutlet &outlet : boundary_outlets)
+    {
+        const std::unordered_map<std::uint64_t, std::size_t>::const_iterator found =
+            lookup.find(outlet.reservoir_component_index);
+        require(found != lookup.end(), "Boundary outlet references unknown reservoir");
+        require(std::isfinite(outlet.crest_elevation_m) &&
+                std::isfinite(outlet.downstream_water_level_m) &&
+                outlet.downstream_water_level_m < outlet.crest_elevation_m &&
+                std::isfinite(outlet.effective_width_m) && outlet.effective_width_m > 0.0 &&
+                std::isfinite(outlet.discharge_factor) &&
+                outlet.discharge_factor > 0.0 && outlet.discharge_factor <= 1.0,
+                "Invalid free-overflow boundary control or downstream water level");
+        const SpillReservoirCurve &curve = reservoirs[found->second].curve;
+        require(outlet.crest_elevation_m >= curve.points.front().water_level_m &&
+                outlet.crest_elevation_m < curve.points.back().water_level_m,
+                "Boundary outlet crest is outside the reservoir stage-storage curve");
+        outlet_indices.push_back(found->second);
+    }
+
     long double total_duration = 0.0L;
     for (const CoupledInflowInterval &interval : inflow_intervals)
     {
@@ -188,12 +233,16 @@ CoupledRoutingResult routeCoupledReservoirs(
     CoupledRoutingResult result;
     result.snapshots.reserve(inflow_intervals.size() + 1);
     std::vector<double> transferred(connections.size(), 0.0);
+    std::vector<double> outlet_totals(boundary_outlets.size(), 0.0);
+    long double cumulative_outflow = 0.0L;
     long double inflow_total = 0.0L;
     double time = 0.0;
     result.snapshots.push_back(snapshot(time, storage, reservoirs, transferred,
-                                        initial_total, inflow_total));
+                                        outlet_totals, initial_total, inflow_total,
+                                        cumulative_outflow));
     std::vector<double> changes(reservoirs.size(), 0.0);
     std::vector<double> proposed(connections.size(), 0.0);
+    std::vector<double> proposed_outflow(boundary_outlets.size(), 0.0);
     std::vector<double> candidate(storage.size(), 0.0);
     std::vector<double> current_levels(storage.size(), 0.0);
     std::vector<double> candidate_levels(storage.size(), 0.0);
@@ -238,6 +287,18 @@ CoupledRoutingResult routeCoupledReservoirs(
                     require(std::isfinite(proposed[c]), "Nonfinite coupled transfer volume");
                     changes[ends.first] -= proposed[c];
                     changes[ends.second] += proposed[c];
+                }
+                // All exterior controls use the same START stages as all
+                // internal controls; their subtraction happens only in the
+                // candidate state, never incrementally by outlet order.
+                for (std::size_t o = 0; o < boundary_outlets.size(); ++o)
+                {
+                    const std::size_t reservoir_index = outlet_indices[o];
+                    proposed_outflow[o] = outletDischarge(
+                        boundary_outlets[o], current_levels[reservoir_index]) * step;
+                    require(std::isfinite(proposed_outflow[o]),
+                            "Nonfinite external boundary transfer volume");
+                    changes[reservoir_index] -= proposed_outflow[o];
                 }
                 bool acceptable = true;
                 for (std::size_t i = 0; i < reservoirs.size(); ++i)
@@ -284,11 +345,30 @@ CoupledRoutingResult routeCoupledReservoirs(
                 }
                 if (acceptable)
                 {
+                    for (std::size_t o = 0; o < boundary_outlets.size(); ++o)
+                    {
+                        if (proposed_outflow[o] == 0.0) continue;
+                        const std::size_t reservoir_index = outlet_indices[o];
+                        const double tolerance = 1e-12 *
+                            std::max({1.0, std::abs(current_levels[reservoir_index]),
+                                      std::abs(boundary_outlets[o].crest_elevation_m)});
+                        if (candidate_levels[reservoir_index] + tolerance <
+                            boundary_outlets[o].crest_elevation_m)
+                            acceptable = false;
+                    }
+                }
+                if (acceptable)
+                {
                     // Update all reservoirs simultaneously; no earlier edge in
                     // the vector receives a head-start over later edges.
                     storage.swap(candidate);
                     for (std::size_t c = 0; c < transferred.size(); ++c)
                         transferred[c] += proposed[c];
+                    for (std::size_t o = 0; o < outlet_totals.size(); ++o)
+                    {
+                        outlet_totals[o] += proposed_outflow[o];
+                        cumulative_outflow += static_cast<long double>(proposed_outflow[o]);
+                    }
                     for (std::size_t i = 0; i < reservoirs.size(); ++i)
                         inflow_total += static_cast<long double>(interval.inflow_volume_m3[i]) *
                             static_cast<long double>(step / interval.duration_seconds);
@@ -306,9 +386,21 @@ CoupledRoutingResult routeCoupledReservoirs(
         }
         time += interval.duration_seconds;
         result.snapshots.push_back(snapshot(time, storage, reservoirs, transferred,
-                                            initial_total, inflow_total));
+                                            outlet_totals, initial_total, inflow_total,
+                                            cumulative_outflow));
     }
     return result;
+}
+
+CoupledRoutingResult routeCoupledReservoirs(
+    const std::vector<CoupledReservoir> &reservoirs,
+    const std::vector<CoupledConnection> &connections,
+    const std::vector<CoupledInflowInterval> &inflow_intervals,
+    const CoupledRoutingOptions &options,
+    const std::atomic<bool> *cancel_requested)
+{
+    return routeCoupledReservoirsWithOutlets(reservoirs, connections, {},
+                                            inflow_intervals, options, cancel_requested);
 }
 
 } // namespace Aowis::Hydrology

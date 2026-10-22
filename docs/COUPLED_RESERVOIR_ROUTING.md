@@ -17,19 +17,20 @@ Each reservoir `i` has a monotone stage–storage relationship `S_i(h)`:
 - `Q_ij`: signed discharge from reservoir `i` to `j`, m³/s;
 - `I_i(t)`: externally specified, nonnegative reservoir inflow, m³/s.
 
-For each hydraulic step of length `dt`, the solver approximates
+For each hydraulic step of length `dt`, the original closed-network solver approximates
 
 \[
 S_i(t+dt)=S_i(t)+I_i(t)dt+\sum_{j}Q_{ji}(t)dt-\sum_j Q_{ij}(t)dt.
 \]
 
-It evaluates the discharge at the **start** of the substep (forward Euler). A discharge on an edge is subtracted from its sender and added to its receiver **exactly once**. Consequently, transfers do not create or destroy water. Across a closed network:
+The open-boundary variant additionally subtracts each reservoir's outlet discharge `Q_boundary,i(t) dt` from its storage and adds the identical volume to cumulative exterior discharge. It evaluates the discharge at the **start** of the substep (forward Euler). A discharge on an edge is subtracted from its sender and added to its receiver **exactly once**. Consequently, transfers do not create or destroy water. Across the original closed network (or the opt-in open network after adding cumulative outlet discharge to the storage side):
 
 \[
-\sum_i S_i(t) = \sum_i S_i(0)+\sum_{k\text{ elapsed}}\sum_i V_{i,k}^{\mathrm{inflow}}.
+\sum_i S_i(t) + V_{\mathrm{boundary}}(t)
+= \sum_i S_i(0)+\sum_{k\text{ elapsed}}\sum_i V_{i,k}^{\mathrm{inflow}}.
 \]
 
-The result checks this invariant at every user-supplied interval boundary. `mass_balance_error_m3` is the computed storage minus the starting storage and injected volume. The allowed round-off residual is `1e-9 × max(1 m³, initial total volume, cumulative inflow)`; **this tolerance is a numerical acceptance threshold, not a hydrological accuracy guarantee**.
+The result checks this invariant at every user-supplied interval boundary. `mass_balance_error_m3` is the computed storage **plus cumulative modeled boundary outflow** minus the starting storage and injected volume (the outflow term is zero for the original closed-network API). The allowed round-off residual is `1e-9 × max(1 m³, initial total volume, cumulative inflow, cumulative boundary outflow)`; **this tolerance is a numerical acceptance threshold, not a hydrological accuracy guarantee**.
 
 ### Stage–storage curves
 
@@ -62,7 +63,7 @@ For each candidate substep:
 
 This avoids index-order preference and detects numerically excessive timesteps. However, it remains explicit Euler, not an implicit solution of the network: **halve `maximum_substep_seconds` and compare results** before interpreting time-dependent flood levels. A trial that remains unstable after repeated refinements, or exceeds its total accepted/rejected substep budget, fails rather than extrapolating.
 
-Unsupported physical regimes (for example, a partially submerged orifice with a water-level difference) cause an explicit exception; reducing the timestep does not make an unknown discharge law acceptable. The reservoir network is **closed**; neither a domain-exit discharge boundary nor negative external withdrawals are currently supported. If a reservoir exceeds the provided curve, the solver reports an error rather than losing the excess water.
+Unsupported physical regimes (for example, a partially submerged orifice with a water-level difference) cause an explicit exception; reducing the timestep does not make an unknown discharge law acceptable. The original `routeCoupledReservoirs()` call remains a **closed** reservoir network. The opt-in `routeCoupledReservoirsWithOutlets()` separately supports validated, **one-way free-overflow outlets** to the exterior. Each outlet uses an independently supplied crest, width, factor and permanently sub-crest downstream level. It reports cumulative boundary discharge and tests `stored + boundary discharge = initial + prescribed inflow`. It does **not** support submerged outlets or reverse external inflow. See [free-overflow domain boundaries](BOUNDARY_OUTLETS.md). If a reservoir exceeds the provided curve, the solver reports an error rather than losing the excess water.
 
 The calculation is bounded: at most 100,000 reservoirs, 200,000 connections, 100,000 input intervals, a configured maximum output-interval count, and a configured maximum total number of accepted/rejected substeps (up to 100 million). Cancellation is checked during routing and produces a `std::runtime_error`.
 
@@ -134,7 +135,7 @@ The reported water levels belong to **lumped reservoir approximations**. A snaps
 - **Hydrology** already produces static basin topology, storage relationships, and total runoff volumes. This new core is deliberately separate from scenario persistence and REST: event-duration and total rainfall depth alone do **not** determine an inflow hydrograph.
 - The opt-in [timed-runoff forcing adapter](TEMPORAL_RUNOFF_FORCING.md) now distributes Stage 7 event runoff totals into **externally specified time fractions** and maps the original DEM's dry-D8 leaf inflow volumes into per-reservoir intervals. This is not a travel-time calculation: all dry-D8 arrivals are assumed immediate, and the caller must separately provide physically disjoint reservoir curves and calibrated controls.
 - Exposing timed simulations over the service will require a separate job identity, input provenance, model-specific cache version and cancellation/status handling. It must never silently overwrite the static redistribution result or reuse its cache key.
-- An external domain-outflow boundary, physically defensible time-varying surface infiltration, and connections to SWMM are separate future capabilities.
+- The opt-in [free-overflow boundary outlet](BOUNDARY_OUTLETS.md) now accounts for discharge leaving modeled reservoirs while preserving simultaneous update and per-snapshot conservation. It is not an inferred DEM feature, backwater calculation, or a persisted time-dependent simulation service. Physically defensible time-varying infiltration and connections to SWMM remain future capabilities.
 
 ## Validation and known limitations
 
@@ -143,7 +144,7 @@ The reported water levels belong to **lumped reservoir approximations**. A snaps
 The solver **does not** yet have:
 
 - physically inferred rainfall-to-runoff timing or travel-time routing; the separate adapter accepts explicit event-time fractions and applies them uniformly, with zero source-to-basin delay;
-- an outlet to an outside-domain reservoir, floodplain surface propagation, infiltration, evapotranspiration or negative discharge boundaries;
+- a **submerged or reversible** outside-domain boundary, floodplain surface propagation, infiltration, evapotranspiration or negative discharge boundaries (the new opt-in terminal outlet handles one-way **free-overflow** only);
 - implicit time integration / hydraulic inertia / momentum conservation;
 - general culvert hydraulics, partially submerged apertures, complex multiway controls, backwater through connected channels or surveyed spillway cross-sections sourced automatically;
 - calibration against measured hydrographs or terrain reference tools.

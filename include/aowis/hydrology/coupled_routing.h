@@ -40,6 +40,21 @@ struct CoupledConnection
     RectangularOrificeControl orifice;
 };
 
+// A ONE-WAY, free-overflow outlet from a reservoir to the external domain.
+// This is an independently characterized physical control section, not an
+// inferred DEM boundary cell or a BasinSpillJunction. The downstream level
+// must remain STRICTLY below the crest throughout the modeled event; flooded
+// or backwater-controlled boundaries require a different hydraulic law.
+// No external inflow/backflow is possible through this type of outlet.
+struct CoupledBoundaryOutlet
+{
+    std::uint64_t reservoir_component_index = 0;
+    double crest_elevation_m = 0.0;
+    double effective_width_m = 0.0;
+    double discharge_factor = 0.0;
+    double downstream_water_level_m = 0.0;
+};
+
 // Each interval has a prescribed nonnegative ADDITIONAL volume for each basin.
 // The volume arrives uniformly during that interval. This is NOT derived from
 // a total rainfall depth or a hydrograph by this solver.
@@ -65,6 +80,11 @@ struct CoupledRoutingSnapshot
     // orientation, from the initial state through this interval boundary.
     std::vector<double> connection_transfer_m3;
     double cumulative_inflow_m3 = 0.0;
+    // Cumulative, nonnegative discharge to the exterior, indexed in the
+    // same order as the configured boundary outlets. The legacy closed-
+    // network API returns an empty vector and zero cumulative outflow.
+    std::vector<double> boundary_outflow_m3;
+    double cumulative_boundary_outflow_m3 = 0.0;
     double total_storage_m3 = 0.0;
     double mass_balance_error_m3 = 0.0;
 };
@@ -88,6 +108,20 @@ struct CoupledRoutingResult
 CoupledRoutingResult routeCoupledReservoirs(
     const std::vector<CoupledReservoir> &reservoirs,
     const std::vector<CoupledConnection> &connections,
+    const std::vector<CoupledInflowInterval> &inflow_intervals,
+    const CoupledRoutingOptions &options = {},
+    const std::atomic<bool> *cancel_requested = nullptr);
+
+// Experimental OPEN-domain variant. Boundary outlets are computed alongside
+// every internal connection using the same start-of-substep water levels.
+// Accepted steps conserve INITIAL + INFLOW = STORAGE + EXTERNAL OUTFLOW.
+// Substeps that would lower a reservoir below an active outlet's crest are
+// rejected and subdivided. Submergence/backflow, ungauged outlet geometry,
+// and time-varying downstream stages are not approximated here.
+CoupledRoutingResult routeCoupledReservoirsWithOutlets(
+    const std::vector<CoupledReservoir> &reservoirs,
+    const std::vector<CoupledConnection> &connections,
+    const std::vector<CoupledBoundaryOutlet> &boundary_outlets,
     const std::vector<CoupledInflowInterval> &inflow_intervals,
     const CoupledRoutingOptions &options = {},
     const std::atomic<bool> *cancel_requested = nullptr);

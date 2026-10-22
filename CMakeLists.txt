@@ -174,6 +174,11 @@ if(BUILD_TESTING)
     add_test(NAME aowis-hydrology-coupled-routing COMMAND aowis-hydrology-coupled-routing-test)
     set_tests_properties(aowis-hydrology-coupled-routing PROPERTIES LABELS "hydrology;aowis")
 
+    add_executable(aowis-hydrology-boundary-outlets-test tests/test_boundary_outlets.cpp)
+    target_link_libraries(aowis-hydrology-boundary-outlets-test PRIVATE AOWIS::Hydrology)
+    add_test(NAME aowis-hydrology-boundary-outlets COMMAND aowis-hydrology-boundary-outlets-test)
+    set_tests_properties(aowis-hydrology-boundary-outlets PROPERTIES LABELS "hydrology;aowis")
+
     add_executable(aowis-hydrology-temporal-inflows-test tests/test_temporal_inflows.cpp)
     target_link_libraries(aowis-hydrology-temporal-inflows-test PRIVATE AOWIS::Hydrology)
     add_test(NAME aowis-hydrology-temporal-inflows COMMAND aowis-hydrology-temporal-inflows-test)
