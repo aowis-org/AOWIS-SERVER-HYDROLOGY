@@ -132,7 +132,7 @@ JSON when comparing environments. Run multiple fresh processes (for example,
 interpret a single wall-time difference smaller than operating-system noise
 as an optimization.
 
-## Hierarchy row-area optimization: measured baseline
+## Hierarchy row-area optimization: measured results
 
 A real Copernicus GLO-30 job with 352 × 556 cells (195,712 cells) was
 measured on the user's Linux server **before** optimization. The server
@@ -160,12 +160,45 @@ speedup of approximately **2.08×**. These measurements are host-specific;
 small fluctuations in other stage times and process RSS are not evidence
 of an algorithmic regression.
 
-To assess the actual effect on the Map-backed service, build and restart
-Hydrology and submit an identical **new** job. Compare the
-`server_stage_timings_ms.depression_hierarchy` field (not the client polling
-latency), basin count, and checksums. Keep the terrain-source dataset,
-resolution, bounds, server build configuration, and Map cache state the same.
-The original analysis job and all existing stored artifacts remain valid.
+On the user's Arch Linux service with the *same* 352 × 556 GLO-30 window,
+the row-area optimization reduced server-side hierarchy time from **688.21 ms**
+to **146.06 ms** (78.8% less). Total worker time dropped from **1037.69 ms**
+to **530.12 ms** (48.9% less). The run retained **4,487 basins**,
+**14,757 conditioned cells** and identical saved elevation-window SHA-256.
+Terrain acquisition stayed approximately unchanged at **222.69 → 225.26 ms**.
+D8 time changed from **92.22 → 112.00 ms** in these single runs; that is not
+enough sampling to diagnose a D8 regression. Map elevations agreed with the
+persisted raster byte-for-byte on the comparison window. These results are
+**paired single-job measurements**, not a multi-run performance distribution
+or proof that all hierarchy outputs match across all DEM inputs.
+
+## Reuse the Map HTTP session within each terrain job
+
+After the hierarchy improvement, terrain fetching became the largest measured
+server stage: 225.26 ms out of 530.12 ms. The REST terrain reader acquires
+bounded Map analysis-grid patches sequentially; a typical 352 × 556 raster
+with `terrain/patch_size=256` uses **six source patches**. Previously, each
+patch constructed a new `QNetworkAccessManager`, so Map could not reuse the
+same HTTP connection across successive requests. The reader now constructs
+one manager in the caller's worker thread for the duration of **one terrain
+acquisition**, letting Qt reuse its connection(s) for subsequent patches.
+
+All request bounds, columns, rows, source-precision sample values, MIME and
+length checks, request timeouts, authentication headers, patch ordering and
+cancellation checks are unchanged. The in-process `AOWIS::Map` path uses the
+same patch geometry but does not make HTTP requests. The network manager is
+**not shared between jobs or threads**. A loopback HTTP/1.1 regression test
+checks multi-patch decoding, exact cell placement, a persistent connection and
+pre-request cancellation.
+
+The change reduces avoidable connection setup but does not remove work from
+Map's DEM sampling implementation. It is therefore a **hypothesis about
+latency**, not a measured speedup. Benchmark with a restarted Hydrology server
+and the **same** `benchmark_map_http.py` invocation used for the baseline;
+compare `server_stage_timings_ms.terrain_fetch` and the terrain window SHA-256.
+For a robust estimate, repeat several new jobs after accounting for Map's
+source cache and OS load. Client-side `map_sample_requests` is a separate
+benchmark of Map's sampling endpoint, not Hydrology's connection reuse.
 
 ## Verification and reference comparisons
 
@@ -195,7 +228,7 @@ not just successful runs, before using the outputs for engineering decisions.
 
 ## Current limits
 
-- Synthetic benchmark only; no actual Copernicus/Map end-to-end timing.
+- Synthetic and real Map/Hydrology benchmarks exist, but current published live results cover up to 195,712 DEM cells; not yet representative metropolitan scale.
 - In-memory core algorithms; the 10-million-cell cap is a safety budget, not
   a guarantee that a particular machine has enough RAM.
 - No speedup assertion, throughput SLA, calibration result or metro-sized

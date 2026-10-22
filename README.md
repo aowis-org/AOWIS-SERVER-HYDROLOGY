@@ -2,7 +2,7 @@
 
 AOWIS terrain-based hydrology analysis service. It is independent of the GUI and of the planned **AOWIS-SERVER-SWMM** service. The same analysis capabilities are intended to run as a dedicated HTTP service or inside the [AOWIS-SERVER-Standalone](https://github.com/aowis-org/aowis-server-standalone) application as linked C++ libraries, without running local HTTP servers.
 
-See [Integration architecture](docs/INTEGRATION.md) for GUI–Hydrology–Map contracts, [GeoTIFF development reader](docs/GEOTIFF.md) for test fixtures and direct library usage, and [Implementation roadmap](docs/ROADMAP.md) for stages and verification criteria.
+See [Integration architecture](docs/INTEGRATION.md) for GUI–Hydrology–Map contracts, [GeoTIFF development reader](docs/GEOTIFF.md) for test fixtures and direct library usage, and [Implementation roadmap](docs/ROADMAP.md) for stages and verification criteria. For performance validation, [Benchmarking](docs/BENCHMARKING.md) documents reproducible synthetic and live Map-to-Hydrology tests, persisted per-stage worker timings, the measured hierarchy speedup and REST terrain-session reuse.
 
 ## Current capabilities
 

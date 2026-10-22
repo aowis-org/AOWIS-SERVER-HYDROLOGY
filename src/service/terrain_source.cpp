@@ -27,7 +27,7 @@ QString precise(double value)
     return QString::number(value, 'g', 17);
 }
 
-QByteArray fetchRemoteGrid(const SourceConfig &source, const QString &dataset,
+QByteArray fetchRemoteGrid(QNetworkAccessManager &manager, const SourceConfig &source, const QString &dataset,
                            double west, double south, double east, double north,
                            int columns, int rows)
 {
@@ -42,7 +42,6 @@ QByteArray fetchRemoteGrid(const SourceConfig &source, const QString &dataset,
     query.addQueryItem(QStringLiteral("rows"), QString::number(rows));
     endpoint.setQuery(query);
 
-    QNetworkAccessManager manager;
     QNetworkRequest request(endpoint);
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
                          QNetworkRequest::ManualRedirectPolicy);
@@ -91,6 +90,11 @@ ElevationGrid readTerrain(const SourceConfig &source, const ElevationGrid &geome
     ElevationGrid grid = geometry;
     grid.elevations_m.assign(std::size_t(cells), std::numeric_limits<float>::quiet_NaN());
 
+    // One manager per terrain-read invocation: requests stay sequential and share
+    // this worker thread, but Qt can reuse the HTTP connection across patches.
+    // Never share a QNetworkAccessManager across concurrent worker threads.
+    QNetworkAccessManager manager;
+
     for (std::uint32_t row = 0; row < geometry.rows; row += std::uint32_t(source.patch_size))
     {
         for (std::uint32_t column = 0; column < geometry.columns;
@@ -131,7 +135,7 @@ ElevationGrid readTerrain(const SourceConfig &source, const ElevationGrid &geome
             }
 #endif
             const QByteArray bytes = fetchRemoteGrid(
-                source, dataset, west, south, east, north, patch_columns, patch_rows);
+                manager, source, dataset, west, south, east, north, patch_columns, patch_rows);
             for (int local_row = 0; local_row < patch_rows; ++local_row)
             {
                 const std::size_t target = std::size_t(row + local_row) * geometry.columns + column;
