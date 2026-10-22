@@ -32,6 +32,7 @@ map_url=http://127.0.0.1:8122/
 map_read_api_key=
 request_timeout_ms=180000
 patch_size=256
+max_concurrent_requests=4
 # Standalone integrations supply their already-initialized Map library instance
 # to AOWIS::HydrologyService; the executable always uses Map REST.
 )INI");
@@ -106,6 +107,14 @@ bool loadConfig(const QString &file_path, bool explicitly_requested,
     if (!valid || config->source.patch_size < 1 || config->source.patch_size > 512)
     {
         *error = QStringLiteral("Invalid terrain/patch_size");
+        return false;
+    }
+    config->source.max_concurrent_requests = settings.value(
+        QStringLiteral("terrain/max_concurrent_requests"), 4).toString().toInt(&valid);
+    if (!valid || config->source.max_concurrent_requests < 1 ||
+        config->source.max_concurrent_requests > 4)
+    {
+        *error = QStringLiteral("Invalid terrain/max_concurrent_requests (valid range 1..4)");
         return false;
     }
     const QString mode = settings.value(QStringLiteral("terrain/mode"),

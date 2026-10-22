@@ -21,6 +21,7 @@ struct SourceConfig
     QByteArray map_read_api_key; // optional existing Map read credential
     int request_timeout_ms = 180000;
     int patch_size = 256;
+    int max_concurrent_requests = 4; // REST only; standalone Map remains sequential
 #ifdef AOWIS_HYDROLOGY_LOCAL_MAP
     Aowis::Map::TerrainData *local_map = nullptr;
 #endif
@@ -35,7 +36,9 @@ struct TerrainFetchMetrics
     QString transport; // "map_http" or "map_in_process"
     std::uint64_t patch_count = 0;
     std::uint64_t response_bytes = 0;
-    double map_request_ms = 0.0;
+    double map_request_ms = 0.0; // summed lifetimes; can exceed elapsed fetch time
+    double map_request_wall_ms = 0.0; // first request dispatch to last completion
+    int peak_in_flight = 0;
     double raster_copy_ms = 0.0;
     double first_request_ms = 0.0;
     double fastest_request_ms = 0.0;

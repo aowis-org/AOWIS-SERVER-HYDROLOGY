@@ -226,6 +226,8 @@ Illustrative shape (the numbers below are *not* field measurements):
   "patch_count": 6,
   "response_bytes": 782848,
   "map_request_ms": 210.0,
+  "map_request_wall_ms": 120.0,
+  "peak_in_flight": 4,
   "raster_copy_ms": 2.0,
   "first_request_ms": 70.0,
   "fastest_request_ms": 20.0,
@@ -238,14 +240,20 @@ Illustrative shape (the numbers below are *not* field measurements):
 | `transport` | `map_http` for REST, `map_in_process` for a borrowed Map object |
 | `patch_count` | Number of successful Map analysis-grid patches assembled |
 | `response_bytes` | Total raw float32 sample bytes (excluding HTTP headers); identical for the two modes on equal grids |
-| `map_request_ms` | Sum of per-patch synchronous Map call wall times, including server work, transport, Qt reply decoding and payload validation on HTTP; **not** network-only latency |
+| `map_request_ms` | **Sum of per-patch Map call wall durations**. With concurrent HTTP requests it can exceed `stage_timings_ms.terrain_fetch` because requests overlap; it is **not** network-only latency |
+| `map_request_wall_ms` | Elapsed span from the first Map call dispatch to the last successful reply completion, including any overlap; used for wall-clock attribution |
+| `peak_in_flight` | Largest number of simultaneous outstanding Map requests (1 for sequential or in-process transport, at most `terrain/max_concurrent_requests` for REST) |
 | `raster_copy_ms` | Time spent decoding/copying the returned float values into the full DEM |
 | `first_request_ms` | First successful Map patch call duration |
 | `fastest_request_ms`, `slowest_request_ms` | Extremal per-patch Map call durations, not percentiles |
 
-`map_request_ms + raster_copy_ms` is bounded by (and normally slightly less
-than) `stage_timings_ms.terrain_fetch`: the latter also contains setup,
-request geometry and other per-job overhead. This is **not** a decomposition
+When `peak_in_flight == 1`, the sum of `map_request_ms` and `raster_copy_ms`
+is normally bounded by `stage_timings_ms.terrain_fetch`. For parallel jobs,
+**this inequality no longer holds**: Map requests overlap and their summed
+lifetimes are not elapsed duration. Instead compare `map_request_wall_ms` with
+`stage_timings_ms.terrain_fetch`; the former includes any decoding or copying
+performed *between* replies and is a span, not a separately measured CPU cost.
+Do not subtract parallel per-request sums from worker wall time. This is **not** a decomposition
 of Map's internal processing time versus TCP latency: that would require
 additional Map-side instrumentation. The diagnostics use steady-clock wall
 time, are local to each worker, and have constant memory overhead regardless
@@ -288,6 +296,8 @@ jq '{
   jobs: .measured_jobs, patches: .patch_count_per_job,
   fetch_ms: .timing_distributions_ms.terrain_fetch,
   map_calls_ms: .timing_distributions_ms.map_request_ms,
+  map_elapsed_ms: .timing_distributions_ms.map_request_wall_ms,
+  peak_in_flight: .timing_distributions_ms.peak_in_flight,
   copy_ms: .timing_distributions_ms.raster_copy_ms,
   residual_ms: .timing_distributions_ms.fetch_unattributed_ms,
   map_share_pct: .share_distributions_pct.request_of_fetch_pct,
@@ -299,9 +309,16 @@ The output includes `timing_distributions_ms`,
 `share_distributions_pct`, and a `jobs` array containing each original
 report. Summaries provide each ordered sample list, min, median, mean and
 nearest-rank p90 (descriptive only: five jobs are not enough for a reliable
-p90 estimate). `fetch_unattributed_ms` is the measured `terrain_fetch` minus
-Map-call and raster-copy times and can include Qt event-loop setup, patch
-geometry and other worker overhead. **It is not TCP latency.** Per-run
+p90 estimate). `fetch_unattributed_ms` is the measured `terrain_fetch` minus the
+Map-request elapsed **span**, and (only for sequential reads) raster-copy
+wall time. It can include Qt event-loop setup, patch geometry and other
+worker overhead. In parallel mode the span already includes raster assembly
+between responses, so the copy duration is not subtracted again.
+`request_of_fetch_pct` is the **elapsed request span** divided by fetch wall
+time; `overlap_ratio` is the sum of request durations divided by their elapsed
+span (typically greater than 1 during real overlap). The saved
+`map_request_ms` field continues to mean the sum of individual request
+lifetimes even when requests overlap. **It is not TCP latency.** Per-run
 percentages are summarized from individual run ratios, not ratios of
 rounded median timings.
 
@@ -321,7 +338,7 @@ remain available; the error names the failed run. There is no claim that
 these runs measure cold Map data: source-tile and OS caches can already be
 warm, even on the first job.
 
-Interpretation: if `map_request_ms` takes nearly all of `terrain_fetch`,
+Interpretation: if `map_request_wall_ms` takes nearly all of `terrain_fetch`,
 further Hydrology raster-copy microoptimizations cannot materially improve
 acquisition time. To distinguish Map's DEM sampling CPU from HTTP delivery,
 we must instrument **AOWIS-SERVER-MAP** separately; the present service
@@ -645,3 +662,47 @@ run released its transient D8 result before building the hierarchy. When
 comparing a live HTTP job with the synthetic benchmark, account for additional
 resident source buffers, Qt allocations, Map cache, persistent files and
 potential concurrent requests.
+
+
+### Bounded concurrent Map acquisition (HTTP)
+
+Hydrology now issues up to four concurrent Map analysis-grid REST GETs within
+**one** terrain-analysis worker. The default `terrain/max_concurrent_requests=4`
+is based on three local six-patch experiments, where four parallel Map reads
+reduced probe wall time by approximately 1.88–2.12× compared with sequential
+reads. This is a *probe result*, not a promise of the same improvement for a
+full Hydrology worker or for other Map deployments.
+
+Use an INI file with:
+
+```ini
+[terrain]
+patch_size=256
+max_concurrent_requests=4
+request_timeout_ms=180000
+```
+
+The valid concurrency range is 1–4, checked by both the executable's INI
+parser and the library API. `1` selects the previous sequential behavior and
+is the recommended A/B comparison baseline. Each Hydrology worker maintains
+its **own Qt network manager and queue**; it never shares replies or a manager
+across threads. Requests preserve identical patch bounds, source sample
+precision, WGS84 cell-centre handling and per-patch response checks. Replies
+are placed by row/column rather than completion order. No unbounded per-patch
+request array is allocated; at most four payloads can be in flight. Cancel
+and error paths abort remaining replies without returning a partial DEM.
+The shared, borrowed Map C++ object (`map_in_process`) remains sequential
+regardless of this setting; concurrent calls into that object would require
+explicit Map-side guarantees that are not assumed here.
+
+Run repeated jobs with `max_concurrent_requests=1` and again with `4`, keeping
+Map's cache and CPU load comparable, to evaluate **full-worker** speedup. The
+same raster hashes, basin counts and conditioned-cell counts must match. In
+addition inspect `server_terrain_fetch_details.peak_in_flight`,
+`map_request_wall_ms`, and `map_request_ms` and the series' `overlap_ratio`
+metric. Full-worker timing includes D8, basin hierarchy and persistence, so
+its speedup will normally be smaller than the Map-only concurrency probe.
+A large number of simultaneous Hydrology *jobs* can multiply outstanding Map
+GETs (`jobs × max_concurrent_requests`); production scheduling must bound job
+concurrency independently. This is not a new Map rate limit or a change to
+Map's own cache policy.

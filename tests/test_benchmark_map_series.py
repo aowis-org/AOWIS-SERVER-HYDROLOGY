@@ -90,6 +90,25 @@ class RepeatedBenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(series.single.BenchmarkError, "inconsistent terrain fetch"):
             series.summarize([report(1), bad])
 
+    def test_overlapping_request_accounting(self):
+        first = report(1)
+        second = report(2)
+        for item in (first, second):
+            details = item["server_terrain_fetch_details"]
+            details["peak_in_flight"] = 2
+            details["map_request_wall_ms"] = 50.0
+            details["map_request_ms"] = 145.0
+        summary = series.summarize([first, second])
+        self.assertEqual(summary["timing_distributions_ms"]["map_request_wall_ms"]["median"], 50.0)
+        self.assertEqual(summary["timing_distributions_ms"]["peak_in_flight"]["median"], 2.0)
+        self.assertEqual(summary["timing_distributions_ms"]["fetch_unattributed_ms"]["median"], 51.5)
+        self.assertGreater(summary["share_distributions_pct"]["overlap_ratio"]["median"], 2.0)
+        broken = report(3)
+        broken["server_terrain_fetch_details"]["peak_in_flight"] = 2
+        broken["server_terrain_fetch_details"]["map_request_wall_ms"] = 200.0
+        with self.assertRaisesRegex(series.single.BenchmarkError, "inconsistent terrain fetch"):
+            series.summarize([first, broken])
+
     def test_preflight_rejects_without_post(self):
         for opts in (("--max-cells", "2"), ("--runs", "21"),
                      ("--existing-job", "fake-id"), ("--warmup-runs", "6")):

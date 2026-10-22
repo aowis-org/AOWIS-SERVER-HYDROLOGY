@@ -65,9 +65,11 @@ def summarize(reports, warmup_runs=0):
     ms = {name: [] for name in STAGE_FIELDS}
     ms.update({name: [] for name in FETCH_FIELDS})
     ms["fetch_unattributed_ms"] = []
+    ms["map_request_wall_ms"] = []
+    ms["peak_in_flight"] = []
     ms["job_wait_ms"] = []
     fractions = {"request_of_fetch_pct": [], "copy_of_fetch_pct": [],
-                 "fetch_of_worker_pct": []}
+                 "fetch_of_worker_pct": [], "overlap_ratio": []}
     patch_count = None
     response_bytes = None
     transport = None
@@ -112,14 +114,24 @@ def summarize(reports, warmup_runs=0):
         fetch = stage["terrain_fetch"]
         request = details["map_request_ms"]
         copy = details["raster_copy_ms"]
-        residual = fetch - request - copy
-        # Values use independently sampled monotonic clocks. Permit only tiny
-        # numerical overlap, never silently label substantial overlap as zero.
+        peak = details.get("peak_in_flight", 1)
+        wall = details.get("map_request_wall_ms", request)
+        if (not isinstance(peak, int) or isinstance(peak, bool) or peak < 1 or
+                peak > 4 or peak > count or
+                not isinstance(wall, (int, float)) or isinstance(wall, bool) or
+                not math.isfinite(wall) or wall < 0):
+            raise single.BenchmarkError(f"run {index}: invalid concurrent fetch metrics")
+        # With concurrency, individual request durations overlap: their sum
+        # is NOT bounded by worker elapsed time. The request span is.
+        residual = fetch - wall - (copy if peak == 1 else 0.0)
         if residual < -1.0:
             raise single.BenchmarkError(f"run {index}: inconsistent terrain fetch accounting")
         ms["fetch_unattributed_ms"].append(max(0.0, residual))
+        ms["map_request_wall_ms"].append(wall)
+        ms["peak_in_flight"].append(peak)
         ms["job_wait_ms"].append(report["job_wait_s"] * 1000.0)
-        fractions["request_of_fetch_pct"].append(request / fetch * 100.0 if fetch else 0.0)
+        fractions["request_of_fetch_pct"].append(wall / fetch * 100.0 if fetch else 0.0)
+        fractions["overlap_ratio"].append(request / wall if wall else 0.0)
         fractions["copy_of_fetch_pct"].append(copy / fetch * 100.0 if fetch else 0.0)
         worker = stage["total_worker"]
         fractions["fetch_of_worker_pct"].append(fetch / worker * 100.0 if worker else 0.0)
@@ -145,7 +157,8 @@ def summarize(reports, warmup_runs=0):
         "notes": [
             "Each measured job is a separate terrain acquisition; client query repeats are within each job.",
             "Map request time includes Map processing, HTTP transport and response handling; it is NOT network-only time.",
-            "Fetch unattributed time is worker fetch minus measured Map calls and raster copies, not a network latency estimate.",
+            "With concurrent requests map_request_ms sums overlapping lifetimes; map_request_wall_ms is their elapsed span.",
+            "Fetch unattributed is fetch minus the request span (and minus raster copy only in sequential mode); not TCP latency.",
             "Warmup jobs, if requested, create persistent analyses but are excluded from measurements.",
             "Server and Map caches may be warm, and concurrent external workloads can affect all measurements.",
             "Nearest-rank p90 is descriptive only; five observations cannot establish a stable tail latency.",

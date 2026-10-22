@@ -142,6 +142,7 @@ map_url=http://127.0.0.1:8122/
 map_read_api_key=
 request_timeout_ms=180000
 patch_size=256
+max_concurrent_requests=4
 ```
 
 Hydrology no longer has a `terrain/local_dem_directory` or a production
@@ -207,6 +208,7 @@ Relevant INI options:
 | `terrain/map_read_api_key` | Optional existing Map read key when configured by Map |
 | `terrain/request_timeout_ms` | Timeout per Map REST patch |
 | `terrain/patch_size` | Maximum patch dimension, 1–512 cells |
+| `terrain/max_concurrent_requests` | Concurrent Map HTTP patch requests per analysis worker, 1–4 (default 4); set to 1 for sequential transport. Borrowed in-process Map remains sequential |
 
 `terrain/map_url` accepts HTTP or HTTPS URLs. Hydrology obtains elevation samples through Map, which remains responsible for acquisition and caching. No Copernicus downloader or independent Map configuration is started by Hydrology.
 

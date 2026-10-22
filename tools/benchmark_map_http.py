@@ -308,6 +308,15 @@ def run(args):
             details["first_request_ms"] > details["slowest_request_ms"] or
             details["first_request_ms"] < details["fastest_request_ms"]):
             raise BenchmarkError("Hydrology returned invalid terrain fetch details")
+        span = details.get("map_request_wall_ms", details["map_request_ms"])
+        peak = details.get("peak_in_flight", 1)
+        if (not isinstance(span, (int, float)) or isinstance(span, bool) or
+            not math.isfinite(span) or span < 0 or
+            not isinstance(peak, int) or isinstance(peak, bool) or
+            peak < 1 or peak > 4 or peak > details["patch_count"] or
+            (stage_timings is not None and "terrain_fetch" in stage_timings and
+             span > stage_timings["terrain_fetch"] + 1.0)):
+            raise BenchmarkError("Hydrology returned invalid concurrent terrain fetch metrics")
     report["server_terrain_fetch_details"] = details
     report["source_dataset"] = metadata.get("dataset")
     report["vertical_datum"] = metadata.get("vertical_datum")

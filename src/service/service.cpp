@@ -687,6 +687,8 @@ void AnalysisService::runJob(const QSharedPointer<Job> &job)
                 {QStringLiteral("patch_count"), double(fetch_metrics.patch_count)},
                 {QStringLiteral("response_bytes"), double(fetch_metrics.response_bytes)},
                 {QStringLiteral("map_request_ms"), fetch_metrics.map_request_ms},
+                {QStringLiteral("map_request_wall_ms"), fetch_metrics.map_request_wall_ms},
+                {QStringLiteral("peak_in_flight"), fetch_metrics.peak_in_flight},
                 {QStringLiteral("raster_copy_ms"), fetch_metrics.raster_copy_ms},
                 {QStringLiteral("first_request_ms"), fetch_metrics.first_request_ms},
                 {QStringLiteral("fastest_request_ms"), fetch_metrics.fastest_request_ms},

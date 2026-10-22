@@ -9,8 +9,10 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QUrlQuery>
+#include <QTimer>
 #include <QtEndian>
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cmath>
@@ -39,6 +41,10 @@ int main(int argc, char **argv)
 
     int requests = 0;
     int connections = 0;
+    int pending_responses = 0;
+    int maximum_pending_responses = 0;
+    bool delay_responses = false;
+    bool fail_responses = false;
     std::vector<QString> patch_coordinates;
     QObject::connect(&server, &QTcpServer::newConnection, &server, [&]()
     {
@@ -92,12 +98,24 @@ int main(int argc, char **argv)
                             qToLittleEndian<quint32>(bits, body.data() +
                                 (row * width + column) * 4);
                         }
-                    const QByteArray response = QByteArray("HTTP/1.1 200 OK\r\n") +
-                        "Content-Type: application/vnd.aowis.dem-f32le\r\n" +
-                        "Content-Length: " + QByteArray::number(body.size()) + "\r\n" +
-                        "Connection: keep-alive\r\n\r\n" + body;
-                    socket->write(response);
-                    socket->flush();
+                    const QByteArray response = fail_responses
+                        ? QByteArray("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n")
+                        : QByteArray("HTTP/1.1 200 OK\r\n") +
+                            "Content-Type: application/vnd.aowis.dem-f32le\r\n" +
+                            "Content-Length: " + QByteArray::number(body.size()) + "\r\n" +
+                            "Connection: keep-alive\r\n\r\n" + body;
+                    ++pending_responses;
+                    maximum_pending_responses = std::max(maximum_pending_responses, pending_responses);
+                    const auto respond = [socket, response, &pending_responses]()
+                    {
+                        socket->write(response);
+                        socket->flush();
+                        --pending_responses;
+                    };
+                    if (delay_responses)
+                        QTimer::singleShot(40, socket, respond);
+                    else
+                        respond();
                 }
             });
             QObject::connect(socket, &QTcpSocket::disconnected,
@@ -108,6 +126,7 @@ int main(int argc, char **argv)
     SourceConfig source;
     source.map_url = QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort()));
     source.patch_size = 3;
+    source.max_concurrent_requests = 1;
     source.request_timeout_ms = 5000;
     const std::atomic<bool> running{false};
     TerrainFetchMetrics metrics;
@@ -116,6 +135,8 @@ int main(int argc, char **argv)
     assert(metrics.transport == QStringLiteral("map_http"));
     assert(metrics.patch_count == 6);
     assert(metrics.response_bytes == 7ULL * 5ULL * sizeof(float));
+    assert(metrics.peak_in_flight == 1);
+    assert(metrics.map_request_wall_ms >= 0.0);
     assert(std::isfinite(metrics.map_request_ms) && metrics.map_request_ms >= 0.0);
     assert(std::isfinite(metrics.raster_copy_ms) && metrics.raster_copy_ms >= 0.0);
     assert(metrics.fastest_request_ms <= metrics.first_request_ms);
@@ -138,6 +159,60 @@ int main(int argc, char **argv)
             assert(loaded.elevations_m[std::size_t(row) * loaded.columns + column] ==
                 float(1000 + row * 100 + column));
 
+    // Concurrent acquisition must place every patch identically even when
+    // several replies are outstanding. The mock delays replies to enforce
+    // overlap, and the scheduler may not exceed the requested cap.
+    delay_responses = true;
+    maximum_pending_responses = 0;
+    source.max_concurrent_requests = 4;
+    TerrainFetchMetrics parallel_metrics;
+    const ElevationGrid parallel = readTerrain(source, geometry,
+        QStringLiteral("copernicus-glo30"), running, &parallel_metrics);
+    assert(requests == 12);
+    assert(maximum_pending_responses >= 2);
+    assert(maximum_pending_responses <= 4);
+    assert(parallel_metrics.peak_in_flight >= 2 && parallel_metrics.peak_in_flight <= 4);
+    assert(parallel_metrics.patch_count == 6);
+    assert(parallel_metrics.response_bytes == 7ULL * 5ULL * sizeof(float));
+    assert(parallel_metrics.first_request_ms >= parallel_metrics.fastest_request_ms);
+    assert(parallel_metrics.first_request_ms <= parallel_metrics.slowest_request_ms);
+    assert(parallel_metrics.map_request_ms > parallel_metrics.map_request_wall_ms);
+    assert(parallel.elevations_m == loaded.elevations_m);
+    assert(pending_responses == 0);
+
+    // A remote failure aborts outstanding requests without delivering a
+    // partial raster or starting additional patches.
+    fail_responses = true;
+    bool failure_caught = false;
+    try
+    {
+        (void)readTerrain(source, geometry, QStringLiteral("copernicus-glo30"), running);
+    }
+    catch (const std::runtime_error &error)
+    {
+        failure_caught = QString::fromUtf8(error.what()).contains(QStringLiteral("HTTP 503"));
+    }
+    assert(failure_caught);
+    fail_responses = false;
+
+    // A cancellation during outstanding requests is also bounded and must
+    // terminate before a delayed reply arrives.
+    std::atomic<bool> cancellation_flag{false};
+    const int before_cancel = requests;
+    QTimer::singleShot(10, &server, [&]() { cancellation_flag.store(true); });
+    bool in_flight_cancellation = false;
+    try
+    {
+        (void)readTerrain(source, geometry,
+            QStringLiteral("copernicus-glo30"), cancellation_flag);
+    }
+    catch (const std::runtime_error &error)
+    {
+        in_flight_cancellation = std::strcmp(error.what(), "Job canceled") == 0;
+    }
+    assert(in_flight_cancellation);
+    assert(requests > before_cancel && requests <= before_cancel + 4);
+
     // Cancellation remains effective before issuing the next network patch.
     const std::atomic<bool> cancelled{true};
     bool cancellation_caught = false;
@@ -150,6 +225,22 @@ int main(int argc, char **argv)
         cancellation_caught = std::strcmp(error.what(), "Job canceled") == 0;
     }
     assert(cancellation_caught);
-    assert(requests == 6);
+    assert(requests <= before_cancel + 4);
+    // Never accept an unbounded number of requests from a malformed library
+    // config, even when the caller bypasses the REST server INI parser.
+    for (const int invalid_limit : {0, 5})
+    {
+        source.max_concurrent_requests = invalid_limit;
+        bool invalid_rejected = false;
+        try
+        {
+            (void)readTerrain(source, geometry, QStringLiteral("copernicus-glo30"), running);
+        }
+        catch (const std::invalid_argument &)
+        {
+            invalid_rejected = true;
+        }
+        assert(invalid_rejected);
+    }
     return 0;
 }
