@@ -176,8 +176,9 @@ or proof that all hierarchy outputs match across all DEM inputs.
 
 After the hierarchy improvement, terrain fetching became the largest measured
 server stage: 225.26 ms out of 530.12 ms. The REST terrain reader acquires
-bounded Map analysis-grid patches sequentially; a typical 352 × 556 raster
-with `terrain/patch_size=256` uses **six source patches**. Previously, each
+bounded Map analysis-grid patches, with 1–4 outstanding requests per analysis
+worker (default 4); a typical 352 × 556 raster with `terrain/patch_size=256`
+uses **six source patches**. Previously, each
 patch constructed a new `QNetworkAccessManager`, so Map could not reuse the
 same HTTP connection across successive requests. The reader now constructs
 one manager in the caller's worker thread for the duration of **one terrain
@@ -354,13 +355,12 @@ into the DEM takes approximately 0.13 ms. That request measurement includes
 **Map processing, Qt/HTTP delivery, and client waiting together**; it does
 not establish whether TCP or raster sampling dominates inside Map.
 
-Before changing the production acquisition path to parallel requests, use
-`tools/benchmark_map_concurrency.py` to probe whether the *existing* Map
-server can serve independent DEM patch GET requests concurrently. This is a
+Use `tools/benchmark_map_concurrency.py` to independently measure how well
+the *existing* Map server serves concurrent DEM patch GET requests. This is a
 **read-only experiment**: provide an already completed Hydrology job, and the
 probe reconstructs the original full-grid Map patch requests from the saved
 analysis geometry. It does not create jobs, delete caches, change Map settings,
-or change Hydrology's sequential production fetch policy.
+or modify Hydrology's production concurrency setting.
 
 ```bash
 ./tools/benchmark_map_concurrency.py \
@@ -397,17 +397,132 @@ concurrency levels, otherwise the probe fails. Metrics distinguish:
   each level's median, descriptive rather than a guarantee of speedup.
 
 Concurrent requests may be serviced in parallel by Map, but faster results
-here would **not** establish that changing Hydrology to concurrent acquisition
-will produce the same speedup: the Python client has different HTTP behavior,
-thread scheduling, and cache locality. Map's internal sampling CPU and
-transport costs still require instrumenting AOWIS-SERVER-MAP. Keep the
-existing single-worker baseline and verify output identity before pursuing
-production concurrency.
+here does **not** guarantee identical gains in Hydrology's already-parallel
+production reader: Python and Qt have different connection handling and
+scheduling. Production `terrain_fetch` timings and byte-identical raster
+outputs are the appropriate validation. Map's internal sampling CPU and
+transport costs still require instrumentation in AOWIS-SERVER-MAP.
 
 **Repository packaging:** `.gitignore` ignores `benchmark*.json` and
 `benchmark*.log` result files, but not `tools/benchmark_map_series.py` or
 `tools/benchmark_map_concurrency.py`. The source scripts must appear in
-`tools/zip_hydrology.sh` repository archives even when untracked.
+`tools/zip_hydrology.sh` repository archives even when untracked. All
+`tools/benchmark_map_*.py` entrypoints must be executable; the packaging tool
+rejects missing execute bits. Generated Python `__pycache__` directories and
+bytecode files are excluded from source archives.
+
+
+### Simultaneous Hydrology analysis jobs (live scaling benchmark)
+
+`tools/benchmark_map_jobs.py` tests **inter-job** scaling rather than the
+number of Map patches dispatched **within one job**. It submits several
+independent jobs at approximately the same time using a bounded worker pool,
+and polls each job until completion. Each job may itself dispatch up to four
+parallel Map HTTP requests; thus four active jobs can ask Map to handle up to
+**16** outstanding terrain-patch requests (not a global throughput promise).
+The production terrain-analysis scheduler is **configurable**:
+`server/max_concurrent_analyses=1` (default) serializes whole analysis jobs;
+2–4 permit overlapping analysis jobs after a service restart. The HTTP
+`/status` response reports both the configured worker count and per-analysis
+Map request cap. At 4 active workers and 4 Map requests per worker there may
+be as many as 16 outstanding HTTP calls, but this is not a Map global limit.
+The independent redistribution and coupled-simulation queues remain unchanged.
+A borrowed in-process Map source must be explicitly verified thread-safe
+before raising analysis worker count.
+
+Run against your development servers only. This workload creates **persistent
+analyses**; a default 1/2/4-job × three-round test creates 21 new analyses.
+There is no automatic deletion or server-side cancellation if a test fails.
+Use a fresh small terrain domain first and inspect Map load, then consider
+larger inputs. The example below uses the same measured 195,712-cell GLO-30
+region as the single-job tests:
+
+```bash
+./tools/benchmark_map_jobs.py \
+  --west 8.600 --south 50.650 --east 8.750 --north 50.800 \
+  --resolution-m 30 --jobs 1,2,4 --rounds 3 \
+  --poll-seconds 0.05 --source-patch-size 256 \
+  > benchmark-map-jobs.json
+
+jq '{created: .total_jobs_created, results: [.results[] | {
+  jobs, wall_ms: .wall_ms.median,
+  throughput_jobs_per_second: .throughput_jobs_per_second.median,
+  relative_throughput_vs_single,
+  job_latency_ms: .job_latency_ms.median,
+  queue_wait_ms: .queue_wait_ms.median,
+  terrain_fetch_ms: .stage_timings_ms.terrain_fetch.median,
+  worker_ms: .stage_timings_ms.total_worker.median
+}]}' benchmark-map-jobs.json
+```
+
+Newly submitted jobs now include `stage_timings_ms.queue_wait` in their
+persistent metadata: the monotonic wall time between enqueueing in the
+analysis thread pool and starting its worker. It is **excluded** from
+`total_worker`. The multi-job report exposes `queue_wait_ms` as an individual
+job measurement and a per-concurrency-level distribution; old servers that
+do not report it yield `null`, not a fabricated zero. With
+`max_concurrent_analyses=1`, queued waves should show much larger waits
+than their actual worker times. With a higher worker cap, remeasure both
+batch throughput and peak **Map/Hydrology RSS**. Do not assume more workers
+always improves performance: it adds CPU competition, increases live DEM
+memory and can multiply Map requests.
+
+The benchmark stops each wave's wall timer when the **last** analysis reports
+`completed`, then reads a stored elevation raster window for every job. Those
+checks, and an optional independent Map DEM-parity check when `--map-url` is
+supplied, are deliberately excluded from the completion wall time; they
+also cannot affect other jobs within that wave. All jobs must agree on
+dimensions, dataset, basin count, conditioned cells and the sampled elevation
+window's SHA-256. Full-grid DEM identity is **not** implied by a matching
+sampled window. Different result values abort the benchmark.
+
+`relative_throughput_vs_single` is the job count multiplied by the median
+single-job wave wall time divided by that level's median wave wall time;
+this is a *batch throughput comparison*, not a sustainable jobs-per-second
+rate or a concurrency guarantee. The report retains all individual measured
+wave and job observations, plus per-job stage times and measured peak Map
+patch concurrency. Warmup waves are optional; they also create saved jobs but
+are excluded from aggregate results. The order of concurrency levels rotates
+to limit systematic warm-cache/order effects.
+
+Resource limits are enforced **before** submitting any job:
+
+- `--jobs` must be a unique comma-separated subset of 1..4 containing 1;
+  `--rounds` is 1..5, `--warmup-rounds` is 0..2, and at most 40 new jobs
+  are permitted per benchmark invocation.
+- `--max-cells` limits each job (default 250,000); `--max-batch-cells`
+  limits simultaneous requested cells (default 1,000,000); and
+  `--max-total-cells` limits all persisted new cells (default 8,000,000).
+- To test a larger region, raise those budgets **explicitly**, choosing fewer
+  job levels or rounds if needed; the server's own `max_cells` still applies.
+  `--job-timeout` applies separately to every submitted job.
+
+For optional live Linux **process RSS** sampling, supply the actual process
+IDs from your local Map and Hydrology services; e.g. append:
+
+```bash
+  --map-pid <MAP_SERVER_PID> --hydrology-pid <HYDROLOGY_SERVER_PID>
+```
+
+Only when PIDs are supplied, the tool periodically reads `/proc/<pid>/status`
+`VmRSS` during each wave, reporting `initial_kib`, `peak_kib`, `last_kib`,
+`peak_increase_kib`, and sample counts for each process. PID accessibility is
+validated before any job is submitted; benchmark failure can still leave jobs
+running. These samples are **not** peak total system RAM, include neither
+unreported child processes nor Map's cache allocations that happened before
+the wave, and can miss brief short-lived peaks. `--rss-poll-seconds` defaults
+to 0.025 (valid 0.01..1 second). Use system monitoring for memory pressure,
+CPU scheduling, disk I/O and other tenants while interpreting the results.
+
+Run local, no-server protocol regression checks with:
+
+```bash
+python3 tests/test_benchmark_map_jobs.py -v
+```
+
+The opt-in `AOWIS_HYDROLOGY_BUILD_BENCHMARKS=ON` CTest suite registers the
+same offline test. Ordinary Debug/Release builds and the 18-test service
+suite remain unchanged; the tool does **not** need new C++ instrumentation.
 
 ## Verification and reference comparisons
 
@@ -552,6 +667,7 @@ Example of the *shape* of the result (numbers are illustrative):
 
 ```json
 "stage_timings_ms": {
+  "queue_wait": 12.0,
   "terrain_fetch": 40.0,
   "terrain_validation": 0.5,
   "d8_analysis": 75.0,
@@ -564,6 +680,7 @@ Example of the *shape* of the result (numbers are illustrative):
 
 | Stage key | Start and end of measurement |
 | --- | --- |
+| `queue_wait` | Elapsed time between submitting a persisted job to the terrain-analysis thread pool and entering the worker; **excluded** from `total_worker` |
 | `terrain_fetch` | Entire injected/Map terrain reader call, including HTTP, retries, assembling source tiles; excludes coverage validation |
 | `terrain_validation` | Geometry/coverage validation before D8 computation |
 | `d8_analysis` | `analyze()` including terrain conditioning, flow directions and upstream accumulation |
@@ -575,7 +692,7 @@ Example of the *shape* of the result (numbers are illustrative):
 All figures are **monotonic wall-clock milliseconds**, not CPU usage. Individual
 stages exclude most intermediate metadata-manifest writes, Qt bookkeeping and
 scheduler overhead. Accordingly, `total_worker` is expected to be at least
-the sum of recorded stages (within floating-point error); don't infer that
+the sum of the execution stages **excluding `queue_wait`** (within floating-point error); don't infer that
 the remainder is idle CPU time. The final completion-manifest commit follows
 the `total_worker` measurement. Failed or canceled jobs may expose only the
 stages they reached plus `total_worker`.

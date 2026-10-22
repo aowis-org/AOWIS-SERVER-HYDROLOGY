@@ -50,6 +50,7 @@ struct AnalysisService::Job
     std::uint64_t basin_count = 0;
     QJsonObject stage_timings_ms;
     QJsonObject terrain_fetch_details;
+    std::chrono::steady_clock::time_point queued_at{};
     std::atomic<bool> cancelled {false};
 };
 
@@ -504,6 +505,14 @@ AnalysisService::~AnalysisService()
 
 bool AnalysisService::initialize(QString *error)
 {
+    if (this->config.max_concurrent_analyses < 1 ||
+        this->config.max_concurrent_analyses > 4)
+    {
+        if (error != nullptr)
+            *error = QStringLiteral("max_concurrent_analyses must be between 1 and 4");
+        return false;
+    }
+    this->workers.setMaxThreadCount(this->config.max_concurrent_analyses);
     if (this->config.output_directory.isEmpty() ||
         !QDir().mkpath(this->config.output_directory))
     {
@@ -653,6 +662,16 @@ void AnalysisService::runJob(const QSharedPointer<Job> &job)
 {
     using Clock = std::chrono::steady_clock;
     const Clock::time_point worker_started = Clock::now();
+    // This is QUEUE delay, not worker execution: the one-worker baseline
+    // serialized jobs even though their Map HTTP patches overlapped.
+    if (job->queued_at != Clock::time_point{})
+    {
+        const double queue_ms = std::chrono::duration<double, std::milli>(
+            worker_started - job->queued_at).count();
+        QMutexLocker locker(&this->jobs_mutex);
+        job->stage_timings_ms.insert(QStringLiteral("queue_wait"),
+                                     std::max(0.0, queue_ms));
+    }
     // All timing fields represent elapsed monotonic wall time, never CPU time.
     // Updating a job's metrics uses the same lock as jobJson(), so HTTP
     // readers cannot observe a partially updated JSON object.
@@ -894,6 +913,10 @@ QString AnalysisService::submit(const AnalysisRequest &request, QString *error)
         if (error != nullptr) *error = QStringLiteral("Cannot persist job metadata");
         return {};
     }
+    // Queue time begins after the manifest is safely persisted. Pool size is
+    // configured once on initialize(), so pending jobs remain bounded by the
+    // accepted service requests rather than spawning arbitrary threads.
+    job->queued_at = std::chrono::steady_clock::now();
     // Unlike QtConcurrent::run, QThreadPool::start is a fire-and-forget API.
     this->workers.start([this, job]() { runJob(job); });
     return id;

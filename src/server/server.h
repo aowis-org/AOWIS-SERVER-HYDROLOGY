@@ -18,6 +18,7 @@ struct ServerConfig
     QString output_directory;
     QString dataset = QStringLiteral("copernicus-glo30");
     std::uint64_t maximum_cells = 10000000;
+    int max_concurrent_analyses = 1;
 };
 
 // Thin HTTP adapter. All analysis/jobs/results are owned by AnalysisService.

@@ -34,10 +34,23 @@ paths=()
 while IFS= read -r -d '' path; do
     [[ -f "$project_root/$path" && ! -L "$project_root/$path" ]] || continue
     [[ "$project_root/$path" != "$output_path" ]] || continue
+    # Benchmark entrypoints are documented as directly executable. Preserve
+    # that contract in worktree archives rather than silently distributing
+    # a non-executable script (which will remain non-executable on extraction).
+    case "$path" in
+        tools/benchmark_map_*.py)
+            if [[ ! -x "$project_root/$path" ]]; then
+                printf 'Benchmark entrypoint must be executable: %s (run chmod +x %q)\n' \
+                    "$path" "$project_root/$path" >&2
+                exit 1
+            fi
+            ;;
+    esac
     # Exclude the original misnamed Bash script if it remains after upgrade.
     [[ "$path" != tools/zip_hydrology.zip ]] || continue
     case "/$path" in
         */.env|*/.env.*|*.pem|*.key|*.p12|*.pfx|*/id_rsa|*/id_ed25519) continue ;;
+        */__pycache__/*|*.pyc|*.pyo|*.pyd) continue ;;
     esac
     if [[ "$path" == *$'\n'* ]]; then
         printf 'Filename contains a newline: cannot package safely.\n' >&2

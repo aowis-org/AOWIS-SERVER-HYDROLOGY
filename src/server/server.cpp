@@ -45,6 +45,7 @@ ServiceConfig serviceConfig(const ServerConfig &config)
     result.output_directory = config.output_directory;
     result.dataset = config.dataset;
     result.maximum_cells = config.maximum_cells;
+    result.max_concurrent_analyses = config.max_concurrent_analyses;
     return result;
 }
 } // namespace
@@ -70,11 +71,13 @@ bool Server::start(QString *error_message)
 
 void Server::setupRoutes()
 {
-    this->http.route("/status", QHttpServerRequest::Method::Get, []()
+    this->http.route("/status", QHttpServerRequest::Method::Get, [this]()
     {
-        return jsonResponse(QJsonObject{{QStringLiteral("service"),
-            QStringLiteral("aowis-server-hydrology")},
-            {QStringLiteral("status"), QStringLiteral("ok")}});
+        return jsonResponse(QJsonObject{
+            {QStringLiteral("service"), QStringLiteral("aowis-server-hydrology")},
+            {QStringLiteral("status"), QStringLiteral("ok")},
+            {QStringLiteral("max_concurrent_analyses"), this->config.max_concurrent_analyses},
+            {QStringLiteral("map_requests_per_analysis"), this->config.source.max_concurrent_requests}});
     });
 
     this->http.route("/v1/jobs", QHttpServerRequest::Method::Post,

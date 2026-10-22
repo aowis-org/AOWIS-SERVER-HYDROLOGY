@@ -106,6 +106,11 @@ if(AOWIS_HYDROLOGY_BUILD_BENCHMARKS)
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_benchmark_map_concurrency.py")
             set_tests_properties(aowis-hydrology-benchmark-map-concurrency-mock PROPERTIES
                 LABELS "hydrology;aowis;benchmark-smoke")
+            add_test(NAME aowis-hydrology-benchmark-map-jobs-mock
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_benchmark_map_jobs.py")
+            set_tests_properties(aowis-hydrology-benchmark-map-jobs-mock PROPERTIES
+                LABELS "hydrology;aowis;benchmark-smoke")
         endif()
     endif()
 endif()
@@ -155,6 +160,17 @@ if(AOWIS_HYDROLOGY_BUILD_SERVER)
     target_compile_features(aowis-server-hydrology PRIVATE cxx_std_20)
     target_link_libraries(aowis-server-hydrology PRIVATE
         AOWIS::HydrologyService Qt6::HttpServer)
+    if(BUILD_TESTING)
+        find_package(Python3 QUIET COMPONENTS Interpreter)
+        if(Python3_Interpreter_FOUND)
+            add_test(NAME aowis-hydrology-server-config-cli
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_server_config_cli.py"
+                    "$<TARGET_FILE:aowis-server-hydrology>")
+            set_tests_properties(aowis-hydrology-server-config-cli PROPERTIES
+                LABELS "hydrology;aowis")
+        endif()
+    endif()
 endif()
 
 if(BUILD_TESTING)

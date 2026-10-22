@@ -112,7 +112,13 @@ Use it after starting the instrumented server; the single-job
 A separate **read-only** `tools/benchmark_map_concurrency.py` probes 1, 2
 and 4 concurrent Map DEM patch requests against an existing completed job,
 verifying identical per-patch SHA-256 results before reporting any timing
-comparison. It does not enable parallel acquisition in production.
+comparison. Production REST terrain acquisition independently supports a configurable
+1–4 concurrent requests per analysis worker (default 4); the probe does not
+change that setting. The separate `tools/benchmark_map_jobs.py` performs
+bounded **simultaneous analysis jobs** (1/2/4 jobs per wave), records
+per-job worker latency and batch throughput, verifies saved DEM windows after
+each measured wave, and can sample local Linux Map/Hydrology process RSS.
+It does not change the service scheduler or delete the persisted jobs it creates.
 
 `tools/benchmark_map_http.py` benchmarks a live Map → Hydrology terrain job,
 repeated bounded raster and basin queries, DEM window parity between Map and
@@ -134,16 +140,26 @@ comparison methodology and measured baseline performance.
 For a normal HTTP deployment, configure Hydrology to use the **Map** service:
 
 ```ini
+[server]
+; Active terrain-analysis jobs. Default 1; raise to 2 only after measuring RAM.
+max_concurrent_analyses=1
+
 [terrain]
 dataset=copernicus-glo30
 mode=rest
 map_url=http://127.0.0.1:8122/
-# Optional if the existing Map server requires its configured read key:
+; Optional if the existing Map server requires its configured read key:
 map_read_api_key=
 request_timeout_ms=180000
 patch_size=256
 max_concurrent_requests=4
 ```
+
+INI comment lines must begin with `;` (not `#`), as required by Qt's
+`QSettings::IniFormat`. If you generated an INI with an earlier version and
+changed any settings, replace its comment prefixes rather than overwriting
+those settings. Both `--write-default-config` and `--print-default-config`
+produce valid, loadable INI examples.
 
 Hydrology no longer has a `terrain/local_dem_directory` or a production
 `mode=geotiff`: the **Map server** owns terrain acquisition and cached files.
@@ -151,6 +167,10 @@ The Hydrology executable also does not instantiate an independent Map service.
 The in-process/standalone application must supply its **already initialized**
 `Aowis::Map::TerrainData` instance via `SourceConfig::local_map` (when built
 with `AOWIS_HYDROLOGY_USE_LOCAL_MAP=ON`) or an injected `TerrainReader`.
+The default one-worker queue also protects borrowed in-process Map objects;
+only enable multiple analysis workers when the Map interface or injected
+callback is independently verified as thread-safe. HTTP workers have their
+own Qt network managers and independent output directories.
 
 The optional `AOWIS::HydrologyRaster` library remains a Qt-independent GDAL
 GeoTIFF reader for unit tests and development tools. To exclude it completely,
@@ -183,16 +203,38 @@ To build only the Qt-independent algorithm library, disable **both** `AOWIS_HYDR
 
 ## Configuration
 
-Configuration is Qt **INI** format. The application does not create or alter a file on startup.
+Configuration uses Qt **INI** format. The default file is located under the OS's
+per-user application data directory; on Linux this is normally
+`~/.local/share/aowis-server-hydrology/hydrology.ini` (or
+`$XDG_DATA_HOME/aowis-server-hydrology/hydrology.ini` when `XDG_DATA_HOME` is set).
+Qt selects the equivalent user-data directory on Windows and macOS. The
+analysis output defaults to the sibling `analyses/` directory.
+
+Create the file once and edit it:
 
 ```bash
-./build/aowis-server-hydrology --print-default-config
-./build/aowis-server-hydrology --write-default-config ./hydrology.ini
-./build/aowis-server-hydrology --config ./hydrology.ini --check-config
-./build/aowis-server-hydrology --config ./hydrology.ini
+./build-linux/aowis-server-hydrology --write-default-config
+nano ~/.local/share/aowis-server-hydrology/hydrology.ini
+./build-linux/aowis-server-hydrology --check-config
+./compile_linux.sh
 ```
 
-`--write-default-config` refuses to replace an existing file unless `--overwrite` is specified. Without `--config`, the service checks its default data-location configuration path, `aowis-server-hydrology/hydrology.ini`, and uses documented defaults if none exists. No configuration is silently generated. `--check-config` validates settings; it is not a test of map-server connectivity.
+The `nano` example assumes the default Linux XDG data location. **No `--config`
+argument is needed** to read this file at startup. The `--write-default-config`
+command creates its parent directory when necessary. It refuses to replace an
+existing file unless `--overwrite` is explicitly specified. Neither normal
+startup nor `--check-config` silently generates a configuration file.
+
+You can still choose an explicit file path or print the sample without writing:
+
+```bash
+./build-linux/aowis-server-hydrology --write-default-config ./hydrology.ini
+./build-linux/aowis-server-hydrology --config ./hydrology.ini --check-config
+./build-linux/aowis-server-hydrology --config ./hydrology.ini
+./build-linux/aowis-server-hydrology --print-default-config
+```
+
+`--check-config` validates settings but does not test Map server connectivity.
 
 Relevant INI options:
 
@@ -201,7 +243,8 @@ Relevant INI options:
 | `server/listen_address` | Bind address; defaults to loopback `127.0.0.1` |
 | `server/port` | REST port; defaults to `8123` |
 | `server/output_directory` | Persistent job/result storage; blank means platform default |
-| `server/max_cells` | Maximum cells per requested analysis (default 10 million) |
+| `server/max_cells` | Maximum cells per requested analysis (default 10 million), **per job**, not an aggregate memory budget |
+| `server/max_concurrent_analyses` | Active terrain-analysis workers, 1–4 (default **1**). Additional submitted jobs queue. At 4 Map GETs/job, the maximum per-service simultaneous Map GET count is workers × 4. Raising this multiplies peak memory demand and requires a restart |
 | `terrain/dataset` | Dataset identifier used by Map (initially `copernicus-glo30`) |
 | `terrain/mode` | `rest` (the executable); standalone selects a C++ Map source through the library API |
 | `terrain/map_url` | Map server base URL (REST mode; defaults to `http://127.0.0.1:8122/`) |

@@ -27,6 +27,11 @@ aowis-server-gui (same process)
 Standalone must not spawn Hydrology or Map HTTP daemons, create implicit localhost sockets, or implement an alternative hydrology algorithm. It invokes the same application-service operations in process. Map's existing configuration governs DEM availability, download policies and caches. A Map object supplied by the application is borrowed and must outlive the Hydrology service; ownership remains with the standalone application.
 
 The existing `AOWIS::Hydrology` target exposes the pure C++ `analyze()` algorithm. `AOWIS::HydrologyService` now owns the **existing terrain-analysis job API**, including background execution, persistence, cancellation, binary result retrieval and an injectable terrain callback. HTTP `Server` delegates to this library. Rainfall scenarios and persisted static basin-overflow redistribution use that same application service; background redistribution tasks share the same service, with task status and cooperative cancellation. The legacy C++ redistribution method remains synchronous, but REST GET is cache-only. GUI wiring and time-dependent hydraulics remain future work. See [RUNOFF_REDISTRIBUTION.md](RUNOFF_REDISTRIBUTION.md), [REDISTRIBUTION_CACHE.md](REDISTRIBUTION_CACHE.md) and [ASYNCHRONOUS_REDISTRIBUTION.md](ASYNCHRONOUS_REDISTRIBUTION.md). Call `AnalysisService` directly instead of using HTTP server types in Standalone.
+`ServiceConfig::max_concurrent_analyses` (default 1, permitted range 1..4)
+controls the number of active terrain-analysis jobs in either integration;
+other submissions remain queued. A value above one requires a reentrant
+`TerrainReader`/borrowed Map source and additional per-job memory. It does not
+change the separate, one-worker redistribution and coupled-simulation queues.
 
 ## Stable interface principles
 

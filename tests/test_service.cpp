@@ -13,10 +13,14 @@
 #include <QThread>
 #include <QUuid>
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <stdexcept>
 #include <limits>
 
@@ -69,6 +73,88 @@ int main(int argc, char **argv)
                     float(1000 - int(y) - int(x));
         return result;
     };
+    // Separate per-job output directories and worker-local terrain readers
+    // permit bounded concurrent analysis. Verify the configured pool really
+    // overlaps two jobs, does not admit a third, and can cancel a queued job.
+    {
+        ServiceConfig invalid = configuration;
+        invalid.max_concurrent_analyses = 0;
+        AnalysisService invalid_service(invalid);
+        QString error;
+        assert(!invalid_service.initialize(&error));
+        assert(error.contains(QStringLiteral("max_concurrent_analyses")));
+        invalid.max_concurrent_analyses = 5;
+        AnalysisService oversized_service(invalid);
+        assert(!oversized_service.initialize(&error));
+    }
+    {
+        QTemporaryDir concurrent_directory;
+        assert(concurrent_directory.isValid());
+        ServiceConfig parallel = configuration;
+        parallel.output_directory = concurrent_directory.path();
+        parallel.max_concurrent_analyses = 2;
+        const TerrainReader base_reader = configuration.terrain_reader;
+        std::mutex gate_mutex;
+        std::condition_variable gate_condition;
+        int active = 0;
+        int entered = 0;
+        int peak = 0;
+        bool release = false;
+        parallel.terrain_reader = [&](const ElevationGrid &grid, const QString &dataset,
+                                      const std::atomic<bool> &cancelled)
+        {
+            {
+                std::unique_lock<std::mutex> lock(gate_mutex);
+                ++active;
+                ++entered;
+                peak = std::max(peak, active);
+                gate_condition.notify_all();
+                if (!gate_condition.wait_for(lock, std::chrono::seconds(5),
+                                             [&] { return release; }))
+                    throw std::runtime_error("Concurrent workers did not release");
+                --active;
+            }
+            return base_reader(grid, dataset, cancelled);
+        };
+        AnalysisService service(parallel);
+        QString error;
+        assert(service.initialize(&error));
+        const QString first = service.submit(smallRequest(), &error);
+        const QString second = service.submit(smallRequest(), &error);
+        assert(!first.isEmpty() && !second.isEmpty() && first != second && error.isEmpty());
+        {
+            std::unique_lock<std::mutex> lock(gate_mutex);
+            assert(gate_condition.wait_for(lock, std::chrono::seconds(5),
+                                           [&] { return entered == 2; }));
+            assert(peak == 2);
+        }
+        const QString third = service.submit(smallRequest(), &error);
+        assert(!third.isEmpty() && error.isEmpty());
+        QThread::msleep(35);
+        {
+            std::lock_guard<std::mutex> lock(gate_mutex);
+            assert(entered == 2); // bounded pool, no third terrain reader
+        }
+        assert(service.cancel(third));
+        {
+            std::lock_guard<std::mutex> lock(gate_mutex);
+            release = true;
+        }
+        gate_condition.notify_all();
+        waitForState(service, first, QStringLiteral("completed"));
+        waitForState(service, second, QStringLiteral("completed"));
+        waitForState(service, third, QStringLiteral("canceled"));
+        assert(peak == 2);
+        const QJsonObject timings = service.job(third)
+            .value(QStringLiteral("stage_timings_ms")).toObject();
+        assert(timings.value(QStringLiteral("queue_wait")).toDouble(-1) >= 15.0);
+        const QByteArray a = service.rasterWindow(first, QStringLiteral("elevation"),
+                                                  0, 0, 3, 3, &error);
+        assert(error.isEmpty() && !a.isEmpty());
+        const QByteArray b = service.rasterWindow(second, QStringLiteral("elevation"),
+                                                  0, 0, 3, 3, &error);
+        assert(error.isEmpty() && a == b);
+    }
     QString successful_id;
     QJsonObject saved_job_timings;
     QString rainfall_scenario_id;
@@ -202,6 +288,7 @@ int main(int argc, char **argv)
         }
         assert(timings.value(QStringLiteral("total_worker")).toDouble(-1.0) >=
             measured_stage_sum - 0.001);
+        assert(timings.value(QStringLiteral("queue_wait")).toDouble(-1) >= 0.0);
         saved_job_timings = timings;
         assert(completed.value(QStringLiteral("horizontal_crs")) ==
             QStringLiteral("EPSG:4326"));

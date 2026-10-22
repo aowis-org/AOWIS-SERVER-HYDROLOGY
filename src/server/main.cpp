@@ -16,25 +16,27 @@ namespace
 {
 QString exampleConfig()
 {
-    return QStringLiteral(R"INI(# AOWIS Hydrology service. No file is created unless explicitly requested.
-# Configure the AOWIS map server separately; this component never downloads DEMs.
+    return QStringLiteral(R"INI(; AOWIS Hydrology service. No file is created unless explicitly requested.
+; Configure the AOWIS map server separately; this component never downloads DEMs.
 [server]
 listen_address=127.0.0.1
 port=8123
 output_directory=
 max_cells=10000000
+; Independent analysis workers (1..4). Default 1 to limit memory use.
+max_concurrent_analyses=1
 
 [terrain]
 dataset=copernicus-glo30
 mode=rest
 map_url=http://127.0.0.1:8122/
-# Optional if Map already has a read API key configured:
+; Optional if Map already has a read API key configured:
 map_read_api_key=
 request_timeout_ms=180000
 patch_size=256
 max_concurrent_requests=4
-# Standalone integrations supply their already-initialized Map library instance
-# to AOWIS::HydrologyService; the executable always uses Map REST.
+; Standalone integrations supply their already-initialized Map library instance
+; to AOWIS::HydrologyService; the executable always uses Map REST.
 )INI");
 }
 
@@ -84,6 +86,14 @@ bool loadConfig(const QString &file_path, bool explicitly_requested,
         return false;
     }
     config->maximum_cells = std::uint64_t(max_cells);
+    config->max_concurrent_analyses = settings.value(
+        QStringLiteral("server/max_concurrent_analyses"), 1).toString().toInt(&valid);
+    if (!valid || config->max_concurrent_analyses < 1 ||
+        config->max_concurrent_analyses > 4)
+    {
+        *error = QStringLiteral("server/max_concurrent_analyses must be between 1 and 4");
+        return false;
+    }
     const QString output_path = settings.value(QStringLiteral("server/output_directory")).toString().trimmed();
     if (!output_path.isEmpty())
         config->output_directory = QFileInfo(output_path).isAbsolute()
@@ -158,11 +168,24 @@ int main(int argc, char *argv[])
     parser.addOption(QCommandLineOption(QStringLiteral("print-default-config"),
         QStringLiteral("Print a documented sample configuration")));
     parser.addOption(QCommandLineOption(QStringLiteral("write-default-config"),
-        QStringLiteral("Write example configuration, refusing an existing file"),
-        QStringLiteral("path")));
+        QStringLiteral("Write the default INI to the user data directory, or to an optional positional path")));
     parser.addOption(QCommandLineOption(QStringLiteral("overwrite"),
         QStringLiteral("Explicitly replace an existing example configuration")));
-    parser.process(application);
+    // Keep the former --write-default-config=PATH spelling valid even though
+    // the path is now optional and the Qt option itself takes no value.
+    QStringList arguments = application.arguments();
+    const QString write_config_prefix = QStringLiteral("--write-default-config=");
+    for (int index = 1; index < arguments.size(); ++index)
+    {
+        if (arguments.at(index).startsWith(write_config_prefix))
+        {
+            const QString path = arguments.at(index).mid(write_config_prefix.size());
+            arguments[index] = QStringLiteral("--write-default-config");
+            arguments.insert(index + 1, path);
+            ++index;
+        }
+    }
+    parser.process(arguments);
     QTextStream output(stdout);
     QTextStream errors(stderr);
     if (parser.isSet(QStringLiteral("print-default-config")))
@@ -170,32 +193,50 @@ int main(int argc, char *argv[])
         output << exampleConfig();
         return 0;
     }
+    const QString user_data_directory = QDir(QStandardPaths::writableLocation(
+        QStandardPaths::GenericDataLocation)).filePath(
+            QStringLiteral("aowis-server-hydrology"));
+    const QString default_config = QDir(user_data_directory).filePath(
+        QStringLiteral("hydrology.ini"));
     if (parser.isSet(QStringLiteral("write-default-config")))
     {
-        const QString output_path = parser.value(QStringLiteral("write-default-config"));
-        if (output_path.isEmpty() ||
-            (QFileInfo::exists(output_path) && !parser.isSet(QStringLiteral("overwrite"))))
+        const QStringList positional_paths = parser.positionalArguments();
+        if (positional_paths.size() > 1)
+        {
+            errors << "Expected at most one configuration output path.\n";
+            return 2;
+        }
+        const QString output_path = positional_paths.isEmpty()
+            ? default_config : positional_paths.first();
+        if (QFileInfo::exists(output_path) && !parser.isSet(QStringLiteral("overwrite")))
         {
             errors << "Refusing to overwrite configuration; use --overwrite explicitly.\n";
+            return 2;
+        }
+        const QFileInfo output_info(output_path);
+        if (!QDir().mkpath(output_info.absolutePath()))
+        {
+            errors << "Cannot create configuration directory: " << output_info.absolutePath() << '\n';
             return 2;
         }
         QSaveFile destination(output_path);
         if (!destination.open(QIODevice::WriteOnly) ||
             destination.write(exampleConfig().toUtf8()) < 0 || !destination.commit())
         {
-            errors << "Cannot write requested configuration file\n";
+            errors << "Cannot write requested configuration file: " << output_path << '\n';
             return 2;
         }
         output << "Wrote " << output_path << '\n';
         return 0;
     }
+    if (!parser.positionalArguments().isEmpty())
+    {
+        errors << "Unexpected positional argument (use --config <path> to load an INI).\n";
+        return 2;
+    }
     Aowis::Hydrology::ServerConfig config;
-    config.output_directory = QDir(QStandardPaths::writableLocation(
-        QStandardPaths::GenericDataLocation)).filePath(
-            QStringLiteral("aowis-server-hydrology/analyses"));
-    const QString default_config = QDir(QStandardPaths::writableLocation(
-        QStandardPaths::GenericDataLocation)).filePath(
-            QStringLiteral("aowis-server-hydrology/hydrology.ini"));
+    config.output_directory = QDir(user_data_directory).filePath(
+        QStringLiteral("analyses"));
     const bool explicit_config = parser.isSet(QStringLiteral("config"));
     const QString config_path = explicit_config
         ? parser.value(QStringLiteral("config")) : default_config;

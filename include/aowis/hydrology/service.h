@@ -50,6 +50,10 @@ struct ServiceConfig
     QString output_directory;
     QString dataset = QStringLiteral("copernicus-glo30");
     std::uint64_t maximum_cells = 10000000;
+    // Bounded number of simultaneous terrain-analysis jobs (1..4). Each
+    // REST job can also issue source.max_concurrent_requests Map requests.
+    // Keep the default at one for embedded integrations and large rasters.
+    int max_concurrent_analyses = 1;
     TerrainReader terrain_reader; // optional; defaults to Map HTTP/in-process adapter
 };
 
