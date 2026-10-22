@@ -2,6 +2,8 @@
 #include <aowis/hydrology/coupled_routing.h>
 #include <aowis/hydrology/depression_archive.h>
 #include <aowis/hydrology/spill_geometry.h>
+#include <aowis/hydrology/temporal_inflows.h>
+#include <aowis/hydrology/travel_time_inflows.h>
 
 #include <QCryptographicHash>
 #include <QDir>
@@ -96,7 +98,8 @@ struct SimulationInput
     CoupledRoutingOptions options;
 };
 
-SimulationInput parseInput(const QJsonObject &request, const SpillGeometry *geometry)
+SimulationInput parseInput(const QJsonObject &request, const SpillGeometry *geometry,
+                           bool scenario_forcing = false)
 {
     SimulationInput parsed;
     const QJsonArray reservoirs = boundedArray(request, "reservoirs", 1, MaximumReservoirs);
@@ -177,7 +180,8 @@ SimulationInput parseInput(const QJsonObject &request, const SpillGeometry *geom
         item.downstream_water_level_m = number(json, "downstream_water_level_m");
         parsed.outlets.push_back(item);
     }
-    const QJsonArray intervals = boundedArray(request, "inflows", 1, MaximumIntervals);
+    const QJsonArray intervals = scenario_forcing ? QJsonArray() :
+        boundedArray(request, "inflows", 1, MaximumIntervals);
     for (const QJsonValue &value : intervals)
     {
         requireSimulation(value.isObject(), "Invalid temporal inflow interval");
@@ -201,6 +205,62 @@ SimulationInput parseInput(const QJsonObject &request, const SpillGeometry *geom
         parsed.options.maximum_substeps = indexNumber(options, "maximum_substeps");
     parsed.options.maximum_output_intervals = MaximumIntervals;
     return parsed;
+}
+
+// Scenario forcing is opt-in; absence of a forcing object preserves the
+// existing, independently prescribed inflow history and binary result format.
+struct ScenarioForcingInput
+{
+    QString scenario_id;
+    QString model;
+    std::vector<TemporalRainfallInterval> profile;
+    TravelTimeOptions travel;
+};
+
+ScenarioForcingInput parseScenarioForcing(const QJsonObject &request)
+{
+    requireSimulation(request.value(QStringLiteral("scenario_forcing")).isObject() &&
+        !request.contains(QStringLiteral("inflows")),
+        "Specify either scenario_forcing or inflows, never both");
+    const QJsonObject forcing = request.value(QStringLiteral("scenario_forcing")).toObject();
+    ScenarioForcingInput result;
+    result.scenario_id = forcing.value(QStringLiteral("scenario_id")).toString();
+    requireSimulation(validUuid(result.scenario_id), "Invalid forcing scenario UUID");
+    result.model = forcing.value(QStringLiteral("delivery_model")).toString();
+    requireSimulation(result.model == QStringLiteral("instant") ||
+        result.model == QStringLiteral("d8_constant_velocity"),
+        "Unsupported forcing delivery model");
+    const QJsonArray profile = boundedArray(forcing, "time_profile", 1, MaximumIntervals);
+    long double fraction_total = 0.0L;
+    for (const QJsonValue &value : profile)
+    {
+        requireSimulation(value.isObject(), "Invalid runoff timing profile interval");
+        const QJsonObject interval = value.toObject();
+        const double duration = number(interval, "duration_seconds");
+        const double fraction = number(interval, "runoff_fraction");
+        requireSimulation(duration > 0.0 && fraction >= 0.0 && fraction <= 1.0,
+            "Invalid runoff timing profile duration or fraction");
+        result.profile.push_back({duration, fraction});
+        fraction_total += fraction;
+    }
+    requireSimulation(std::abs(fraction_total - 1.0L) <= 1e-9L,
+        "Runoff timing fractions must sum to one");
+    if (result.model == QStringLiteral("d8_constant_velocity"))
+    {
+        result.travel.effective_velocity_m_per_s = number(forcing, "effective_velocity_m_per_s");
+        result.travel.output_interval_seconds = number(forcing, "output_interval_seconds");
+        requireSimulation(result.travel.effective_velocity_m_per_s > 0.0 &&
+            result.travel.output_interval_seconds > 0.0,
+            "Invalid effective runoff velocity or output interval");
+        result.travel.maximum_output_intervals = MaximumIntervals;
+    }
+    else
+    {
+        requireSimulation(!forcing.contains(QStringLiteral("effective_velocity_m_per_s")) &&
+            !forcing.contains(QStringLiteral("output_interval_seconds")),
+            "Instant forcing does not use travel-time parameters");
+    }
+    return result;
 }
 
 QString simulationFolder(const QString &root, const QString &id)
@@ -397,7 +457,9 @@ QJsonObject readPage(const QString &folder, const QJsonObject &manifest, int off
         {QStringLiteral("total_snapshots"), int(shape.snapshots)},
         {QStringLiteral("offset"), offset}, {QStringLiteral("limit"), limit},
         {QStringLiteral("has_more"), end < shape.snapshots},
-        {QStringLiteral("snapshots"), snapshots}
+        {QStringLiteral("snapshots"), snapshots},
+        {QStringLiteral("scenario_forcing_result"),
+            manifest.value(QStringLiteral("scenario_forcing_result"))}
     };
 }
 
@@ -454,6 +516,161 @@ SpillGeometry loadGeometry(const QString &folder, const QJsonObject &analysis,
     return extractSpillGeometry(grid, hierarchy, 2000000, 16000000, cancelled);
 }
 
+DepressionHierarchy loadSavedHierarchy(const QString &folder, std::uint32_t columns,
+                                       std::uint32_t rows, const std::atomic<bool> *cancelled)
+{
+    if (cancelled->load()) throw std::runtime_error("Coupled simulation canceled");
+    QFile file(QDir(folder).filePath(QStringLiteral("basins.aowbin")));
+    const qint64 maximum = 41 + 162 * qint64(columns) * rows;
+    if (!file.open(QIODevice::ReadOnly) || file.size() < 41 ||
+        file.size() > maximum || file.size() > std::numeric_limits<int>::max())
+        throw std::runtime_error("Missing saved basin hierarchy");
+    const QByteArray bytes = file.readAll();
+    if (cancelled->load()) throw std::runtime_error("Coupled simulation canceled");
+    return decodeDepressionHierarchy(std::vector<std::uint8_t>(
+        reinterpret_cast<const std::uint8_t *>(bytes.constData()),
+        reinterpret_cast<const std::uint8_t *>(bytes.constData()) + bytes.size()),
+        columns, rows);
+}
+
+std::vector<double> readRunoffRaster(const QString &folder, std::uint64_t cell_count,
+                                    const std::atomic<bool> *cancelled)
+{
+    QFile file(QDir(folder).filePath(QStringLiteral("runoff.f64")));
+    if (!file.open(QIODevice::ReadOnly) || file.size() != qint64(cell_count * 8))
+        throw std::runtime_error("Missing or invalid rainfall runoff raster");
+    std::vector<double> volumes(std::size_t(cell_count), 0.0);
+    QByteArray block(8192, '\0');
+    for (std::uint64_t position = 0; position < cell_count;)
+    {
+        if (cancelled->load()) throw std::runtime_error("Coupled simulation canceled");
+        const qsizetype byte_count = qsizetype(std::min<std::uint64_t>(1024, cell_count - position) * 8);
+        if (file.read(block.data(), byte_count) != byte_count)
+            throw std::runtime_error("Truncated rainfall runoff raster");
+        for (qsizetype offset = 0; offset < byte_count; offset += 8)
+        {
+            const quint64 bits = qFromLittleEndian<quint64>(block.constData() + offset);
+            double amount = 0.0;
+            std::memcpy(&amount, &bits, 8);
+            requireSimulation(std::isfinite(amount) && amount >= 0.0,
+                "Invalid rainfall runoff raster value");
+            volumes[std::size_t(position++)] = amount;
+        }
+    }
+    return volumes;
+}
+
+QString fileSha256(const QString &path, const std::atomic<bool> *cancelled)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly))
+        throw std::runtime_error("Coupled forcing source is missing");
+    QCryptographicHash digest(QCryptographicHash::Sha256);
+    while (!file.atEnd())
+    {
+        if (cancelled->load()) throw std::runtime_error("Coupled simulation canceled");
+        const QByteArray block = file.read(65536);
+        if (block.isEmpty() && !file.atEnd())
+            throw std::runtime_error("Cannot read coupled forcing source");
+        digest.addData(block);
+    }
+    return QString::fromLatin1(digest.result().toHex());
+}
+
+struct PreparedForcing
+{
+    std::vector<CoupledInflowInterval> intervals;
+    QJsonObject provenance;
+};
+
+PreparedForcing buildScenarioForcing(const QString &job_folder, const QJsonObject &analysis,
+                                    const QJsonObject &request,
+                                    const std::vector<CoupledReservoir> &reservoirs,
+                                    const std::atomic<bool> *cancelled)
+{
+    const ScenarioForcingInput input = parseScenarioForcing(request);
+    const QString scenario_folder = QDir(job_folder).filePath(
+        QStringLiteral("rainfall-scenarios/") + input.scenario_id);
+    const QString scenario_path = QDir(scenario_folder).filePath(QStringLiteral("scenario.json"));
+    QFile file(scenario_path);
+    if (!file.open(QIODevice::ReadOnly) || file.size() <= 0 || file.size() > 262144)
+        throw std::runtime_error("Unknown or invalid rainfall scenario");
+    const QJsonDocument document = QJsonDocument::fromJson(file.readAll());
+    requireSimulation(document.isObject(), "Invalid rainfall scenario manifest");
+    const QJsonObject scenario = document.object();
+    requireSimulation(scenario.value(QStringLiteral("id")) == input.scenario_id &&
+        scenario.value(QStringLiteral("duration_seconds")).isDouble() &&
+        scenario.value(QStringLiteral("effective_runoff_volume_m3")).isDouble(),
+        "Inconsistent rainfall scenario identity or quantities");
+    const double duration = number(scenario, "duration_seconds");
+    const double expected_runoff = number(scenario, "effective_runoff_volume_m3");
+    requireSimulation(duration > 0.0 && expected_runoff >= 0.0,
+        "Invalid saved rainfall scenario duration or runoff volume");
+    const ElevationGrid elevation = loadDem(job_folder, analysis, cancelled);
+    const DepressionHierarchy hierarchy = loadSavedHierarchy(job_folder, elevation.columns,
+                                                               elevation.rows, cancelled);
+    const std::vector<double> runoff = readRunoffRaster(scenario_folder,
+        std::uint64_t(elevation.columns) * elevation.rows, cancelled);
+    PreparedForcing prepared;
+    double maximum_delay = 0.0;
+    double timeline_seconds = duration;
+    TemporalRunoffForcing forcing;
+    if (input.model == QStringLiteral("instant"))
+    {
+        forcing = temporalInflowsFromRaster(elevation, hierarchy, runoff, reservoirs,
+                                            input.profile, duration, cancelled);
+    }
+    else
+    {
+        const TravelTimeRunoffForcing delayed = travelTimeInflowsFromRaster(
+            elevation, hierarchy, runoff, reservoirs, input.profile, duration,
+            input.travel, cancelled);
+        forcing = delayed.forcing;
+        maximum_delay = delayed.maximum_source_travel_seconds;
+        timeline_seconds = delayed.output_duration_seconds;
+    }
+    requireSimulation(forcing.basin_inflows.size() >= 1 &&
+        forcing.basin_inflows.size() <= MaximumIntervals &&
+        forcing.direct_boundary_outflow_m3_by_interval.size() == forcing.basin_inflows.size(),
+        "Coupled simulation forcing exceeds the permitted interval budget");
+    requireSimulation(std::abs(forcing.generated_runoff_m3 - expected_runoff) <=
+        1e-7 * std::max(1.0, expected_runoff),
+        "Rainfall runoff file does not match scenario manifest");
+    prepared.intervals = std::move(forcing.basin_inflows);
+    const QJsonObject sources{
+        {QStringLiteral("scenario_manifest_sha256"), fileSha256(scenario_path, cancelled)},
+        {QStringLiteral("runoff_raster_sha256"), fileSha256(
+            QDir(scenario_folder).filePath(QStringLiteral("runoff.f64")), cancelled)},
+        {QStringLiteral("original_dem_sha256"), fileSha256(
+            QDir(job_folder).filePath(QStringLiteral("elevation.f32")), cancelled)},
+        {QStringLiteral("basin_hierarchy_sha256"), fileSha256(
+            QDir(job_folder).filePath(QStringLiteral("basins.aowbin")), cancelled)}
+    };
+    QJsonObject provenance{
+        {QStringLiteral("scenario_id"), input.scenario_id},
+        {QStringLiteral("delivery_model"), input.model},
+        {QStringLiteral("event_duration_seconds"), duration},
+        {QStringLiteral("output_duration_seconds"), timeline_seconds},
+        {QStringLiteral("maximum_source_travel_seconds"), maximum_delay},
+        {QStringLiteral("runoff_generated_m3"), forcing.generated_runoff_m3},
+        {QStringLiteral("delivered_to_basins_m3"), forcing.delivered_to_basins_m3},
+        {QStringLiteral("direct_dem_boundary_runoff_m3"), forcing.direct_boundary_outflow_m3},
+        {QStringLiteral("mass_balance_error_m3"), forcing.mass_balance_error_m3},
+        {QStringLiteral("interval_count"), int(prepared.intervals.size())},
+        {QStringLiteral("source_sha256"), sources},
+        {QStringLiteral("timing_assumed"), true}
+    };
+    if (input.model == QStringLiteral("d8_constant_velocity"))
+    {
+        provenance.insert(QStringLiteral("effective_velocity_m_per_s"),
+                          input.travel.effective_velocity_m_per_s);
+        provenance.insert(QStringLiteral("output_interval_seconds"),
+                          input.travel.output_interval_seconds);
+    }
+    prepared.provenance = provenance;
+    return prepared;
+}
+
 QJsonObject taskResponse(const QJsonObject &manifest)
 {
     return QJsonObject{
@@ -464,7 +681,9 @@ QJsonObject taskResponse(const QJsonObject &manifest)
         {QStringLiteral("result_ready"), manifest.value(QStringLiteral("state")) == QStringLiteral("completed")},
         {QStringLiteral("model"), QStringLiteral("coupled_reservoir_routing_v1")},
         {QStringLiteral("accepted_substeps"), manifest.value(QStringLiteral("accepted_substeps"))},
-        {QStringLiteral("rejected_substeps"), manifest.value(QStringLiteral("rejected_substeps"))}
+        {QStringLiteral("rejected_substeps"), manifest.value(QStringLiteral("rejected_substeps"))},
+        {QStringLiteral("scenario_forcing_result"),
+            manifest.value(QStringLiteral("scenario_forcing_result"))}
     };
 }
 }
@@ -496,7 +715,9 @@ QJsonObject AnalysisService::startCoupledSimulation(const QString &id,
         requireSimulation(!request.contains(QStringLiteral("options")) ||
             request.value(QStringLiteral("options")).isObject(),
             "Invalid coupled simulation options");
-        (void)parseInput(without_connections, nullptr);
+        const bool from_scenario = request.contains(QStringLiteral("scenario_forcing"));
+        if (from_scenario) (void)parseScenarioForcing(request);
+        (void)parseInput(without_connections, nullptr, from_scenario);
         QSharedPointer<CoupledTask> task;
         {
             QMutexLocker locker(&this->coupled_tasks_mutex);
@@ -566,13 +787,31 @@ void AnalysisService::runCoupledTask(const QSharedPointer<CoupledTask> &task)
         if (!connections.isEmpty())
             geometry = loadGeometry(QDir(this->config.output_directory).filePath(task->analysis_id),
                                     analysis, &task->cancelled);
-        const SimulationInput input = parseInput(task->request, &geometry);
+        SimulationInput input = parseInput(task->request, &geometry,
+            task->request.contains(QStringLiteral("scenario_forcing")));
+        QJsonObject forcing_provenance;
+        if (task->request.contains(QStringLiteral("scenario_forcing")))
+        {
+            PreparedForcing prepared = buildScenarioForcing(
+                QDir(this->config.output_directory).filePath(task->analysis_id),
+                analysis, task->request, input.reservoirs, &task->cancelled);
+            input.intervals = std::move(prepared.intervals);
+            forcing_provenance = prepared.provenance;
+        }
         const CoupledRoutingResult result = routeCoupledReservoirsWithOutlets(
             input.reservoirs, input.connections, input.outlets, input.intervals,
             input.options, &task->cancelled);
         accepted = result.accepted_substeps;
         rejected = result.rejected_substeps;
         writeResult(folder, task->request, result, task->cancelled);
+        if (!forcing_provenance.isEmpty())
+        {
+            // Save provenance before completed state is published. A failed
+            // write cannot claim a complete, reproducible simulation.
+            QJsonObject manifest = readManifest(folder);
+            manifest.insert(QStringLiteral("scenario_forcing_result"), forcing_provenance);
+            writeCoupledSimulationManifest(folder, manifest);
+        }
     }
     catch (const std::exception &ex)
     {

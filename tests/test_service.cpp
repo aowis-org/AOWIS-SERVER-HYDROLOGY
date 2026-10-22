@@ -399,6 +399,7 @@ int main(int argc, char **argv)
     QString basin_job_id;
     QString basin_id;
     QString basin_scenario_id;
+    QString scenario_coupled_simulation_id;
     configuration.terrain_reader = [](const ElevationGrid &geometry, const QString &,
                                       const std::atomic<bool> &)
     {
@@ -451,6 +452,93 @@ int main(int argc, char **argv)
             basin_job_id, centered_rain, &error);
         assert(error.isEmpty() && !centered.isEmpty());
         basin_scenario_id = centered.value(QStringLiteral("id")).toString();
+        // Saved rainfall scenarios can now drive a separate, opt-in coupled
+        // simulation. The reservoir curve remains EXPLICIT, not inferred.
+        const double capacity = single.value(QStringLiteral("capacity_at_spill_m3")).toDouble();
+        const QJsonObject forcing_reservoir{
+            {QStringLiteral("component_index"), 0},
+            {QStringLiteral("initial_storage_m3"), 0.0},
+            {QStringLiteral("stage_storage"), QJsonArray{
+                QJsonArray{10.0, 0.0}, QJsonArray{15.0, capacity},
+                QJsonArray{20.0, capacity * 2.0}}}
+        };
+        const QJsonArray forcing_profile{
+            QJsonObject{{QStringLiteral("duration_seconds"), 240.0},
+                {QStringLiteral("runoff_fraction"), 0.25}},
+            QJsonObject{{QStringLiteral("duration_seconds"), 360.0},
+                {QStringLiteral("runoff_fraction"), 0.75}}
+        };
+        const QJsonObject forcing_request{
+            {QStringLiteral("reservoirs"), QJsonArray{forcing_reservoir}},
+            {QStringLiteral("connections"), QJsonArray()},
+            {QStringLiteral("outlets"), QJsonArray()},
+            {QStringLiteral("scenario_forcing"), QJsonObject{
+                {QStringLiteral("scenario_id"), basin_scenario_id},
+                {QStringLiteral("delivery_model"), QStringLiteral("instant")},
+                {QStringLiteral("time_profile"), forcing_profile}}}
+        };
+        QJsonObject invalid_forcing = forcing_request;
+        invalid_forcing.insert(QStringLiteral("inflows"), QJsonArray());
+        assert(service.startCoupledSimulation(basin_job_id, invalid_forcing, &error).isEmpty());
+        assert(error.contains(QStringLiteral("either scenario_forcing or inflows")));
+        invalid_forcing = forcing_request;
+        QJsonObject invalid_profile = invalid_forcing.value(
+            QStringLiteral("scenario_forcing")).toObject();
+        invalid_profile.insert(QStringLiteral("scenario_id"), QStringLiteral("not-a-uuid"));
+        invalid_forcing.insert(QStringLiteral("scenario_forcing"), invalid_profile);
+        assert(service.startCoupledSimulation(basin_job_id, invalid_forcing, &error).isEmpty());
+        assert(error.contains(QStringLiteral("UUID")));
+        for (const QString &delivery : {QStringLiteral("instant"),
+                                        QStringLiteral("d8_constant_velocity")})
+        {
+            QJsonObject request = forcing_request;
+            if (delivery == QStringLiteral("d8_constant_velocity"))
+            {
+                QJsonObject details = request.value(QStringLiteral("scenario_forcing")).toObject();
+                details.insert(QStringLiteral("delivery_model"), delivery);
+                details.insert(QStringLiteral("effective_velocity_m_per_s"), 0.5);
+                details.insert(QStringLiteral("output_interval_seconds"), 60.0);
+                request.insert(QStringLiteral("scenario_forcing"), details);
+            }
+            const QJsonObject started = service.startCoupledSimulation(basin_job_id, request, &error);
+            assert(error.isEmpty());
+            const QString run_id = started.value(QStringLiteral("simulation_id")).toString();
+            assert(!run_id.isEmpty());
+            if (delivery == QStringLiteral("instant"))
+                scenario_coupled_simulation_id = run_id;
+            QElapsedTimer timer;
+            timer.start();
+            QJsonObject finished;
+            while (timer.elapsed() < 10000)
+            {
+                finished = service.coupledSimulationStatus(basin_job_id, run_id, &error);
+                assert(error.isEmpty());
+                if (finished.value(QStringLiteral("state")) == QStringLiteral("completed")) break;
+                assert(finished.value(QStringLiteral("state")) != QStringLiteral("failed"));
+                QThread::msleep(5);
+            }
+            assert(finished.value(QStringLiteral("state")) == QStringLiteral("completed"));
+            const QJsonObject provenance = finished.value(
+                QStringLiteral("scenario_forcing_result")).toObject();
+            assert(provenance.value(QStringLiteral("scenario_id")).toString() == basin_scenario_id);
+            assert(provenance.value(QStringLiteral("delivery_model")).toString() == delivery);
+            assert(provenance.value(QStringLiteral("direct_dem_boundary_runoff_m3")).toDouble() < 1e-8);
+            assert(provenance.value(QStringLiteral("delivered_to_basins_m3")).toDouble() > 0);
+            assert(provenance.value(QStringLiteral("source_sha256")).toObject().size() == 4);
+            const int total = service.coupledSimulationSnapshots(basin_job_id, run_id,
+                0, 1, &error).value(QStringLiteral("total_snapshots")).toInt();
+            assert(error.isEmpty());
+            assert(total == (delivery == QStringLiteral("instant") ? 3 : 11));
+            const QJsonObject end_page = service.coupledSimulationSnapshots(
+                basin_job_id, run_id, total - 1, 1, &error);
+            assert(error.isEmpty());
+            const QJsonObject last = end_page.value(QStringLiteral("snapshots"))
+                .toArray().first().toObject();
+            assert(std::abs(last.value(QStringLiteral("cumulative_inflow_m3")).toDouble() -
+                provenance.value(QStringLiteral("delivered_to_basins_m3")).toDouble()) < 1e-5);
+            assert(std::abs(last.value(QStringLiteral("total_storage_m3")).toDouble() -
+                provenance.value(QStringLiteral("delivered_to_basins_m3")).toDouble()) < 1e-5);
+        }
         const QJsonObject basin_balance = service.rainfallRedistribution(
             basin_job_id, basin_scenario_id, 0, 1, &error);
         assert(error.isEmpty() && basin_balance.value(QStringLiteral("total_basins")).toInt() == 1);
@@ -639,6 +727,16 @@ int main(int argc, char **argv)
         QString error;
         assert(restored.initialize(&error));
         assert(restored.job(basin_job_id).value(QStringLiteral("state")) == QStringLiteral("completed"));
+        const QJsonObject saved_forcing = restored.coupledSimulationStatus(
+            basin_job_id, scenario_coupled_simulation_id, &error);
+        assert(error.isEmpty() && saved_forcing.value(QStringLiteral("state")) ==
+            QStringLiteral("completed"));
+        assert(saved_forcing.value(QStringLiteral("scenario_forcing_result")).toObject()
+            .value(QStringLiteral("scenario_id")).toString() == basin_scenario_id);
+        const QJsonObject saved_forcing_page = restored.coupledSimulationSnapshots(
+            basin_job_id, scenario_coupled_simulation_id, 2, 1, &error);
+        assert(error.isEmpty() && saved_forcing_page.value(QStringLiteral("snapshots"))
+            .toArray().size() == 1);
         const QJsonObject persisted = restored.basins(basin_job_id, 0, 10, &error);
         assert(error.isEmpty() && persisted.value(QStringLiteral("total_basins")).toInt() == 1);
         assert(persisted.value(QStringLiteral("basins")).toArray().first().toObject()

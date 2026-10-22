@@ -101,7 +101,7 @@ A rainfall scenario with **no depression leaves** can yield a valid forcing whos
 
 **Implemented:** the independent C++ bridge in `AOWIS::Hydrology`, unchanged Map ownership of terrain, unchanged static rainfall/redistribution/inundation APIs, and an explicit distinction between dynamic reservoir inputs and direct DEM-edge runoff.
 
-**Not implemented yet:** time-resolved rainfall storage in the scenario service/REST, field-calibrated travel-time routing and runoff attenuation, different spatial hyetographs, calibrated boundary controls attached to a job, scenario-specific timed simulation jobs/cache formats, and integration with SWMM. The next service integration must persist the **time profile, calibration choices, source DEM/scenario identity, and hydraulic topology** separately from the existing static rainfall cache.
+**Still not implemented:** native time-resolved rainfall rasters in Stage 7 scenario storage, field-calibrated travel-time routing and runoff attenuation, spatially variable hyetographs, automatic hydraulic-control survey/calibration, and integration with SWMM. **Implemented opt-in:** a separate coupled-simulation REST job can now load a saved event-total scenario using an explicit `scenario_forcing` time profile, retaining its **profile, assumptions, source checksum provenance and calibrated connection inputs** separately from static rainfall caches. See [Scenario-driven coupled forcing](SCENARIO_COUPLED_FORCING.md).
 
 See [Rainfall scenarios](RAINFALL_SCENARIOS.md), [Runoff redistribution](RUNOFF_REDISTRIBUTION.md), [Coupled reservoir routing](COUPLED_RESERVOIR_ROUTING.md), and [Spill hydraulics](SPILL_HYDRAULICS.md) for the upstream calculation and hydraulic assumptions.
 
