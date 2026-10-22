@@ -97,7 +97,7 @@ The original, closed-network call returns **empty** `boundary_outflow_m3` and **
 
 ### Relationship to timed runoff forcing
 
-The existing [temporal forcing adapter](TEMPORAL_RUNOFF_FORCING.md) separately reports **direct runoff that reaches the analysis-domain boundary** by dry D8 paths without first entering a modeled basin. That volume **must not** be passed through a boundary outlet as though it were stored inside a reservoir. When combining the two subsystems, count *direct dry-D8 boundary discharge* and *coupled reservoir outlet discharge* as distinct outflow contributions. The adapter still has zero source-to-basin travel delay and still requires an explicit event-time profile.
+The existing [temporal forcing adapter](TEMPORAL_RUNOFF_FORCING.md) separately reports **direct runoff that reaches the analysis-domain boundary** by dry D8 paths without first entering a modeled basin. That volume **must not** be passed through a boundary outlet as though it were stored inside a reservoir. When combining the two subsystems, count *direct dry-D8 boundary discharge* and *coupled reservoir outlet discharge* as distinct outflow contributions. That immediate-delivery adapter has zero source-to-basin travel delay; the separate [D8 travel-time adapter](TRAVEL_TIME_RUNOFF.md) can now delay both basin inputs and direct boundary runoff using a specified effective velocity. Both adapters still require an explicit event-time profile.
 
 ## Stability, limits, and errors
 

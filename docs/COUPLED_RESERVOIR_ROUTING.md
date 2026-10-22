@@ -67,6 +67,10 @@ Unsupported physical regimes (for example, a partially submerged orifice with a 
 
 The calculation is bounded: at most 100,000 reservoirs, 200,000 connections, 100,000 input intervals, a configured maximum output-interval count, and a configured maximum total number of accepted/rejected substeps (up to 100 million). Cancellation is checked during routing and produces a `std::runtime_error`.
 
+### Optional travel-delayed rainfall forcing
+
+Use the [travel-time-aware forcing adapter](TRAVEL_TIME_RUNOFF.md) to produce `CoupledInflowInterval` values whose volumes follow an explicitly assumed **dry-D8 path velocity**. That adapter retains a full post-rainfall arrival tail and keeps direct DEM-edge runoff separate from modeled hydraulic outlet discharge. It does not calibrate a velocity or produce time-of-arrival observations; the original immediate-delivery [temporal forcing](TEMPORAL_RUNOFF_FORCING.md) remains an independent alternative.
+
 ## C++ usage: two connected reservoirs
 
 ```cpp
@@ -143,7 +147,7 @@ The reported water levels belong to **lumped reservoir approximations**. A snaps
 
 The solver **does not** yet have:
 
-- physically inferred rainfall-to-runoff timing or travel-time routing; the separate adapter accepts explicit event-time fractions and applies them uniformly, with zero source-to-basin delay;
+- physically inferred rainfall-to-runoff timing or calibrated travel-time routing; the immediate adapter applies explicit event-time fractions with zero delay, while the [separate D8 adapter](TRAVEL_TIME_RUNOFF.md) shifts them by a caller-assumed constant effective velocity;
 - a **submerged or reversible** outside-domain boundary, floodplain surface propagation, infiltration, evapotranspiration or negative discharge boundaries (the new opt-in terminal outlet handles one-way **free-overflow** only);
 - implicit time integration / hydraulic inertia / momentum conservation;
 - general culvert hydraulics, partially submerged apertures, complex multiway controls, backwater through connected channels or surveyed spillway cross-sections sourced automatically;
