@@ -70,6 +70,7 @@ int main(int argc, char **argv)
         return result;
     };
     QString successful_id;
+    QJsonObject saved_job_timings;
     QString rainfall_scenario_id;
     QString coupled_simulation_id;
     {
@@ -184,6 +185,22 @@ int main(int argc, char **argv)
         }
         assert(bad_finished);
         const QJsonObject completed = service.job(successful_id);
+        const QJsonObject timings = completed.value(QStringLiteral("stage_timings_ms")).toObject();
+        const QStringList stage_names{
+            QStringLiteral("terrain_fetch"), QStringLiteral("terrain_validation"),
+            QStringLiteral("d8_analysis"), QStringLiteral("raster_persistence"),
+            QStringLiteral("depression_hierarchy"), QStringLiteral("basin_persistence")};
+        double measured_stage_sum = 0.0;
+        for (const QString &name : stage_names)
+        {
+            assert(timings.contains(name));
+            const double milliseconds = timings.value(name).toDouble(-1.0);
+            assert(std::isfinite(milliseconds) && milliseconds >= 0.0);
+            measured_stage_sum += milliseconds;
+        }
+        assert(timings.value(QStringLiteral("total_worker")).toDouble(-1.0) >=
+            measured_stage_sum - 0.001);
+        saved_job_timings = timings;
         assert(completed.value(QStringLiteral("horizontal_crs")) ==
             QStringLiteral("EPSG:4326"));
         assert(completed.value(QStringLiteral("vertical_datum")) ==
@@ -337,6 +354,8 @@ int main(int argc, char **argv)
         AnalysisService restored(configuration);
         QString error;
         assert(restored.initialize(&error));
+        assert(restored.job(successful_id).value(QStringLiteral("stage_timings_ms")).toObject() ==
+            saved_job_timings);
         assert(restored.job(successful_id).value(QStringLiteral("state")) ==
             QStringLiteral("completed"));
         const QJsonObject persisted_coupled = restored.coupledSimulationStatus(

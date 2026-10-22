@@ -261,6 +261,69 @@ anything; use it after an actual server restart to test job and raster
 persistence, because re-querying during the same process lifetime does not
 prove restart recovery.
 
+### Server-side stage timing (new analyses)
+
+A completed analysis now includes a `stage_timings_ms` object in the normal
+`GET /v1/jobs/{job-id}` response. It is also retained in the job's `job.json`
+manifest and copied to `server_stage_timings_ms` in the live benchmark report.
+This does **not** change the request, binary raster formats, or analysis files.
+An older analysis created before this capability has an empty object; the
+benchmark prints that empty object (or `null` for an older server without the
+field). **Re-querying an existing job does not create historical timings.**
+
+Example of the *shape* of the result (numbers are illustrative):
+
+```json
+"stage_timings_ms": {
+  "terrain_fetch": 40.0,
+  "terrain_validation": 0.5,
+  "d8_analysis": 75.0,
+  "raster_persistence": 20.0,
+  "depression_hierarchy": 160.0,
+  "basin_persistence": 5.0,
+  "total_worker": 315.0
+}
+```
+
+| Stage key | Start and end of measurement |
+| --- | --- |
+| `terrain_fetch` | Entire injected/Map terrain reader call, including HTTP, retries, assembling source tiles; excludes coverage validation |
+| `terrain_validation` | Geometry/coverage validation before D8 computation |
+| `d8_analysis` | `analyze()` including terrain conditioning, flow directions and upstream accumulation |
+| `raster_persistence` | Writing and committing all seven analysis raster files |
+| `depression_hierarchy` | `buildDepressionHierarchy()` on the original DEM |
+| `basin_persistence` | Encoding and atomically writing `basins.aowbin` |
+| `total_worker` | Elapsed time in `runJob()` until completion is about to be recorded (or until failure/cancellation) |
+
+All figures are **monotonic wall-clock milliseconds**, not CPU usage. Individual
+stages exclude most intermediate metadata-manifest writes, Qt bookkeeping and
+scheduler overhead. Accordingly, `total_worker` is expected to be at least
+the sum of recorded stages (within floating-point error); don't infer that
+the remainder is idle CPU time. The final completion-manifest commit follows
+the `total_worker` measurement. Failed or canceled jobs may expose only the
+stages they reached plus `total_worker`.
+
+The client-reported `job_wait_s` is different: it includes queuing and
+asynchronous polling delay. In particular, the client observes states only at
+`--poll-seconds` intervals. Comparing repeated actual-region runs at the same
+resolution is more informative than using a synthetic hierarchy benchmark to
+infer Map/network costs. Server timing does not show Map's internal stages or
+identify whether Map downloaded new Copernicus tiles versus serving cache.
+
+To benchmark the same area with the new fields, **restart the Hydrology server
+with the updated executable**, then submit a *new* analysis:
+
+```bash
+./tools/benchmark_map_http.py \
+  --west 8.650 --south 50.670 --east 8.750 --north 50.770 \
+  --resolution-m 30 --poll-seconds 0.05 --repeats 5 \
+  > benchmark-district-stages.json
+```
+
+Only after this separation should we prioritize optimizing Map acquisition,
+D8, basin hierarchy, persistence or result queries. For a larger run, adjust
+`--max-cells` consciously and monitor the server's resident memory separately.
+
 **Important performance distinctions:** The measured full-job wall time
 includes Map network/download and disk writes; synthetic C++ core time does
 not. A first request can hit an already-populated Map cache. The Map sample

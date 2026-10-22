@@ -18,6 +18,7 @@
 #include <QtEndian>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -47,6 +48,7 @@ struct AnalysisService::Job
     double breach_excavation_m3 = 0.0;
     float maximum_breach_cut_m = 0.0f;
     std::uint64_t basin_count = 0;
+    QJsonObject stage_timings_ms;
     std::atomic<bool> cancelled {false};
 };
 
@@ -558,6 +560,7 @@ QJsonObject AnalysisService::jobJson(const QSharedPointer<Job> &job) const
     result.insert(QStringLiteral("potential_fill_volume_m3"), job->potential_fill_volume_m3);
     result.insert(QStringLiteral("maximum_potential_fill_m"), double(job->maximum_potential_fill_m));
     result.insert(QStringLiteral("basin_count"), double(job->basin_count));
+    result.insert(QStringLiteral("stage_timings_ms"), job->stage_timings_ms);
     return result;
 }
 
@@ -614,6 +617,7 @@ void AnalysisService::restoreJobs()
         job->potential_fill_volume_m3 = saved.value(QStringLiteral("potential_fill_volume_m3")).toDouble();
         job->maximum_potential_fill_m = float(saved.value(QStringLiteral("maximum_potential_fill_m")).toDouble());
         job->basin_count = std::uint64_t(saved.value(QStringLiteral("basin_count")).toDouble());
+        job->stage_timings_ms = saved.value(QStringLiteral("stage_timings_ms")).toObject();
         bool missing_basin_archive = false;
         if (job->state == QStringLiteral("completed") &&
             !QFileInfo::exists(QDir(jobDirectory(id)).filePath(QStringLiteral("basins.aowbin"))))
@@ -643,6 +647,19 @@ void AnalysisService::restoreJobs()
 
 void AnalysisService::runJob(const QSharedPointer<Job> &job)
 {
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point worker_started = Clock::now();
+    // All timing fields represent elapsed monotonic wall time, never CPU time.
+    // Updating a job's metrics uses the same lock as jobJson(), so HTTP
+    // readers cannot observe a partially updated JSON object.
+    const std::function<void(const QString &, const Clock::time_point &)> record_stage =
+        [this, &job](const QString &name, const Clock::time_point &started)
+        {
+            const double duration_ms =
+                std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+            QMutexLocker locker(&this->jobs_mutex);
+            job->stage_timings_ms.insert(name, duration_ms);
+        };
     try
     {
         if (job->cancelled.load())
@@ -652,9 +669,12 @@ void AnalysisService::runJob(const QSharedPointer<Job> &job)
             job->state = QStringLiteral("fetching-terrain");
         }
         writeManifest(job);
+        const Clock::time_point fetch_started = Clock::now();
         ElevationGrid source = this->config.terrain_reader
             ? this->config.terrain_reader(job->grid, job->dataset, job->cancelled)
             : readTerrain(this->config.source, job->grid, job->dataset, job->cancelled);
+        record_stage(QStringLiteral("terrain_fetch"), fetch_started);
+        const Clock::time_point validation_started = Clock::now();
         if (source.columns != job->grid.columns || source.rows != job->grid.rows ||
             source.geometry.origin_x != job->grid.geometry.origin_x ||
             source.geometry.origin_y != job->grid.geometry.origin_y ||
@@ -686,12 +706,15 @@ void AnalysisService::runJob(const QSharedPointer<Job> &job)
                 std::to_string(first_missing / source.columns));
         if (job->cancelled.load())
             throw std::runtime_error("Job canceled");
+        record_stage(QStringLiteral("terrain_validation"), validation_started);
         {
             QMutexLocker locker(&this->jobs_mutex);
             job->state = QStringLiteral("analyzing");
         }
         writeManifest(job);
+        const Clock::time_point analysis_started = Clock::now();
         AnalysisResult result = analyze(source, job->options, &job->cancelled);
+        record_stage(QStringLiteral("d8_analysis"), analysis_started);
         if (job->cancelled.load())
             throw std::runtime_error("Job canceled");
         {
@@ -710,6 +733,7 @@ void AnalysisService::runJob(const QSharedPointer<Job> &job)
         }
         writeManifest(job);
         const QDir folder(jobDirectory(job->id));
+        const Clock::time_point raster_save_started = Clock::now();
         writeArray(folder.filePath(QStringLiteral("elevation.f32")), result.source.elevations_m);
         writeArray(folder.filePath(QStringLiteral("conditioned.f32")), result.conditioned_elevations_m);
         writeArray(folder.filePath(QStringLiteral("potential-fill-depth.f32")), result.potential_fill_depth_m);
@@ -717,15 +741,19 @@ void AnalysisService::runJob(const QSharedPointer<Job> &job)
         writeArray(folder.filePath(QStringLiteral("upstream-area.f64")), result.upstream_area_m2);
         writeArray(folder.filePath(QStringLiteral("upstream-count.u64")), result.upstream_cell_count);
         writeArray(folder.filePath(QStringLiteral("downstream.i64")), result.downstream);
+        record_stage(QStringLiteral("raster_persistence"), raster_save_started);
         {
             QMutexLocker locker(&this->jobs_mutex);
             job->state = QStringLiteral("analyzing-basins");
         }
         writeManifest(job);
+        const Clock::time_point hierarchy_started = Clock::now();
         const DepressionHierarchy hierarchy = buildDepressionHierarchy(
             result.source, true, &job->cancelled);
+        record_stage(QStringLiteral("depression_hierarchy"), hierarchy_started);
         if (job->cancelled.load())
             throw std::runtime_error("Job canceled");
+        const Clock::time_point basin_save_started = Clock::now();
         const std::vector<std::uint8_t> encoded = encodeDepressionHierarchy(hierarchy);
         QSaveFile archive(folder.filePath(QStringLiteral("basins.aowbin")));
         if (!archive.open(QIODevice::WriteOnly) ||
@@ -733,6 +761,7 @@ void AnalysisService::runJob(const QSharedPointer<Job> &job)
                           qsizetype(encoded.size())) != qsizetype(encoded.size()) ||
             !archive.commit())
             throw std::runtime_error("Cannot save depression hierarchy archive");
+        record_stage(QStringLiteral("basin_persistence"), basin_save_started);
         {
             QMutexLocker locker(&this->jobs_mutex);
             job->basin_count = hierarchy.basins.size();
@@ -741,6 +770,7 @@ void AnalysisService::runJob(const QSharedPointer<Job> &job)
         writeManifest(job);
         if (job->cancelled.load())
             throw std::runtime_error("Job canceled");
+        record_stage(QStringLiteral("total_worker"), worker_started);
         {
             QMutexLocker locker(&this->jobs_mutex);
             job->state = QStringLiteral("completed");
@@ -750,6 +780,7 @@ void AnalysisService::runJob(const QSharedPointer<Job> &job)
     }
     catch (const std::exception &error)
     {
+        record_stage(QStringLiteral("total_worker"), worker_started);
         {
             QMutexLocker locker(&this->jobs_mutex);
             job->state = job->cancelled.load()

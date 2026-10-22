@@ -407,3 +407,10 @@ static runoff redistribution and persistent per-scenario result caching are avai
 sink, or a configured resource/distance limit. It does not simulate rainfall
 travel time or discharge.
 
+
+
+Completed terrain jobs expose persisted `stage_timings_ms` in their job
+metadata: Map/terrain acquisition, validation, D8 computation, raster writes,
+basin hierarchy, basin-archive writes, and total worker time. The opt-in live
+benchmark includes these values in `server_stage_timings_ms`; see
+[`docs/BENCHMARKING.md`](docs/BENCHMARKING.md) for units and interpretation.

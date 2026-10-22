@@ -57,7 +57,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/v1/jobs/00000000-0000-4000-8000-000000000001":
             self.send_json({"id": "00000000-0000-4000-8000-000000000001", "state": "completed", "columns": 4,
                             "rows": 4, "basin_count": 1, "conditioned_cells": 2, "dataset": "copernicus-glo30",
-                            "vertical_datum": "EGM2008", "west": 8.0, "north": 50.0,
+                            "vertical_datum": "EGM2008", "stage_timings_ms": {
+                                "terrain_fetch": 3.0, "depression_hierarchy": 5.0,
+                                "total_worker": 12.0}, "west": 8.0, "north": 50.0,
                             "step_lon_deg": 0.0004, "step_lat_deg": 0.0004})
         elif path.endswith("/raster/elevation"):
             from urllib.parse import parse_qs, urlsplit
@@ -116,6 +118,9 @@ class LiveBenchmarkTests(unittest.TestCase):
     def test_live_job_and_parity(self):
         result = benchmark.run(self.args("--map-read-api-key", "secret-example"))
         self.assertEqual(result["cells"], 16)
+        self.assertEqual(result["server_stage_timings_ms"], {
+            "terrain_fetch": 3.0, "depression_hierarchy": 5.0,
+            "total_worker": 12.0})
         self.assertTrue(result["map_hydrology_parity"]["exact_bytes_equal"])
         self.assertEqual(result["elevation_window"]["count"], 2)
         self.assertEqual(Handler.state["post_count"], 1)

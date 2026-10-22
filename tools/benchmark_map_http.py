@@ -285,6 +285,12 @@ def run(args):
     report["cells"] = columns * rows
     report["basin_count"] = metadata.get("basin_count")
     report["conditioned_cells"] = metadata.get("conditioned_cells")
+    stage_timings = metadata.get("stage_timings_ms")
+    if stage_timings is not None and not (isinstance(stage_timings, dict) and
+        all(isinstance(value, (int, float)) and not isinstance(value, bool) and
+            math.isfinite(value) and value >= 0 for value in stage_timings.values())):
+        raise BenchmarkError("Hydrology returned invalid server stage timings")
+    report["server_stage_timings_ms"] = stage_timings
     report["source_dataset"] = metadata.get("dataset")
     report["vertical_datum"] = metadata.get("vertical_datum")
 
@@ -363,7 +369,7 @@ def run(args):
                 "and both services use the same Map terrain source.")
 
     report["notes"] = [
-        "Completion wall time includes Map terrain acquisition, analysis, hierarchy, and persistence; stages are not individually instrumented.",
+        "Client job wait includes polling and queue delays; server_stage_timings_ms measures individual worker stages when available.",
         "Queries are sequential client-measured requests. OS caches and Map cache may already be warm.",
         "Map sample is requested after the Hydrology job; it does not measure a cold Map download.",
         "Synthetic core benchmark and real HTTP benchmark are not directly comparable.",
