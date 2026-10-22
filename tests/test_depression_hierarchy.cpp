@@ -161,6 +161,46 @@ int main()
         }
     }
 
+    // Reusing each raster row's metric area must not flatten geographic or
+    // projection-induced area changes. Separate pits at different rows each
+    // have a known one-cell pre-spill volume, and storage queries use the
+    // same exact geodesic area as hierarchy construction.
+    ElevationGrid row_pits = gridOf(5, 7, std::vector<float>(35, 20.0f));
+    row_pits.elevations_m[7] = 10.0f;  // row 1, column 2
+    row_pits.elevations_m[27] = 14.0f; // row 5, column 2
+    for (int projection = 0; projection < 2; ++projection)
+    {
+        ElevationGrid test_grid = row_pits;
+        if (projection == 1)
+        {
+            test_grid.geometry.horizontal_crs = HorizontalCrs::Wgs84Utm;
+            test_grid.geometry.utm_zone = 32;
+            test_grid.geometry.northern_hemisphere = true;
+            test_grid.geometry.origin_x = 500000.0;
+            test_grid.geometry.origin_y = 5700000.0;
+            test_grid.geometry.pixel_width = 30.0;
+            test_grid.geometry.pixel_height = 30.0;
+        }
+        const DepressionHierarchy hierarchy = buildDepressionHierarchy(test_grid);
+        assert(hierarchy.basins.size() == 2);
+        for (const DepressionBasin &basin : hierarchy.basins)
+        {
+            const std::uint32_t row = std::uint32_t(basin.minimum_cell / test_grid.columns);
+            const double area_m2 = rasterRowCellAreaM2(
+                test_grid.geometry, test_grid.columns, row);
+            assert(basin.spill_elevation_m == 20.0);
+            assert(basin.cells_below_spill == 1);
+            assert(approximately(basin.capacity_at_spill_m3,
+                                 (20.0 - basin.minimum_elevation_m) * area_m2));
+            const double level = 0.5 * (20.0 + basin.minimum_elevation_m);
+            const BasinStorageState sampled = basinStorageAtLevel(
+                test_grid, hierarchy, basin.index, level);
+            assert(sampled.inundated_cells == 1);
+            assert(approximately(sampled.water_volume_m3,
+                                 (level - basin.minimum_elevation_m) * area_m2));
+        }
+    }
+
     // Plateaus must not spawn one basin per pixel.
     const ElevationGrid flat = gridOf(5, 5, {
         20, 20, 20, 20, 20,

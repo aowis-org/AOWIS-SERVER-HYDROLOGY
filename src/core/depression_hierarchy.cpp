@@ -170,6 +170,18 @@ DepressionHierarchy buildDepressionHierarchy(
         return l == r ? left < right : l < r;
     });
 
+    // A raster row has one metric cell area under the current raster
+    // geometry contract. GeographicLib polygon evaluation is expensive;
+    // calculating it once per cell was the dominant work on real DEMs.
+    // Retain the identical geodesic calculation, just reuse its result.
+    std::vector<double> row_cell_areas(std::size_t(source.rows), 0.0);
+    for (std::uint32_t row = 0; row < source.rows; ++row)
+    {
+        if ((row & 255U) == 0) checkCancelled(cancel_requested);
+        row_cell_areas[std::size_t(row)] =
+            rasterRowCellAreaM2(source.geometry, source.columns, row);
+    }
+
     DisjointComponents components{std::size_t(cell_count)};
     DepressionHierarchy result;
     result.valid_cells = sorted.size();
@@ -191,8 +203,7 @@ DepressionHierarchy buildDepressionHierarchy(
             const std::uint64_t index = sorted[at];
             components.roots[std::size_t(index)] = std::int64_t(index);
             components.sizes[std::size_t(index)] = 1;
-            const double area = rasterRowCellAreaM2(source.geometry, source.columns,
-                std::uint32_t(index / source.columns));
+            const double area = row_cell_areas[std::size_t(index / source.columns)];
             components.areas[std::size_t(index)] = area;
             components.minimum_heights[std::size_t(index)] = height;
             components.relative_height_area[std::size_t(index)] = 0.0;
@@ -344,6 +355,11 @@ BasinStorageState basinStorageAtLevel(
     const std::uint64_t count = std::uint64_t(source.columns) * source.rows;
     if (basin.minimum_cell >= count)
         throw std::invalid_argument("Basin minimum lies outside DEM");
+    // Storage queries visit cells in arbitrary BFS order. Lazily calculate
+    // each encountered row area once, so even a large connected lake doesn't
+    // repeat ellipsoidal-polygon evaluation for every cell.
+    std::vector<double> row_cell_areas(std::size_t(source.rows),
+                                       std::numeric_limits<double>::quiet_NaN());
     std::vector<std::uint8_t> visited(std::size_t(count), 0);
     std::queue<std::uint64_t> ready;
     visited[std::size_t(basin.minimum_cell)] = 1;
@@ -358,8 +374,11 @@ BasinStorageState basinStorageAtLevel(
         if (++result.inundated_cells > max_visited_cells)
             throw std::runtime_error("Basin storage query cell limit exceeded");
         const double elevation = source.elevations_m[std::size_t(index)];
-        const double area = rasterRowCellAreaM2(source.geometry, source.columns,
-            std::uint32_t(index / source.columns));
+        const std::size_t row = std::size_t(index / source.columns);
+        double &area = row_cell_areas[row];
+        if (std::isnan(area))
+            area = rasterRowCellAreaM2(source.geometry, source.columns,
+                                       std::uint32_t(row));
         result.inundated_cell_area_m2 += area;
         result.water_volume_m3 += std::max(0.0, water_level_m - elevation) * area;
         for (int direction = 0; direction < 8; ++direction)

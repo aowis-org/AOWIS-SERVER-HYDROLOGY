@@ -13,6 +13,17 @@ The hydrology core includes `depression_hierarchy.h` with a **raster-centre bath
 - For each component, capacity is computed from cell-area-weighted heights on the **unmodified DEM**. The accumulator uses heights *relative to its minimum* to reduce catastrophic cancellation at large absolute elevations with shallow basins.
 - Missing terrain can be explicitly rejected (default) or treated as open terrain-data boundaries. Such open boundaries are **not** evidence of a real water outlet.
 - Cancellation is checked during preprocessing. Memory and sorting scale with the input cell count; the routine is *in-memory*, not yet out-of-core.
+- **Row-area memoization:** Raster cells in the same row share the same geographic
+  ellipsoidal-polygon area, or the same representative UTM projection-scale
+  area under this raster geometry contract. The hierarchy evaluates the
+  unchanged `rasterRowCellAreaM2()` formula once per raster row and reuses it
+  when activating cells. This is an implementation optimization, **not** a
+  replacement of GeographicLib with a spherical or planar approximation.
+  `basinStorageAtLevel()` uses a lazy row cache during its bounded flood fill,
+  so queries visiting only a few rows don't evaluate every row in the raster.
+  Different rows retain distinct areas; this is checked on EPSG:4326 and
+  WGS84 UTM test grids. Neither the basin topology nor the archive format
+  changes, and no existing job must be regenerated.
 
 `basinStorageAtLevel(source, hierarchy, index, water_level_m, max_visited_cells, cancel)` estimates the connected area and stored volume at a queried water level. Its accepted interval is **from the basin's formation elevation through its spill elevation**. At exactly the spill level, it returns the stable pre-spill statistics produced by the elevation sweep (saddle-height cells add no capacity). Levels above spill are rejected; the caller must later apply the Fill–Spill–Merge distribution algorithm rather than ignoring the spill.
 

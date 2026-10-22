@@ -111,6 +111,14 @@ backend, accepts explicit WGS84 bounds with a default 250,000-cell limit, and
 keeps live measurements separate from synthetic timings. See the same guide
 for command examples and measurement limitations.
 
+The depression-hierarchy core reuses each row's unchanged GeographicLib
+cell-area calculation, instead of repeating it for every activated cell.
+This improves construction and repeated basin-storage queries without changing
+raster geometry, basin identifiers, archived results or the public API.
+See [docs/DEPRESSION_HIERARCHY.md](docs/DEPRESSION_HIERARCHY.md) for
+accuracy assumptions and [docs/BENCHMARKING.md](docs/BENCHMARKING.md) for
+comparison methodology and measured baseline performance.
+
 ### Terrain input and ownership
 
 For a normal HTTP deployment, configure Hydrology to use the **Map** service:

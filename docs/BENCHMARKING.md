@@ -132,6 +132,41 @@ JSON when comparing environments. Run multiple fresh processes (for example,
 interpret a single wall-time difference smaller than operating-system noise
 as an optimization.
 
+## Hierarchy row-area optimization: measured baseline
+
+A real Copernicus GLO-30 job with 352 × 556 cells (195,712 cells) was
+measured on the user's Linux server **before** optimization. The server
+reported `depression_hierarchy = 688.21 ms`, compared with
+`terrain_fetch = 222.69 ms`, `d8_analysis = 92.22 ms`, and
+`total_worker = 1037.69 ms`. This is one field measurement with already
+available terrain; it is not a cold-cache distribution or a representative
+metropolitan benchmark.
+
+A source-code review identified repeated calls to
+`rasterRowCellAreaM2()` **for every activated cell** in the hierarchy, even
+though area depends on raster row under the supported north-up geometry.
+The implementation now evaluates the **same** GeographicLib-backed area
+once per row, reusing the value across cells. Bounded storage queries lazily
+cache the corresponding row areas. This does not change the cell-area
+formula, grouping of plateaus, parent–child relationships, or persistent
+basin format.
+
+On a separate local Release build (1024 × 1024, `pitted`, seed 17,
+GeographicLib 2.7), hierarchy timing changed from about **1273 ms to
+653 ms**. Five additional paired 512 × 512 synthetic seeds retained
+identical basin counts, runoff totals, boundary outflows, input fingerprints,
+and reported mass-balance residuals, while delivering a median hierarchy
+speedup of approximately **2.08×**. These measurements are host-specific;
+small fluctuations in other stage times and process RSS are not evidence
+of an algorithmic regression.
+
+To assess the actual effect on the Map-backed service, build and restart
+Hydrology and submit an identical **new** job. Compare the
+`server_stage_timings_ms.depression_hierarchy` field (not the client polling
+latency), basin count, and checksums. Keep the terrain-source dataset,
+resolution, bounds, server build configuration, and Map cache state the same.
+The original analysis job and all existing stored artifacts remain valid.
+
 ## Verification and reference comparisons
 
 The benchmark ensures **internal conservation**, not physical correctness.
