@@ -1,10 +1,10 @@
-# Hydraulic spill controls: conservative free-overflow foundation
+# Hydraulic spill controls: free-overflow foundation
 
 ## Purpose, scope, and deployment status
 
-This module is the **first independently testable hydraulic-rate primitive** for AOWIS basin spill connections. It is an opt-in **Qt-independent C++ API**, available through `AOWIS::Hydrology`, that combines a **specific internal DEM merge junction** with an **externally specified** rectangular broad-crested control. It computes a rate under **free overflow** and can transfer a finite volume over one explicit time step between two externally supplied stage–storage curves.
+The free-overflow API described in this document is the **first independently testable hydraulic-rate primitive** for AOWIS basin spill connections. It is an opt-in **Qt-independent C++ API**, available through `AOWIS::Hydrology`, that combines a **specific internal DEM merge junction** with an **externally specified** rectangular broad-crested control. It computes a rate under **free overflow** and can transfer a finite volume over one explicit time step between two externally supplied stage–storage curves.
 
-It **does not change** existing rainfall scenarios, Fill–Spill–Merge redistribution, inundation rasters, REST endpoints, persisted caches, default policies, or their numerical results. In particular, it is **not** the fully coupled, time-dependent city-scale flood model, a backwater solver or a replacement for SWMM.
+It **does not change** existing rainfall scenarios, Fill–Spill–Merge redistribution, inundation rasters, REST endpoints, persisted caches, default policies, or their numerical results. **Additional opt-in calibrated tailwater and engineered-opening APIs now exist**; see [Submerged spill controls](SUBMERGED_SPILL_CONTROLS.md). The original free-flow methods and their refusal behavior are unchanged. In particular, it is **not** the fully coupled, time-dependent city-scale flood model, a backwater solver or a replacement for SWMM.
 
 This separation is deliberate. A 30 m DEM provides approximate saddle topology but cannot establish a culvert opening, road overtopping crest width, roughness or discharge coefficient. Adding discharge rates directly to the existing order-based redistribution would create fictitious physical precision.
 
@@ -47,7 +47,7 @@ The theoretical SI coefficient `sqrt(g) * (2/3)^1.5` is approximately **1.705 m^
 
 **Assumptions:** low approach velocity (upstream water-surface depth approximates specific-energy head), approximately rectangular critical-flow section, steady free overflow during each sampled instant, negligible tailwater effect, and an appropriately calibrated loss factor. The formula is not applicable to orifice/culvert flow or a narrow rough channel without an independently justified approximation.
 
-### Deliberately conservative submergence check
+### Deliberately conservative submergence check in the original free-only API
 
 If the **lower** of the two water levels is **at or above** the crest, and the stages differ, the model returns:
 
@@ -56,7 +56,7 @@ regime = SubmergedUnsupported
 signed_discharge_m3_s = NaN
 ```
 
-This test intentionally rejects some possible free-flow cases (submergence onset depends on critical depth and section details). It does **not** estimate a smaller submerged-flow rate, silently return zero, or treat a high tailwater as a calibrated weir. A downstream-aware hydraulic law and physical control dimensions are required to model those cases. Equal water levels produce zero **net** flow, even when both are above the crest.
+This test intentionally rejects some possible free-flow cases (submergence onset depends on critical depth and section details). It does **not** estimate a smaller submerged-flow rate, silently return zero, or treat a high tailwater as a calibrated weir. For explicitly calibrated control sections, use the new `rateCalibratedBroadCrestedSpill()` and `stepCalibratedBroadCrestedSpill()` methods described in [Submerged spill controls](SUBMERGED_SPILL_CONTROLS.md). They require externally justified tailwater rating knots; the original functions intentionally remain free-only. Equal water levels produce zero **net** flow, even when both are above the crest.
 
 ## One-step volume transfer
 
@@ -92,7 +92,7 @@ second_storage_after_m3 =  808.67842566
 sum                      = 2000.00000000 m3
 ```
 
-A much longer step would be **capped** at the donor/recipient crest storage of `1000 m³` each. When the second surface reaches the crest, subsequent flow requires a submerged-control model; this component **does not guess** the rest of the hydrograph.
+A much longer step would be **capped** at the donor/recipient crest storage of `1000 m³` each. When the second surface reaches the crest, subsequent flow requires a submerged-control model; this original method **does not guess** the rest of the hydrograph. A separate opt-in calibrated model is documented in [Submerged spill controls](SUBMERGED_SPILL_CONTROLS.md).
 
 ## C++ integration example
 
@@ -158,7 +158,7 @@ Run `./compile_linux_tests.sh --both`. The new `aowis-hydrology-spill-hydraulics
 Before introducing a time-dependent production solver, we should:
 
 1. Define surveyed/terrain-supported effective cross-sections (including culverts and roadside drainage), datum transformations and data provenance; add higher-resolution local DEM support where available.
-2. Implement **submergence/tailwater, backwater and engineered openings** as separately validated hydraulic control models. A free-overflow formula is not a universal rate law.
+2. **Available as separate opt-in primitives:** calibrated weir submergence and fully submerged rectangular engineered-orifice rating. **Still pending:** partial-opening transitions, frictional conduits, backwater and integration of hydraulic controls with persisted project models. See [SUBMERGED_SPILL_CONTROLS.md](SUBMERGED_SPILL_CONTROLS.md).
 3. Couple multiple controls, per-basin stage–storage curves, rainfall hyetographs and external outfalls through an adaptive or stability-checked finite-volume time integrator.
 4. Validate against laboratory/reference rating curves and observed hydrographs, then benchmark full municipal networks and cache versioning before changing the production redistribution policy.
 

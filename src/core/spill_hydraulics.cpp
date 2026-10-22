@@ -203,4 +203,247 @@ SpillTransferStep stepBroadCrestedSpill(
     return result;
 }
 
+
+namespace
+{
+void validateSubmergenceRating(const BroadCrestedSubmergenceRating &rating)
+{
+    if (rating.points.size() < 2 || rating.points.size() > 4096)
+        throw std::invalid_argument("Submergence rating requires 2..4096 knots");
+    const SubmergenceRatingPoint &first = rating.points.front();
+    const SubmergenceRatingPoint &last = rating.points.back();
+    if (first.tailwater_ratio != 0.0 || first.discharge_multiplier != 1.0 ||
+        last.tailwater_ratio != 1.0 || last.discharge_multiplier != 0.0)
+        throw std::invalid_argument("Submergence rating must span (0,1) through (1,0)");
+    for (std::size_t i = 1; i < rating.points.size(); ++i)
+    {
+        const SubmergenceRatingPoint &previous = rating.points[i - 1];
+        const SubmergenceRatingPoint &point = rating.points[i];
+        if (!std::isfinite(point.tailwater_ratio) ||
+            !std::isfinite(point.discharge_multiplier) ||
+            point.tailwater_ratio <= previous.tailwater_ratio ||
+            point.tailwater_ratio > 1.0 ||
+            point.discharge_multiplier < 0.0 ||
+            point.discharge_multiplier > previous.discharge_multiplier ||
+            (i + 1 < rating.points.size() && point.discharge_multiplier <= 0.0))
+            throw std::invalid_argument("Invalid or nonmonotonic submergence rating knot");
+    }
+}
+
+double submergenceMultiplier(const BroadCrestedSubmergenceRating &rating, double ratio)
+{
+    if (ratio <= 0.0) return 1.0;
+    if (ratio >= 1.0) return 0.0;
+    const std::vector<SubmergenceRatingPoint>::const_iterator upper =
+        std::lower_bound(rating.points.begin(), rating.points.end(), ratio,
+            [](const SubmergenceRatingPoint &point, double value)
+            { return point.tailwater_ratio < value; });
+    const SubmergenceRatingPoint &lower = *(upper - 1);
+    const double fraction = (ratio - lower.tailwater_ratio) /
+                            (upper->tailwater_ratio - lower.tailwater_ratio);
+    return lower.discharge_multiplier + fraction *
+        (upper->discharge_multiplier - lower.discharge_multiplier);
+}
+
+void validateOrifice(const BasinSpillJunction &junction,
+                     const RectangularOrificeControl &control)
+{
+    if (!std::isfinite(junction.saddle_elevation_m) ||
+        junction.child_contacts.size() != 2 ||
+        control.first_component_index == control.second_component_index ||
+        !std::isfinite(control.invert_elevation_m) ||
+        !std::isfinite(control.opening_width_m) || control.opening_width_m <= 0.0 ||
+        !std::isfinite(control.opening_height_m) || control.opening_height_m <= 0.0 ||
+        !std::isfinite(control.discharge_factor) ||
+        control.discharge_factor <= 0.0 || control.discharge_factor > 1.0 ||
+        !std::isfinite(control.invert_elevation_m + control.opening_height_m) ||
+        !std::isfinite(control.opening_width_m * control.opening_height_m))
+        throw std::invalid_argument("Invalid fully submerged orifice control");
+
+    bool first_found = false;
+    bool second_found = false;
+    for (const BasinSpillContact &contact : junction.child_contacts)
+    {
+        if (contact.child_basin_index == control.first_component_index)
+            first_found = true;
+        if (contact.child_basin_index == control.second_component_index)
+            second_found = true;
+    }
+    if (!first_found || !second_found)
+        throw std::invalid_argument("Orifice component indices do not match junction");
+}
+
+// Bisection on physically feasible volume transfers. The lower bracket is
+// guaranteed to have donor water >= receiving water. If the upper bound
+// cannot equalize the stages, the full bounded transfer is permissible.
+double equalizationLimit(const SpillReservoirCurve &donor_curve,
+                         const SpillReservoirCurve &recipient_curve,
+                         double donor_storage,
+                         double recipient_storage,
+                         double upper_limit)
+{
+    if (upper_limit <= 0.0) return 0.0;
+    const double donor_at_upper = interpolateByVolume(donor_curve, donor_storage - upper_limit);
+    const double recipient_at_upper = interpolateByVolume(recipient_curve, recipient_storage + upper_limit);
+    if (donor_at_upper >= recipient_at_upper) return upper_limit;
+
+    double low = 0.0;
+    double high = upper_limit;
+    for (int iteration = 0; iteration < 80; ++iteration)
+    {
+        const double mid = low + (high - low) / 2.0;
+        if (mid <= low || mid >= high) break;
+        const double donor_level = interpolateByVolume(donor_curve, donor_storage - mid);
+        const double recipient_level = interpolateByVolume(recipient_curve, recipient_storage + mid);
+        if (donor_level >= recipient_level) low = mid;
+        else high = mid;
+    }
+    return low;
+}
+} // namespace
+
+SpillDischarge rateCalibratedBroadCrestedSpill(
+    const BasinSpillJunction &junction,
+    const BroadCrestedSpillControl &control,
+    const BroadCrestedSubmergenceRating &rating,
+    double first_water_level_m,
+    double second_water_level_m)
+{
+    validateControl(junction, control);
+    validateSubmergenceRating(rating);
+    requireFinite(first_water_level_m, "Invalid first reservoir water level");
+    requireFinite(second_water_level_m, "Invalid second reservoir water level");
+    if (std::min(first_water_level_m, second_water_level_m) < control.crest_elevation_m)
+        return rateBroadCrestedSpill(junction, control, first_water_level_m,
+                                     second_water_level_m);
+
+    SpillDischarge result;
+    const double upstream = std::max(first_water_level_m, second_water_level_m);
+    const double downstream = std::min(first_water_level_m, second_water_level_m);
+    result.head_above_crest_m = std::max(0.0, upstream - control.crest_elevation_m);
+    result.tailwater_above_crest_m = std::max(0.0, downstream - control.crest_elevation_m);
+    if (first_water_level_m == second_water_level_m || result.head_above_crest_m <= 0.0)
+        return result;
+
+    const double critical_depth = (2.0 / 3.0) * result.head_above_crest_m;
+    const double free_discharge = control.discharge_factor * control.effective_width_m *
+        std::sqrt(GravityMPerSecondSquared) * critical_depth * std::sqrt(critical_depth);
+    const double tailwater_ratio = result.tailwater_above_crest_m /
+                                   result.head_above_crest_m;
+    const double discharge = free_discharge * submergenceMultiplier(rating, tailwater_ratio);
+    if (!std::isfinite(discharge))
+        throw std::invalid_argument("Submerged spill rating exceeds numeric range");
+    result.regime = SpillFlowRegime::SubmergedCalibrated;
+    result.signed_discharge_m3_s = first_water_level_m > second_water_level_m ?
+        discharge : -discharge;
+    return result;
+}
+
+SpillTransferStep stepCalibratedBroadCrestedSpill(
+    const BasinSpillJunction &junction,
+    const BroadCrestedSpillControl &control,
+    const BroadCrestedSubmergenceRating &rating,
+    const SpillReservoirCurve &first_curve,
+    const SpillReservoirCurve &second_curve,
+    double first_storage_m3,
+    double second_storage_m3,
+    double duration_seconds)
+{
+    validateControl(junction, control);
+    validateSubmergenceRating(rating);
+    validateCurve(first_curve);
+    validateCurve(second_curve);
+    requireFinite(duration_seconds, "Invalid calibrated spill duration");
+    if (duration_seconds <= 0.0)
+        throw std::invalid_argument("Calibrated spill duration must be positive");
+    const double first_at_crest = interpolateByLevel(first_curve, control.crest_elevation_m);
+    const double second_at_crest = interpolateByLevel(second_curve, control.crest_elevation_m);
+    const double first_level = interpolateByVolume(first_curve, first_storage_m3);
+    const double second_level = interpolateByVolume(second_curve, second_storage_m3);
+
+    SpillTransferStep result;
+    result.first_storage_after_m3 = first_storage_m3;
+    result.second_storage_after_m3 = second_storage_m3;
+    result.initial_discharge = rateCalibratedBroadCrestedSpill(
+        junction, control, rating, first_level, second_level);
+    result.calculated = true;
+    if (result.initial_discharge.regime == SpillFlowRegime::NoFlow)
+        return result;
+
+    const bool from_first = result.initial_discharge.signed_discharge_m3_s > 0.0;
+    const SpillReservoirCurve &donor_curve = from_first ? first_curve : second_curve;
+    const SpillReservoirCurve &recipient_curve = from_first ? second_curve : first_curve;
+    const double donor_storage = from_first ? first_storage_m3 : second_storage_m3;
+    const double recipient_storage = from_first ? second_storage_m3 : first_storage_m3;
+    const double donor_crest_storage = from_first ? first_at_crest : second_at_crest;
+    const double donor_available = std::max(0.0, donor_storage - donor_crest_storage);
+    const double recipient_capacity =
+        std::max(0.0, recipient_curve.points.back().stored_volume_m3 - recipient_storage);
+    const double capacity_bound = std::min(donor_available, recipient_capacity);
+    const double equilibrium_bound = equalizationLimit(
+        donor_curve, recipient_curve, donor_storage, recipient_storage, capacity_bound);
+    const double requested = std::abs(result.initial_discharge.signed_discharge_m3_s) * duration_seconds;
+    if (!std::isfinite(requested))
+        throw std::invalid_argument("Requested calibrated transfer exceeds numeric range");
+    const double transferred = std::min(requested, equilibrium_bound);
+    result.limited_by_donor_crest = requested > transferred &&
+        donor_available <= recipient_capacity &&
+        donor_available <= equilibrium_bound;
+    result.limited_by_recipient_curve = requested > transferred &&
+        recipient_capacity <= donor_available &&
+        recipient_capacity <= equilibrium_bound;
+    result.limited_by_level_equalization = requested > transferred &&
+        equilibrium_bound < capacity_bound;
+    result.transferred_volume_m3 = from_first ? transferred : -transferred;
+    if (from_first)
+    {
+        result.first_storage_after_m3 -= transferred;
+        result.second_storage_after_m3 += transferred;
+    }
+    else
+    {
+        result.first_storage_after_m3 += transferred;
+        result.second_storage_after_m3 -= transferred;
+    }
+    return result;
+}
+
+SpillDischarge rateFullySubmergedOrifice(
+    const BasinSpillJunction &junction,
+    const RectangularOrificeControl &control,
+    double first_water_level_m,
+    double second_water_level_m)
+{
+    validateOrifice(junction, control);
+    requireFinite(first_water_level_m, "Invalid first orifice water level");
+    requireFinite(second_water_level_m, "Invalid second orifice water level");
+    SpillDischarge result;
+    if (first_water_level_m == second_water_level_m ||
+        (first_water_level_m <= control.invert_elevation_m &&
+         second_water_level_m <= control.invert_elevation_m))
+        return result;
+
+    const double crown = control.invert_elevation_m + control.opening_height_m;
+    if (std::min(first_water_level_m, second_water_level_m) < crown)
+    {
+        result.regime = SpillFlowRegime::PartiallySubmergedUnsupported;
+        result.signed_discharge_m3_s = std::numeric_limits<double>::quiet_NaN();
+        return result;
+    }
+    const double difference = std::abs(first_water_level_m - second_water_level_m);
+    const double magnitude = control.discharge_factor *
+        (control.opening_width_m * control.opening_height_m) *
+        std::sqrt(2.0 * GravityMPerSecondSquared * difference);
+    if (!std::isfinite(magnitude))
+        throw std::invalid_argument("Fully submerged orifice rating exceeds numeric range");
+    result.regime = SpillFlowRegime::FullySubmergedOrifice;
+    // For this orifice only, reuse the discharge diagnostic head fields as
+    // water depth above the opening CROWN (rather than a weir crest).
+    result.head_above_crest_m = std::max(0.0, std::max(first_water_level_m, second_water_level_m) - crown);
+    result.tailwater_above_crest_m = std::max(0.0, std::min(first_water_level_m, second_water_level_m) - crown);
+    result.signed_discharge_m3_s = first_water_level_m > second_water_level_m ?
+        magnitude : -magnitude;
+    return result;
+}
+
 } // namespace Aowis::Hydrology

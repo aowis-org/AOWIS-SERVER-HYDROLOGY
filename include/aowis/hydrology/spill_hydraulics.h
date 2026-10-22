@@ -30,7 +30,10 @@ enum class SpillFlowRegime
 {
     NoFlow,
     FreeOverflow,
-    SubmergedUnsupported
+    SubmergedUnsupported,
+    SubmergedCalibrated,
+    PartiallySubmergedUnsupported,
+    FullySubmergedOrifice
 };
 
 struct SpillDischarge
@@ -84,6 +87,10 @@ struct SpillTransferStep
     bool calculated = false;
     bool limited_by_donor_crest = false;
     bool limited_by_tailwater_crest = false;
+    // Used only by stepCalibratedBroadCrestedSpill(): both reservoirs are
+    // stopped before one Euler step would reverse the water-level gradient.
+    bool limited_by_level_equalization = false;
+    bool limited_by_recipient_curve = false;
 };
 
 // One forward-Euler free-flow step, WITHOUT rainfall inflow, evaporation or
@@ -100,6 +107,73 @@ SpillTransferStep stepBroadCrestedSpill(
     double first_storage_m3,
     double second_storage_m3,
     double duration_seconds);
+
+// The factor Q/Q_free for an explicitly CALIBRATED broad-crested section.
+// r = downstream positive head / upstream positive head, measured from the
+// same crest datum. The rating must include (0,1) and (1,0) endpoints;
+// strictly increasing r and nonincreasing multipliers in [0,1]. Intermediate
+// factors are linearly interpolated. No universal default is supplied.
+struct SubmergenceRatingPoint
+{
+    double tailwater_ratio = 0.0;
+    double discharge_multiplier = 1.0;
+};
+struct BroadCrestedSubmergenceRating
+{
+    std::vector<SubmergenceRatingPoint> points;
+};
+
+// Opt-in tailwater-corrected broad-crested discharge; unlike the legacy free
+// API, submerged conditions are rated with caller-supplied calibration.
+// The curve is an EXTERNAL hydraulic assumption, not DEM-extracted geometry.
+SpillDischarge rateCalibratedBroadCrestedSpill(
+    const BasinSpillJunction &junction,
+    const BroadCrestedSpillControl &control,
+    const BroadCrestedSubmergenceRating &rating,
+    double first_water_level_m,
+    double second_water_level_m);
+
+// An explicit-Euler two-reservoir transfer with a calibrated tailwater rating.
+// The step is limited by donor storage above crest, recipient curve maximum,
+// AND equality of the two water levels. This last limit prevents a large
+// step from reversing the head gradient. The method still approximates the
+// rate using the START of the step: choose dt by convergence analysis.
+SpillTransferStep stepCalibratedBroadCrestedSpill(
+    const BasinSpillJunction &junction,
+    const BroadCrestedSpillControl &control,
+    const BroadCrestedSubmergenceRating &rating,
+    const SpillReservoirCurve &first_curve,
+    const SpillReservoirCurve &second_curve,
+    double first_storage_m3,
+    double second_storage_m3,
+    double duration_seconds);
+
+// A surveyed or otherwise defensibly specified ENGINEERED opening between
+// two basin components. An orifice can pass water BELOW the DEM saddle.
+// Width/height/coefficient and invert are NEVER inferred from raster contact
+// lengths or the depression tree. No pipe friction, inlet contraction model,
+// culvert headlosses, or partially submerged opening is modeled here.
+struct RectangularOrificeControl
+{
+    std::uint64_t first_component_index = 0;
+    std::uint64_t second_component_index = 0;
+    double invert_elevation_m = std::numeric_limits<double>::quiet_NaN();
+    double opening_width_m = std::numeric_limits<double>::quiet_NaN();
+    double opening_height_m = std::numeric_limits<double>::quiet_NaN();
+    double discharge_factor = std::numeric_limits<double>::quiet_NaN();
+};
+
+// Q = Cd * width * height * sqrt(2g * abs(level_difference)), signed by
+// basin orientation. For orifice results, the diagnostic head fields are
+// depths measured above the OPENING CROWN, not above a weir crest. Valid only if BOTH water surfaces cover the opening's
+// top. Equal levels give zero flow. Other wet-opening states explicitly
+// return PartiallySubmergedUnsupported with NaN discharge. If both levels
+// are below the invert, the completely dry control gives NoFlow.
+SpillDischarge rateFullySubmergedOrifice(
+    const BasinSpillJunction &junction,
+    const RectangularOrificeControl &control,
+    double first_water_level_m,
+    double second_water_level_m);
 
 } // namespace Aowis::Hydrology
 #endif

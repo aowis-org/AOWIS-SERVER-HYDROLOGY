@@ -160,6 +160,11 @@ if(BUILD_TESTING)
     add_test(NAME aowis-hydrology-spill-hydraulics COMMAND aowis-hydrology-spill-hydraulics-test)
     set_tests_properties(aowis-hydrology-spill-hydraulics PROPERTIES LABELS "hydrology;aowis")
 
+    add_executable(aowis-hydrology-submerged-controls-test tests/test_submerged_controls.cpp)
+    target_link_libraries(aowis-hydrology-submerged-controls-test PRIVATE AOWIS::Hydrology)
+    add_test(NAME aowis-hydrology-submerged-controls COMMAND aowis-hydrology-submerged-controls-test)
+    set_tests_properties(aowis-hydrology-submerged-controls PROPERTIES LABELS "hydrology;aowis")
+
     add_executable(aowis-hydrology-inundation-test tests/test_inundation.cpp)
     target_link_libraries(aowis-hydrology-inundation-test PRIVATE AOWIS::Hydrology)
     add_test(NAME aowis-hydrology-inundation COMMAND aowis-hydrology-inundation-test)
