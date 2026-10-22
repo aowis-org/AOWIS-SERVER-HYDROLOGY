@@ -33,12 +33,14 @@ add_library(aowis-hydrology-core STATIC
     src/core/redistribution.cpp
     src/core/spill_geometry.cpp
     src/core/spill_hydraulics.cpp
+    src/core/coupled_routing.cpp
     src/core/redistribution_archive.cpp
     src/core/inundation.cpp
     include/aowis/hydrology/rainfall.h
     include/aowis/hydrology/redistribution.h
     include/aowis/hydrology/spill_geometry.h
     include/aowis/hydrology/spill_hydraulics.h
+    include/aowis/hydrology/coupled_routing.h
     include/aowis/hydrology/redistribution_archive.h
     include/aowis/hydrology/inundation.h
     include/aowis/hydrology/depression_archive.h
@@ -164,6 +166,11 @@ if(BUILD_TESTING)
     target_link_libraries(aowis-hydrology-submerged-controls-test PRIVATE AOWIS::Hydrology)
     add_test(NAME aowis-hydrology-submerged-controls COMMAND aowis-hydrology-submerged-controls-test)
     set_tests_properties(aowis-hydrology-submerged-controls PROPERTIES LABELS "hydrology;aowis")
+
+    add_executable(aowis-hydrology-coupled-routing-test tests/test_coupled_routing.cpp)
+    target_link_libraries(aowis-hydrology-coupled-routing-test PRIVATE AOWIS::Hydrology)
+    add_test(NAME aowis-hydrology-coupled-routing COMMAND aowis-hydrology-coupled-routing-test)
+    set_tests_properties(aowis-hydrology-coupled-routing PROPERTIES LABELS "hydrology;aowis")
 
     add_executable(aowis-hydrology-inundation-test tests/test_inundation.cpp)
     target_link_libraries(aowis-hydrology-inundation-test PRIVATE AOWIS::Hydrology)

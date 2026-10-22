@@ -165,3 +165,7 @@ Run:
 This increases the Qt/GDAL-enabled Hydrology test count from **12 to 13**. The new test is core-only; no Qt, GUI, Map, Standalone or REST component is modified.
 
 Next stages must handle physically based partial-opening/weir regimes where appropriate; multiway engineered junctions; frictional culvert/barrel losses; time-dependent rainfall inflows and outfalls; coupled multi-reservoir stepping with adaptive convergence checks; and independent reference-data/observational validation. Only after those are complete should the persistent scenario solver switch to a dynamic hydraulic policy.
+
+## Coupled routing integration
+
+The experimental [coupled reservoir routing core](COUPLED_RESERVOIR_ROUTING.md) can now use these control ratings in a time-dependent, simultaneous multi-reservoir calculation with externally supplied inflow volumes. This does not relax the requirement for surveyed/calibrated control parameters and does not extend the validity of fully submerged orifice ratings to partly exposed openings. The static scenario service and its persisted results are unchanged.
