@@ -1,11 +1,14 @@
 #include <aowis/hydrology/service.h>
 #include <aowis/hydrology/depression_archive.h>
 #include <aowis/hydrology/redistribution.h>
+#include <aowis/hydrology/redistribution_archive.h>
 #include <aowis/hydrology/spatial_queries.h>
 
+#include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QDateTime>
 #include <QJsonDocument>
 #include <QMutexLocker>
 #include <QStringList>
@@ -1549,6 +1552,185 @@ QByteArray AnalysisService::rainfallRunoffWindow(
 
 namespace Aowis::Hydrology
 {
+namespace
+{
+// The inputs of a completed job/scenario are immutable under normal service
+// operation. File metadata is sufficient to cheaply invalidate a derived
+// cache after accidental/manual replacement; it is not a tamper-proof digest
+// of the potentially multi-gigabyte source rasters.
+RedistributionArchiveIdentity redistributionIdentity(
+    const QString &job_id, const QString &scenario_id,
+    const QString &job_folder, const QString &scenario_folder,
+    std::uint32_t columns, std::uint32_t rows)
+{
+    RedistributionArchiveIdentity identity;
+    identity.columns = columns;
+    identity.rows = rows;
+    const QUuid job_uuid(QStringLiteral("{") + job_id + QStringLiteral("}"));
+    const QUuid scenario_uuid(QStringLiteral("{") + scenario_id + QStringLiteral("}"));
+    if (job_uuid.isNull() || scenario_uuid.isNull())
+        throw std::invalid_argument("Invalid cache job or scenario UUID");
+    const QByteArray job_bytes = job_uuid.toRfc4122();
+    const QByteArray scenario_bytes = scenario_uuid.toRfc4122();
+    if (job_bytes.size() != 16 || scenario_bytes.size() != 16)
+        throw std::invalid_argument("Invalid cache job or scenario UUID");
+    for (std::size_t index = 0; index < 16; ++index)
+    {
+        identity.job_uuid[index] = std::uint8_t(job_bytes.at(qsizetype(index)));
+        identity.scenario_uuid[index] = std::uint8_t(scenario_bytes.at(qsizetype(index)));
+    }
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    const QStringList paths{
+        QDir(job_folder).filePath(QStringLiteral("elevation.f32")),
+        QDir(job_folder).filePath(QStringLiteral("basins.aowbin")),
+        QDir(scenario_folder).filePath(QStringLiteral("runoff.f64")),
+        QDir(scenario_folder).filePath(QStringLiteral("scenario.json"))
+    };
+    for (const QString &path : paths)
+    {
+        const QFileInfo info(path);
+        if (!info.isFile() || info.size() < 0)
+            throw std::runtime_error("Missing immutable redistribution source file");
+        const QByteArray metadata = QByteArray::number(info.size()) + ':' +
+            QByteArray::number(info.lastModified().toMSecsSinceEpoch()) + ';';
+        hash.addData(metadata);
+    }
+    const QByteArray signature = hash.result();
+    for (std::size_t index = 0; index < 16; ++index)
+        identity.source_fingerprint[index] = std::uint8_t(signature.at(qsizetype(index)));
+    return identity;
+}
+
+template <std::size_t Count>
+std::array<std::uint8_t, Count> readCacheBytes(QFile &file)
+{
+    std::array<std::uint8_t, Count> bytes{};
+    if (file.read(reinterpret_cast<char *>(bytes.data()), qsizetype(bytes.size())) !=
+        qsizetype(bytes.size()))
+        throw std::runtime_error("Truncated redistribution cache");
+    return bytes;
+}
+
+struct CachedRedistributionPage
+{
+    RedistributionArchiveHeader header;
+    std::vector<RedistributionArchiveRecord> records;
+};
+
+CachedRedistributionPage loadRedistributionPage(
+    const QString &path, const RedistributionArchiveIdentity &expected,
+    int offset, int limit)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly))
+        throw std::runtime_error("Redistribution cache not available");
+    CachedRedistributionPage page;
+    page.header = decodeRedistributionHeader(
+        readCacheBytes<RedistributionArchiveHeaderBytes>(file));
+    const RedistributionArchiveIdentity &stored = page.header.identity;
+    if (stored.job_uuid != expected.job_uuid ||
+        stored.scenario_uuid != expected.scenario_uuid ||
+        stored.source_fingerprint != expected.source_fingerprint ||
+        stored.columns != expected.columns || stored.rows != expected.rows)
+        throw std::runtime_error("Redistribution cache is stale");
+    const std::uint64_t count = page.header.basin_count;
+    if (count > std::uint64_t((std::numeric_limits<qint64>::max() -
+            qint64(RedistributionArchiveHeaderBytes)) / RedistributionArchiveRecordBytes) ||
+        file.size() != qint64(RedistributionArchiveHeaderBytes +
+            count * RedistributionArchiveRecordBytes))
+        throw std::runtime_error("Invalid redistribution cache length");
+    const std::uint64_t start = std::min(std::uint64_t(offset), count);
+    const std::uint64_t end = std::min(start + std::uint64_t(limit), count);
+    if (!file.seek(qint64(RedistributionArchiveHeaderBytes +
+                          start * RedistributionArchiveRecordBytes)))
+        throw std::runtime_error("Cannot seek redistribution cache");
+    page.records.reserve(std::size_t(end - start));
+    for (std::uint64_t index = start; index < end; ++index)
+        page.records.push_back(decodeRedistributionRecord(
+            readCacheBytes<RedistributionArchiveRecordBytes>(file), index, count));
+    return page;
+}
+
+// Writes a complete atomic result. There is no partially published cache if
+// the server exits while computing or writing it.
+void writeRedistributionCache(const QString &path,
+                              const RedistributionArchiveIdentity &identity,
+                              const RunoffRedistribution &result,
+                              const DepressionHierarchy &hierarchy)
+{
+    if (result.basins.size() != hierarchy.basins.size())
+        throw std::runtime_error("Redistribution hierarchy count mismatch");
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly))
+        throw std::runtime_error("Cannot create redistribution cache");
+    const std::array<std::uint8_t, RedistributionArchiveHeaderBytes> header =
+        encodeRedistributionHeader(identity, result);
+    if (file.write(reinterpret_cast<const char *>(header.data()), qsizetype(header.size())) !=
+        qsizetype(header.size()))
+        throw std::runtime_error("Cannot write redistribution cache header");
+    QByteArray records;
+    records.reserve(65536);
+    for (std::size_t index = 0; index < result.basins.size(); ++index)
+    {
+        RedistributionArchiveRecord row;
+        row.state = result.basins[index];
+        row.parent_index = hierarchy.basins[index].parent_index;
+        const std::array<std::uint8_t, RedistributionArchiveRecordBytes> bytes =
+            encodeRedistributionRecord(row);
+        records.append(reinterpret_cast<const char *>(bytes.data()), qsizetype(bytes.size()));
+        if (records.size() >= 65536)
+        {
+            if (file.write(records) != records.size())
+                throw std::runtime_error("Cannot write redistribution cache records");
+            records.clear();
+        }
+    }
+    if (!records.isEmpty() && file.write(records) != records.size())
+        throw std::runtime_error("Cannot write redistribution cache records");
+    if (!file.commit())
+        throw std::runtime_error("Cannot commit redistribution cache");
+}
+
+// Slow path only: once for each new or invalidated scenario cache.
+void calculateAndCacheRedistribution(const QString &path,
+                                     const RedistributionArchiveIdentity &identity,
+                                     const QString &job_folder,
+                                     const QString &scenario_folder,
+                                     const QJsonObject &manifest,
+                                     const ElevationGrid &geometry)
+{
+    const std::uint64_t cells = std::uint64_t(geometry.columns) * geometry.rows;
+    QFile raster(QDir(scenario_folder).filePath(QStringLiteral("runoff.f64")));
+    if (!raster.open(QIODevice::ReadOnly) || raster.size() != qint64(cells * 8))
+        throw std::runtime_error("Missing or truncated rainfall scenario runoff raster");
+    std::vector<double> volume(std::size_t(cells), 0.0);
+    QByteArray buffer(32768, '\0');
+    std::uint64_t cell = 0;
+    while (cell < cells)
+    {
+        const qsizetype take = qsizetype(std::min<std::uint64_t>(4096, cells - cell) * 8);
+        if (raster.read(buffer.data(), take) != take)
+            throw std::runtime_error("Incomplete rainfall scenario runoff raster");
+        for (qsizetype i = 0; i < take; i += 8)
+        {
+            const quint64 bits = qFromLittleEndian<quint64>(buffer.constData() + i);
+            double value = 0.0;
+            std::memcpy(&value, &bits, sizeof(value));
+            volume[std::size_t(cell++)] = value;
+        }
+    }
+    const ElevationGrid source = loadOriginalElevation(job_folder, geometry);
+    const DepressionHierarchy hierarchy = loadHierarchy(job_folder,
+        geometry.columns, geometry.rows);
+    const RunoffRedistribution result = redistributeRunoff(source, hierarchy, volume);
+    const double expected = manifest.value(QStringLiteral("effective_runoff_volume_m3")).toDouble();
+    if (std::abs(expected - result.generated_runoff_m3) >
+        1e-7 * std::max(1.0, std::abs(expected)))
+        throw std::runtime_error("Rainfall runoff raster and scenario summary disagree");
+    writeRedistributionCache(path, identity, result, hierarchy);
+}
+}
+
 QJsonObject AnalysisService::rainfallRedistribution(
     const QString &id, const QString &scenario_uuid,
     int offset, int limit, QString *error) const
@@ -1568,48 +1750,54 @@ QJsonObject AnalysisService::rainfallRedistribution(
     try
     {
         const QString folder = jobDirectory(id);
-        const QString scenario_folder = QDir(folder).filePath(QStringLiteral("rainfall-scenarios"));
-        const QJsonObject manifest = loadRainfallManifest(scenario_folder, scenario_uuid);
-        const std::uint64_t cells = std::uint64_t(item->grid.columns) * item->grid.rows;
-        const QString raster_path = QDir(scenario_folder).filePath(
-            scenario_uuid + QStringLiteral("/runoff.f64"));
-        QFile raster(raster_path);
-        if (!raster.open(QIODevice::ReadOnly) || raster.size() != qint64(cells * 8))
-            throw std::runtime_error("Missing or truncated rainfall scenario runoff raster");
-        std::vector<double> volume(std::size_t(cells), 0.0);
-        QByteArray buffer(32768, '\0');
-        std::uint64_t cell = 0;
-        while (cell < cells)
+        const QString scenario_root = QDir(folder).filePath(QStringLiteral("rainfall-scenarios"));
+        const QJsonObject manifest = loadRainfallManifest(scenario_root, scenario_uuid);
+        const QString scenario_folder = QDir(scenario_root).filePath(scenario_uuid);
+        const QString path = QDir(scenario_folder).filePath(QStringLiteral("redistribution-v1.aowbin"));
+        const RedistributionArchiveIdentity identity = redistributionIdentity(
+            id, scenario_uuid, folder, scenario_folder, item->grid.columns, item->grid.rows);
+
+        // Prevent duplicate recalculation or simultaneous publication by
+        // requests handled by the same service instance. No work is queued:
+        // initial calculation remains synchronous (Stage 9 will change this).
+        QMutexLocker locker(&this->redistribution_cache_mutex);
+        CachedRedistributionPage page;
+        bool cache_hit = false;
+        const double expected_runoff =
+            manifest.value(QStringLiteral("effective_runoff_volume_m3")).toDouble();
+        if (QFileInfo::exists(path))
         {
-            const qsizetype take = qsizetype(std::min<std::uint64_t>(4096, cells - cell) * 8);
-            if (raster.read(buffer.data(), take) != take)
-                throw std::runtime_error("Incomplete rainfall scenario runoff raster");
-            for (qsizetype i = 0; i < take; i += 8)
+            try
             {
-                const quint64 bits = qFromLittleEndian<quint64>(buffer.constData() + i);
-                double value = 0.0;
-                std::memcpy(&value, &bits, sizeof(value));
-                volume[std::size_t(cell++)] = value;
+                page = loadRedistributionPage(path, identity, offset, limit);
+                if (std::abs(page.header.summary.generated_runoff_m3 - expected_runoff) >
+                    1e-7 * std::max(1.0, std::abs(expected_runoff)))
+                    throw std::runtime_error("Redistribution cache scenario totals disagree");
+                cache_hit = true;
+            }
+            catch (const std::exception &)
+            {
+                // A missing/stale/corrupt derived file is disposable. The
+                // immutable scenario and DEM remain the authoritative inputs.
             }
         }
-        const ElevationGrid source = loadOriginalElevation(folder, item->grid);
-        const DepressionHierarchy hierarchy = loadHierarchy(folder,
-            item->grid.columns, item->grid.rows);
-        const RunoffRedistribution balance = redistributeRunoff(source, hierarchy, volume);
-        const double expected = manifest.value(QStringLiteral("effective_runoff_volume_m3")).toDouble();
-        if (std::abs(expected - balance.generated_runoff_m3) >
-            1e-7 * std::max(1.0, std::abs(expected)))
-            throw std::runtime_error("Rainfall runoff raster and scenario summary disagree");
-        QJsonArray paginated;
-        for (std::uint64_t index = std::uint64_t(offset);
-             index < balance.basins.size() && paginated.size() < limit; ++index)
+        if (!cache_hit)
         {
-            const BasinRedistributionState &state = balance.basins[std::size_t(index)];
-            const DepressionBasin &basin = hierarchy.basins[std::size_t(index)];
+            calculateAndCacheRedistribution(path, identity, folder, scenario_folder,
+                                             manifest, item->grid);
+            page = loadRedistributionPage(path, identity, offset, limit);
+        }
+        if (std::abs(page.header.summary.generated_runoff_m3 - expected_runoff) >
+            1e-7 * std::max(1.0, std::abs(expected_runoff)))
+            throw std::runtime_error("Cached runoff volume disagrees with scenario summary");
+        QJsonArray paginated;
+        for (const RedistributionArchiveRecord &row : page.records)
+        {
+            const BasinRedistributionState &state = row.state;
             paginated.append(QJsonObject{
                 {QStringLiteral("basin_id"), basinUuid(id, state.basin_index)},
-                {QStringLiteral("parent_id"), basin.parent_index >= 0
-                    ? QJsonValue(basinUuid(id, std::uint64_t(basin.parent_index)))
+                {QStringLiteral("parent_id"), row.parent_index >= 0
+                    ? QJsonValue(basinUuid(id, std::uint64_t(row.parent_index)))
                     : QJsonValue(QJsonValue::Null)},
                 {QStringLiteral("direct_inflow_m3"), state.direct_inflow_m3},
                 {QStringLiteral("stored_in_subtree_m3"), state.stored_in_subtree_m3},
@@ -1617,6 +1805,8 @@ QJsonObject AnalysisService::rainfallRedistribution(
                 {QStringLiteral("at_spill"), state.at_spill}
             });
         }
+        const RunoffRedistribution &balance = page.header.summary;
+        const std::uint64_t count = page.header.basin_count;
         return QJsonObject{
             {QStringLiteral("model"), QStringLiteral("static_fill_spill_merge_volume_v1")},
             {QStringLiteral("job_id"), id},
@@ -1627,11 +1817,13 @@ QJsonObject AnalysisService::rainfallRedistribution(
             {QStringLiteral("basin_boundary_outflow_m3"), balance.basin_boundary_outflow_m3},
             {QStringLiteral("total_boundary_outflow_m3"), balance.total_boundary_outflow_m3},
             {QStringLiteral("mass_balance_error_m3"), balance.mass_balance_error_m3},
-            {QStringLiteral("domain_boundary_is_artificial"), true},
-            {QStringLiteral("total_basins"), double(balance.basins.size())},
+            {QStringLiteral("domain_boundary_is_artificial"), balance.domain_boundary_is_artificial},
+            {QStringLiteral("cache_hit"), cache_hit},
+            {QStringLiteral("total_basins"), double(count)},
             {QStringLiteral("offset"), offset},
             {QStringLiteral("limit"), limit},
-            {QStringLiteral("has_more"), std::uint64_t(offset) + std::uint64_t(paginated.size()) < balance.basins.size()},
+            {QStringLiteral("has_more"), std::uint64_t(offset) +
+                std::uint64_t(paginated.size()) < count},
             {QStringLiteral("basins"), paginated}
         };
     }

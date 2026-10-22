@@ -21,7 +21,7 @@ It intentionally does **not** calculate storm arrival times, flow velocities, di
 | Elevations and grid geometry | Completed job, `elevation.f32` | Original, unmodified source DEM from Map |
 | Basin topology and capacities | Completed job, `basins.aowbin` | Calculated from original DEM; persisted with checksummed archive |
 | Runoff volume per cell | Scenario, `runoff.f64` | Derived in Stage 7 from clipped rainfall polygons, depth, and runoff fraction |
-| Flow graph | Calculated from original DEM at query time | Unfilled, unbreached D8: a real closed depression stays a sink |
+| Flow graph | Calculated from original DEM on first scenario redistribution | Unfilled, unbreached D8: a real closed depression stays a sink; later queries reuse cached results |
 
 The persisted job's conditioned D8 flow graph is **not** reused here, because a filled routing surface deliberately gives a sink an artificial drainage connection. Such a link is useful for watershed tracing but must not magically empty a basin before reaching its saddle.
 
@@ -82,7 +82,7 @@ All IDs are UUIDs. A terrain job must be `completed` and contain its basin hiera
 GET /v1/jobs/{job-uuid}/rainfall-scenarios/{scenario-uuid}/redistribution?offset=0&limit=50
 ```
 
-`offset` defaults to 0 and must be nonnegative. `limit` defaults to 50 and accepts 1–100. Pagination changes only the **basin rows returned**, not the computed global totals. The first release **recomputes the redistribution for every query**; it does not persist/cache the result. Avoid repeatedly polling or paging enormous jobs until caching/asynchronous execution is implemented. The endpoint currently executes synchronously and may be computationally expensive on large DEMs.
+`offset` defaults to 0 and must be nonnegative. `limit` defaults to 50 and accepts 1–100. Pagination changes only the **basin rows returned**, not the computed global totals. The first successful query computes the redistribution and **atomically caches** its versioned result per scenario. Further pages and requests after server restart reuse the cache without recalculating D8 or reloading the DEM. A corrupt, outdated or incomplete cache is rebuilt from authoritative inputs. `cache_hit` in the response is `false` for calculation/rebuild and `true` for reuse. The initial solve **still runs synchronously** and can be expensive on large DEMs. Cache design, binary format, validation limits and recovery are documented in [REDISTRIBUTION_CACHE.md](REDISTRIBUTION_CACHE.md).
 
 Example response values below illustrate the **schema and accounting**, not a specific real location:
 
@@ -98,6 +98,7 @@ Example response values below illustrate the **schema and accounting**, not a sp
   "total_boundary_outflow_m3": 400.0,
   "mass_balance_error_m3": 0.0,
   "domain_boundary_is_artificial": true,
+  "cache_hit": true,
   "total_basins": 1,
   "offset": 0,
   "limit": 50,
@@ -143,7 +144,7 @@ These requests require a configured Map server for the *initial* terrain-analysi
 - Invalid UUID, noncompleted analysis, invalid pagination, corrupt or missing raster/archive: the query fails rather than returning fabricated zeros.
 - DEM with any missing elevation: query fails in this increment, including missing boundary pixels.
 - Large valid DEMs currently need in-memory source, dry-flow graph, routing accumulators and hierarchy; this operation is **not out-of-core**.
-- There is no new *redistribution job ID* yet: this is an on-demand query on a saved scenario. Results are not persisted; the original rainfall input and terrain source are.
+- There is no new *redistribution job ID*: this is a cached, on-demand query on a saved scenario. The result is persisted as a derived, disposable binary cache separate from the authoritative rainfall input and terrain source. The initial solve can block its HTTP request.
 - There is no flooded-area GeoJSON or water-depth raster endpoint yet.
 
 ## 5. Pure C++ library
@@ -182,4 +183,4 @@ Automated tests (`aowis-hydrology-redistribution`) cover zero/partial/full pit s
 ./compile_linux_tests.sh --both
 ```
 
-Important next work: avoid dry-D8 recomputation for every paginated query; cache versioned scenario results and expose an asynchronous analysis job for large datasets, add physically meaningful water-level/depth maps and polygon windows, improve overflow path routing beyond the rectangular domain, and benchmark/compare real DEMs with external hydrology software.
+Versioned, paginated scenario caching is implemented (see [REDISTRIBUTION_CACHE.md](REDISTRIBUTION_CACHE.md)). Important remaining work: add an asynchronous redistribution job for large datasets, reliable water-level/depth maps and polygon windows, improve spill routing beyond the rectangular DEM domain, add robust cache content fingerprints and multi-process coordination, and benchmark/compare real DEMs with external hydrology software.

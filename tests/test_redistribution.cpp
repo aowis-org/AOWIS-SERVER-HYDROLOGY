@@ -2,6 +2,7 @@
 #undef NDEBUG
 #endif
 #include <aowis/hydrology/redistribution.h>
+#include <aowis/hydrology/redistribution_archive.h>
 
 #include <algorithm>
 #include <atomic>
@@ -145,6 +146,48 @@ int main()
         balanced(doubled);
         assert(doubled.basin_storage_m3 + 0.001 >= one_storm.basin_storage_m3);
     }
+
+    // Versioned on-disk cache contracts, independent of Qt and the filesystem.
+    RedistributionArchiveIdentity identity;
+    identity.columns = paired.columns;
+    identity.rows = paired.rows;
+    identity.job_uuid[0] = 37;
+    identity.scenario_uuid[0] = 38;
+    identity.source_fingerprint[0] = 39;
+    const std::array<std::uint8_t, RedistributionArchiveHeaderBytes> encoded_header =
+        encodeRedistributionHeader(identity, above_parent);
+    const RedistributionArchiveHeader decoded_header = decodeRedistributionHeader(encoded_header);
+    assert(decoded_header.basin_count == above_parent.basins.size());
+    assert(decoded_header.identity.source_fingerprint == identity.source_fingerprint);
+    assert(equal(decoded_header.summary.basin_storage_m3, above_parent.basin_storage_m3));
+    assert(equal(decoded_header.summary.total_boundary_outflow_m3,
+                 above_parent.total_boundary_outflow_m3));
+    RedistributionArchiveRecord archive_row;
+    archive_row.state = above_parent.basins[0];
+    archive_row.parent_index = merged.basins[0].parent_index;
+    const std::array<std::uint8_t, RedistributionArchiveRecordBytes> encoded_row =
+        encodeRedistributionRecord(archive_row);
+    const RedistributionArchiveRecord decoded_row = decodeRedistributionRecord(
+        encoded_row, 0, above_parent.basins.size());
+    assert(decoded_row.parent_index == archive_row.parent_index);
+    assert(equal(decoded_row.state.stored_in_subtree_m3,
+                 archive_row.state.stored_in_subtree_m3));
+    bool archive_rejected = false;
+    std::array<std::uint8_t, RedistributionArchiveHeaderBytes> damaged_header = encoded_header;
+    damaged_header[90] ^= 1;
+    try { (void)decodeRedistributionHeader(damaged_header); }
+    catch (const std::runtime_error &) { archive_rejected = true; }
+    assert(archive_rejected);
+    archive_rejected = false;
+    std::array<std::uint8_t, RedistributionArchiveRecordBytes> damaged_row = encoded_row;
+    damaged_row[20] ^= 1;
+    try { (void)decodeRedistributionRecord(damaged_row, 0, above_parent.basins.size()); }
+    catch (const std::runtime_error &) { archive_rejected = true; }
+    assert(archive_rejected);
+    archive_rejected = false;
+    try { (void)decodeRedistributionRecord(encoded_row, 1, above_parent.basins.size()); }
+    catch (const std::runtime_error &) { archive_rejected = true; }
+    assert(archive_rejected);
 
     std::atomic<bool> canceled{true};
     bool rejected = false;

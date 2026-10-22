@@ -5,6 +5,8 @@
 
 #include <QCoreApplication>
 #include <QElapsedTimer>
+#include <QDir>
+#include <QFile>
 #include <QTemporaryDir>
 #include <QThread>
 #include <QUuid>
@@ -160,6 +162,11 @@ int main(int argc, char **argv)
             redistributed.value(QStringLiteral("basin_storage_m3")).toDouble() -
             redistributed.value(QStringLiteral("total_boundary_outflow_m3")).toDouble()) < 1.e-6);
         assert(redistributed.value(QStringLiteral("total_basins")).toDouble() == 0);
+        assert(!redistributed.value(QStringLiteral("cache_hit")).toBool());
+        const QJsonObject cached_empty = service.rainfallRedistribution(
+            successful_id, rainfall_scenario_id, 20, 1, &error);
+        assert(error.isEmpty() && cached_empty.value(QStringLiteral("cache_hit")).toBool());
+        assert(cached_empty.value(QStringLiteral("basins")).toArray().isEmpty());
         assert(service.rainfallRedistribution(successful_id, rainfall_scenario_id,
             -1, 20, &error).isEmpty());
         assert(error.startsWith(QStringLiteral("Invalid")));
@@ -234,6 +241,7 @@ int main(int argc, char **argv)
             successful_id, rainfall_scenario_id, 0, 100, &error);
         assert(error.isEmpty());
         assert(restored_balance.value(QStringLiteral("generated_runoff_m3")).toDouble() > 0);
+        assert(restored_balance.value(QStringLiteral("cache_hit")).toBool());
 
         const QJsonObject persisted_watershed = restored.watershedBoundary(
             successful_id, 1, 1, &error);
@@ -249,6 +257,7 @@ int main(int argc, char **argv)
     // stable, and level/volume samples use source elevations, not D8 heights.
     QString basin_job_id;
     QString basin_id;
+    QString basin_scenario_id;
     configuration.terrain_reader = [](const ElevationGrid &geometry, const QString &,
                                       const std::atomic<bool> &)
     {
@@ -300,10 +309,31 @@ int main(int argc, char **argv)
         const QJsonObject centered = service.createRainfallScenario(
             basin_job_id, centered_rain, &error);
         assert(error.isEmpty() && !centered.isEmpty());
+        basin_scenario_id = centered.value(QStringLiteral("id")).toString();
         const QJsonObject basin_balance = service.rainfallRedistribution(
-            basin_job_id, centered.value(QStringLiteral("id")).toString(), 0, 1, &error);
+            basin_job_id, basin_scenario_id, 0, 1, &error);
         assert(error.isEmpty() && basin_balance.value(QStringLiteral("total_basins")).toInt() == 1);
         assert(basin_balance.value(QStringLiteral("basin_storage_m3")).toDouble() > 0);
+        assert(!basin_balance.value(QStringLiteral("cache_hit")).toBool());
+        const QJsonObject basin_page_repeat = service.rainfallRedistribution(
+            basin_job_id, basin_scenario_id, 0, 1, &error);
+        assert(error.isEmpty() && basin_page_repeat.value(QStringLiteral("cache_hit")).toBool());
+        assert(basin_page_repeat.value(QStringLiteral("basins")) ==
+               basin_balance.value(QStringLiteral("basins")));
+        // An invalidated or damaged *derived* cache is automatically
+        // recomputed from the persisted DEM + runoff + basin hierarchy.
+        const QString cache_path = QDir(configuration.output_directory).filePath(
+            basin_job_id + QStringLiteral("/rainfall-scenarios/") + basin_scenario_id +
+            QStringLiteral("/redistribution-v1.aowbin"));
+        QFile damaged(cache_path);
+        assert(damaged.open(QIODevice::ReadWrite));
+        assert(damaged.write("x", 1) == 1);
+        damaged.close();
+        const QJsonObject cache_repaired = service.rainfallRedistribution(
+            basin_job_id, basin_scenario_id, 0, 1, &error);
+        assert(error.isEmpty() && !cache_repaired.value(QStringLiteral("cache_hit")).toBool());
+        assert(cache_repaired.value(QStringLiteral("basins")) ==
+               basin_balance.value(QStringLiteral("basins")));
         assert(basin_balance.value(QStringLiteral("basins")).toArray().first().toObject()
             .value(QStringLiteral("basin_id")).toString() == basin_id);
 
@@ -336,6 +366,10 @@ int main(int argc, char **argv)
                .value(QStringLiteral("id")).toString() == basin_id);
         assert(!restored.basinStorageCurve(basin_job_id, basin_id, 3, &error).isEmpty());
         assert(error.isEmpty());
+        const QJsonObject cached_after_restart = restored.rainfallRedistribution(
+            basin_job_id, basin_scenario_id, 0, 1, &error);
+        assert(error.isEmpty() && cached_after_restart.value(QStringLiteral("cache_hit")).toBool());
+        assert(cached_after_restart.value(QStringLiteral("total_basins")).toInt() == 1);
     }
 
     // An incomplete raster must be rejected even if its only missing cell is

@@ -31,8 +31,10 @@ add_library(aowis-hydrology-core STATIC
     src/core/depression_archive.cpp
     src/core/rainfall.cpp
     src/core/redistribution.cpp
+    src/core/redistribution_archive.cpp
     include/aowis/hydrology/rainfall.h
     include/aowis/hydrology/redistribution.h
+    include/aowis/hydrology/redistribution_archive.h
     include/aowis/hydrology/depression_archive.h
     include/aowis/hydrology/depression_hierarchy.h
     include/aowis/hydrology/geometry.h

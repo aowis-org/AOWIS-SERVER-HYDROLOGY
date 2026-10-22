@@ -111,8 +111,10 @@ public:
     QByteArray rainfallRunoffWindow(const QString &id, const QString &scenario_uuid,
                                     int x, int y, int width, int height,
                                     QString *error) const;
-    // Static volume-balance preview of a saved scenario, recomputed on each
-    // request. basin totals are nested; sum only root basins for total storage.
+    // Static redistribution of a saved scenario. The first request calculates
+    // and atomically caches an immutable result; later requests read only the
+    // requested records, with integrity validation and cache repair. Basin
+    // totals are nested; sum only root basins for total storage.
     QJsonObject rainfallRedistribution(const QString &id, const QString &scenario_uuid,
                                        int offset, int limit, QString *error) const;
 
@@ -129,6 +131,7 @@ private:
 
     ServiceConfig config;
     mutable QMutex jobs_mutex;
+    mutable QMutex redistribution_cache_mutex;
     QHash<QString, QSharedPointer<Job>> job_map;
     QThreadPool workers;
 };
