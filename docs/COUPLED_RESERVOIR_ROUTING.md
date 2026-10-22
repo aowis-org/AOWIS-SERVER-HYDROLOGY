@@ -138,8 +138,8 @@ The reported water levels belong to **lumped reservoir approximations**. A snaps
 - **Map** continues to own DEM acquisition and cached source tiles. It does not own this hydraulic solver.
 - **Hydrology** already produces static basin topology, storage relationships, and total runoff volumes. This new core is deliberately separate from scenario persistence and REST: event-duration and total rainfall depth alone do **not** determine an inflow hydrograph.
 - The opt-in [timed-runoff forcing adapter](TEMPORAL_RUNOFF_FORCING.md) now distributes Stage 7 event runoff totals into **externally specified time fractions** and maps the original DEM's dry-D8 leaf inflow volumes into per-reservoir intervals. This is not a travel-time calculation: all dry-D8 arrivals are assumed immediate, and the caller must separately provide physically disjoint reservoir curves and calibrated controls.
-- Exposing timed simulations over the service will require a separate job identity, input provenance, model-specific cache version and cancellation/status handling. It must never silently overwrite the static redistribution result or reuse its cache key.
-- The opt-in [free-overflow boundary outlet](BOUNDARY_OUTLETS.md) now accounts for discharge leaving modeled reservoirs while preserving simultaneous update and per-snapshot conservation. It is not an inferred DEM feature, backwater calculation, or a persisted time-dependent simulation service. Physically defensible time-varying infiltration and connections to SWMM remain future capabilities.
+- The opt-in coupled simulation service now has separate job UUIDs, explicit input manifests, versioned cache files, cancellation and status APIs. It never overwrites static redistribution results or reuses their cache keys. It does not yet automatically build inflow histories from saved rainfall scenarios.
+- The opt-in [free-overflow boundary outlet](BOUNDARY_OUTLETS.md) now accounts for discharge leaving modeled reservoirs while preserving simultaneous update and per-snapshot conservation. It is not an inferred DEM feature or backwater calculation; it can now be configured explicitly through the separate persisted coupled simulation service. Physically defensible time-varying infiltration and connections to SWMM remain future capabilities.
 
 ## Validation and known limitations
 
@@ -154,3 +154,7 @@ The solver **does not** yet have:
 - calibration against measured hydrographs or terrain reference tools.
 
 **Do not interpret mass conservation as hydraulic calibration.** The present result is a closed-network lumped-parameter numerical simulation conditional on supplied storage curves, control ratings, initial states, and inflow history.
+
+## Service execution
+
+A separate [coupled simulation service API](COUPLED_SIMULATION_SERVICE.md) now supports asynchronous execution of independently configured hydraulic reservoir networks, atomic time-series persistence, and cache-only paginated REST reads. It requires explicit reservoir curves, calibrated controls and per-interval inflows; it does not change existing rainfall scenarios or the static redistribution and inundation results.

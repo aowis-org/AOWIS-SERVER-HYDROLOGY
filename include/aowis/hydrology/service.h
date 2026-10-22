@@ -145,12 +145,33 @@ public:
     bool cancelStaticInundation(const QString &id, const QString &scenario_uuid,
                                 QString *error);
 
+    // Independent, opt-in dynamic reservoir simulations with EXPLICIT hydraulic
+    // curves, controls and timed inflows. Results never modify scenario caches.
+    QJsonObject startCoupledSimulation(const QString &id, const QJsonObject &request,
+                                       QString *error);
+    QJsonObject coupledSimulationStatus(const QString &id, const QString &simulation_id,
+                                        QString *error) const;
+    QJsonObject coupledSimulationSnapshots(const QString &id, const QString &simulation_id,
+                                           int offset, int limit, QString *error) const;
+    bool cancelCoupledSimulation(const QString &id, const QString &simulation_id,
+                                 QString *error);
+
     static QByteArray layerMime(const QString &layer);
 
 private:
     struct Job;
     struct RedistributionTask;
     struct InundationTask;
+    struct CoupledTask
+    {
+        QString id;
+        QString analysis_id;
+        QString state = QStringLiteral("queued");
+        QString error;
+        QJsonObject request;
+        std::atomic<bool> cancelled {false};
+    };
+    void runCoupledTask(const QSharedPointer<CoupledTask> &task);
     void runInundationTask(const QSharedPointer<InundationTask> &task);
     void runRedistributionTask(const QSharedPointer<RedistributionTask> &task);
     QJsonObject rainfallRedistributionImpl(const QString &id, const QString &scenario_uuid,
@@ -171,6 +192,9 @@ private:
     QHash<QString, QSharedPointer<RedistributionTask>> redistribution_tasks;
     QHash<QString, QSharedPointer<InundationTask>> inundation_tasks;
     QThreadPool redistribution_workers;
+    mutable QMutex coupled_tasks_mutex;
+    QHash<QString, QSharedPointer<CoupledTask>> coupled_tasks;
+    QThreadPool coupled_workers;
     QHash<QString, QSharedPointer<Job>> job_map;
     QThreadPool workers;
 };

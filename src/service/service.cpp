@@ -462,6 +462,7 @@ AnalysisService::AnalysisService(const ServiceConfig &config)
 {
     this->workers.setMaxThreadCount(1);
     this->redistribution_workers.setMaxThreadCount(1);
+    this->coupled_workers.setMaxThreadCount(1);
 }
 
 AnalysisService::~AnalysisService()
@@ -488,6 +489,12 @@ AnalysisService::~AnalysisService()
              std::as_const(this->inundation_tasks))
             task->cancelled.store(true);
     }
+    {
+        QMutexLocker locker(&this->coupled_tasks_mutex);
+        for (const QSharedPointer<CoupledTask> &task : std::as_const(this->coupled_tasks))
+            task->cancelled.store(true);
+    }
+    this->coupled_workers.waitForDone();
     this->redistribution_workers.waitForDone();
     this->workers.waitForDone();
 }

@@ -89,6 +89,7 @@ if(AOWIS_HYDROLOGY_BUILD_SERVICE)
         include/aowis/hydrology/service.h
         include/aowis/hydrology/terrain_source.h
         src/service/service.cpp
+        src/service/coupled_simulation.cpp
         src/service/terrain_source.cpp
     )
     add_library(AOWIS::HydrologyService ALIAS aowis-hydrology-service)

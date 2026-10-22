@@ -592,6 +592,77 @@ void Server::setupRoutes()
         return QHttpServerResponse(QByteArrayLiteral("application/vnd.aowis.raster-f32le"), result);
     });
 
+    // Experimental time-dependent lumped-reservoir simulation. Inputs include
+    // explicit stage-storage and calibrated controls. POST queues work; GET
+    // reads only fully persisted, bounded time-series windows.
+    this->http.route("/v1/jobs/<arg>/coupled-simulations", QHttpServerRequest::Method::Post,
+                     [this](const QString &id, const QHttpServerRequest &request)
+    {
+        if (request.body().size() > 256 * 1024)
+            return errorResponse(QStringLiteral("Invalid coupled simulation request size"),
+                                 Status::BadRequest);
+        QJsonParseError parse_error;
+        const QJsonDocument document = QJsonDocument::fromJson(request.body(), &parse_error);
+        if (parse_error.error != QJsonParseError::NoError || !document.isObject())
+            return errorResponse(QStringLiteral("Invalid coupled simulation JSON"), Status::BadRequest);
+        QString error;
+        const QJsonObject result = this->service.startCoupledSimulation(id, document.object(), &error);
+        if (!error.isEmpty())
+            return errorResponse(error, error.startsWith(QStringLiteral("Invalid")) ||
+                error.startsWith(QStringLiteral("Duplicate"))
+                ? Status::BadRequest : error.startsWith(QStringLiteral("Unknown"))
+                ? Status::NotFound : error.startsWith(QStringLiteral("Coupled simulation queue full"))
+                ? Status::Conflict : Status::InternalServerError);
+        return jsonResponse(result, Status::Accepted);
+    });
+
+    this->http.route("/v1/jobs/<arg>/coupled-simulations/<arg>",
+                     QHttpServerRequest::Method::Get,
+                     [this](const QString &id, const QString &simulation_id)
+    {
+        QString error;
+        const QJsonObject result = this->service.coupledSimulationStatus(id, simulation_id, &error);
+        if (!error.isEmpty())
+            return errorResponse(error, error.startsWith(QStringLiteral("Unknown"))
+                ? Status::NotFound : Status::InternalServerError);
+        return jsonResponse(result);
+    });
+
+    this->http.route("/v1/jobs/<arg>/coupled-simulations/<arg>/snapshots",
+                     QHttpServerRequest::Method::Get,
+                     [this](const QString &id, const QString &simulation_id,
+                            const QHttpServerRequest &request)
+    {
+        const QUrlQuery query(request.url());
+        int offset = 0;
+        int limit = 25;
+        if ((query.hasQueryItem(QStringLiteral("offset")) &&
+             !readInt(query, QStringLiteral("offset"), &offset)) ||
+            (query.hasQueryItem(QStringLiteral("limit")) &&
+             !readInt(query, QStringLiteral("limit"), &limit)))
+            return errorResponse(QStringLiteral("Invalid coupled simulation pagination"), Status::BadRequest);
+        QString error;
+        const QJsonObject result = this->service.coupledSimulationSnapshots(
+            id, simulation_id, offset, limit, &error);
+        if (!error.isEmpty())
+            return errorResponse(error, error.startsWith(QStringLiteral("Invalid"))
+                ? Status::BadRequest : error.startsWith(QStringLiteral("Unknown"))
+                ? Status::NotFound : error.startsWith(QStringLiteral("Coupled simulation result not ready"))
+                ? Status::Conflict : Status::InternalServerError);
+        return jsonResponse(result);
+    });
+
+    this->http.route("/v1/jobs/<arg>/coupled-simulations/<arg>",
+                     QHttpServerRequest::Method::Delete,
+                     [this](const QString &id, const QString &simulation_id)
+    {
+        QString error;
+        if (!this->service.cancelCoupledSimulation(id, simulation_id, &error))
+            return errorResponse(error, Status::Conflict);
+        return jsonResponse(QJsonObject{{QStringLiteral("state"),
+            QStringLiteral("cancel_requested")}}, Status::Accepted);
+    });
+
     this->http.route("/v1/jobs/<arg>/catchment", QHttpServerRequest::Method::Get,
                      [this](const QString &id, const QHttpServerRequest &request)
     {

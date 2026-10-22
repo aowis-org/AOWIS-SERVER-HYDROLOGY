@@ -71,6 +71,7 @@ int main(int argc, char **argv)
     };
     QString successful_id;
     QString rainfall_scenario_id;
+    QString coupled_simulation_id;
     {
         AnalysisService service(configuration);
         QString error;
@@ -80,6 +81,108 @@ int main(int argc, char **argv)
         successful_id = service.submit(smallRequest(), &error);
         assert(!successful_id.isEmpty() && error.isEmpty());
         waitForState(service, successful_id, QStringLiteral("completed"));
+        // Coupled routing is an independent persisted model: prescribed basin
+        // inflows and surveyed hydraulic controls, NOT a derived flood forecast.
+        const QJsonObject coupled_request{
+            {QStringLiteral("reservoirs"), QJsonArray{QJsonObject{
+                {QStringLiteral("component_index"), 10},
+                {QStringLiteral("initial_storage_m3"), 1100.0},
+                {QStringLiteral("stage_storage"), QJsonArray{
+                    QJsonArray{0.0, 0.0}, QJsonArray{10.0, 1000.0},
+                    QJsonArray{20.0, 2000.0}}}
+            }}},
+            {QStringLiteral("connections"), QJsonArray()},
+            {QStringLiteral("outlets"), QJsonArray{QJsonObject{
+                {QStringLiteral("component_index"), 10},
+                {QStringLiteral("crest_elevation_m"), 10.0},
+                {QStringLiteral("effective_width_m"), 2.0},
+                {QStringLiteral("discharge_factor"), 0.9},
+                {QStringLiteral("downstream_water_level_m"), 8.0}
+            }}},
+            {QStringLiteral("inflows"), QJsonArray{
+                QJsonObject{{QStringLiteral("duration_seconds"), 0.1},
+                    {QStringLiteral("volume_m3"), QJsonArray{10.0}}},
+                QJsonObject{{QStringLiteral("duration_seconds"), 0.1},
+                    {QStringLiteral("volume_m3"), QJsonArray{0.0}}}
+            }},
+            {QStringLiteral("options"), QJsonObject{
+                {QStringLiteral("maximum_substep_seconds"), 0.01}}}
+        };
+        assert(service.startCoupledSimulation(successful_id,
+            QJsonObject{}, &error).isEmpty());
+        assert(error.startsWith(QStringLiteral("Invalid")));
+        const QJsonObject queued = service.startCoupledSimulation(
+            successful_id, coupled_request, &error);
+        assert(error.isEmpty() && !queued.isEmpty());
+        coupled_simulation_id = queued.value(QStringLiteral("simulation_id")).toString();
+        assert(!coupled_simulation_id.isEmpty());
+        QElapsedTimer coupled_timer;
+        coupled_timer.start();
+        bool coupled_completed = false;
+        while (coupled_timer.elapsed() < 10000)
+        {
+            const QJsonObject state = service.coupledSimulationStatus(
+                successful_id, coupled_simulation_id, &error);
+            assert(error.isEmpty());
+            if (state.value(QStringLiteral("state")) == QStringLiteral("completed"))
+            {
+                assert(state.value(QStringLiteral("result_ready")).toBool());
+                coupled_completed = true;
+                break;
+            }
+            assert(state.value(QStringLiteral("state")) != QStringLiteral("failed"));
+            QThread::msleep(5);
+        }
+        assert(coupled_completed);
+        const QJsonObject series = service.coupledSimulationSnapshots(
+            successful_id, coupled_simulation_id, 0, 2, &error);
+        assert(error.isEmpty());
+        assert(series.value(QStringLiteral("total_snapshots")).toInt() == 3);
+        assert(series.value(QStringLiteral("snapshots")).toArray().size() == 2);
+        assert(series.value(QStringLiteral("has_more")).toBool());
+        const QJsonObject last_page = service.coupledSimulationSnapshots(
+            successful_id, coupled_simulation_id, 2, 2, &error);
+        assert(error.isEmpty() && last_page.value(QStringLiteral("snapshots")).toArray().size() == 1);
+        const QJsonObject last = last_page.value(QStringLiteral("snapshots")).toArray().first().toObject();
+        assert(std::abs(last.value(QStringLiteral("total_storage_m3")).toDouble() +
+            last.value(QStringLiteral("cumulative_boundary_outflow_m3")).toDouble() -
+            1110.0) < 1e-6);
+        assert(service.coupledSimulationSnapshots(successful_id, coupled_simulation_id,
+            -1, 3, &error).isEmpty() && error.startsWith(QStringLiteral("Invalid")));
+        // A client may specify hydraulic parameters, but it cannot fabricate
+        // a DEM saddle junction for an internal weir control.
+        QJsonObject bad_junction_request = coupled_request;
+        bad_junction_request.insert(QStringLiteral("connections"), QJsonArray{QJsonObject{
+            {QStringLiteral("kind"), QStringLiteral("weir")},
+            {QStringLiteral("junction_parent_index"), 99999},
+            {QStringLiteral("first_component_index"), 10},
+            {QStringLiteral("second_component_index"), 11},
+            {QStringLiteral("crest_elevation_m"), 10.0},
+            {QStringLiteral("effective_width_m"), 2.0},
+            {QStringLiteral("discharge_factor"), 0.9},
+            {QStringLiteral("submergence_rating"), QJsonArray{
+                QJsonArray{0.0, 1.0}, QJsonArray{1.0, 0.0}}}
+        }});
+        const QJsonObject bad_started = service.startCoupledSimulation(
+            successful_id, bad_junction_request, &error);
+        assert(error.isEmpty() && !bad_started.isEmpty());
+        const QString bad_id = bad_started.value(QStringLiteral("simulation_id")).toString();
+        coupled_timer.restart();
+        bool bad_finished = false;
+        while (coupled_timer.elapsed() < 10000)
+        {
+            const QJsonObject bad_status = service.coupledSimulationStatus(
+                successful_id, bad_id, &error);
+            assert(error.isEmpty());
+            if (bad_status.value(QStringLiteral("state")) == QStringLiteral("failed"))
+            {
+                bad_finished = true;
+                assert(!bad_status.value(QStringLiteral("result_ready")).toBool());
+                break;
+            }
+            QThread::msleep(5);
+        }
+        assert(bad_finished);
         const QJsonObject completed = service.job(successful_id);
         assert(completed.value(QStringLiteral("horizontal_crs")) ==
             QStringLiteral("EPSG:4326"));
@@ -236,6 +339,29 @@ int main(int argc, char **argv)
         assert(restored.initialize(&error));
         assert(restored.job(successful_id).value(QStringLiteral("state")) ==
             QStringLiteral("completed"));
+        const QJsonObject persisted_coupled = restored.coupledSimulationStatus(
+            successful_id, coupled_simulation_id, &error);
+        assert(error.isEmpty());
+        assert(persisted_coupled.value(QStringLiteral("state")) == QStringLiteral("completed"));
+        const QJsonObject restored_series = restored.coupledSimulationSnapshots(
+            successful_id, coupled_simulation_id, 1, 1, &error);
+        assert(error.isEmpty() && restored_series.value(QStringLiteral("snapshots")).toArray().size() == 1);
+        const QString series_path = QDir(configuration.output_directory).filePath(
+            successful_id + QStringLiteral("/coupled-simulations/") +
+            coupled_simulation_id + QStringLiteral("/series-v1.aowbin"));
+        QFile damaged_series(series_path);
+        assert(damaged_series.open(QIODevice::ReadWrite));
+        assert(damaged_series.seek(64 + 32 + 8));
+        const QByteArray previous_byte = damaged_series.read(1);
+        assert(previous_byte.size() == 1);
+        assert(damaged_series.seek(64 + 32 + 8));
+        const char flipped = char(previous_byte.at(0) ^ 0x40);
+        assert(damaged_series.write(&flipped, 1) == 1);
+        damaged_series.close();
+        assert(restored.coupledSimulationSnapshots(successful_id,
+            coupled_simulation_id, 0, 1, &error).isEmpty());
+        assert(error.contains(QStringLiteral("Corrupt coupled simulation snapshot")));
+
         assert(restored.job(successful_id).value(QStringLiteral("vertical_datum")) ==
             QStringLiteral("EGM2008"));
         assert(restored.job(successful_id).value(QStringLiteral("breach_depressions")) == false);
