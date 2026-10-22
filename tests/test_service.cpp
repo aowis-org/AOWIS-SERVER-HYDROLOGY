@@ -66,6 +66,7 @@ int main(int argc, char **argv)
         return result;
     };
     QString successful_id;
+    QString rainfall_scenario_id;
     {
         AnalysisService service(configuration);
         QString error;
@@ -127,6 +128,31 @@ int main(int argc, char **argv)
             {QStringLiteral("type"), QStringLiteral("Polygon")},
             {QStringLiteral("coordinates"), QJsonArray{rainfall_ring}}
         };
+        const QJsonObject rainfall_request{
+            {QStringLiteral("name"), QStringLiteral("synthetic rain")},
+            {QStringLiteral("geometry"), polygon_geometry},
+            {QStringLiteral("depth_mm"), 25.0},
+            {QStringLiteral("duration_seconds"), 3600.0},
+            {QStringLiteral("effective_runoff_fraction"), 0.4}
+        };
+        const QJsonObject rainfall = service.createRainfallScenario(
+            successful_id, rainfall_request, &error);
+        assert(error.isEmpty());
+        rainfall_scenario_id = rainfall.value(QStringLiteral("id")).toString();
+        assert(!rainfall_scenario_id.isEmpty());
+        assert(rainfall.value(QStringLiteral("wet_cells")).toInt() == 1);
+        const double gross = rainfall.value(QStringLiteral("gross_rainfall_volume_m3")).toDouble();
+        const double effective = rainfall.value(QStringLiteral("effective_runoff_volume_m3")).toDouble();
+        assert(gross > 0.0);
+        assert(std::abs(effective - gross * 0.4) < gross * 1.0e-6);
+        assert(service.rainfallScenarios(successful_id, &error).size() == 1);
+        assert(error.isEmpty());
+        const QByteArray runoff_window = service.rainfallRunoffWindow(
+            successful_id, rainfall_scenario_id, 1, 1, 1, 1, &error);
+        assert(error.isEmpty() && runoff_window.size() == 8);
+        assert(service.createRainfallScenario(successful_id,
+            QJsonObject{{QStringLiteral("geometry"), polygon_geometry}}, &error).isEmpty());
+        assert(error.startsWith(QStringLiteral("Invalid")));
         const QJsonObject polygon_query{
             {QStringLiteral("min_upstream_area_km2"), 0.001},
             {QStringLiteral("geometry"), polygon_geometry}
@@ -181,6 +207,14 @@ int main(int argc, char **argv)
             0, 0, 2, 2, &error).size() == 16);
         assert(restored.rasterWindow(successful_id, QStringLiteral("elevation"), 0, 0, 2, 2,
             &error).size() == 16);
+        assert(error.isEmpty());
+        const QJsonObject saved_rain = restored.rainfallScenario(
+            successful_id, rainfall_scenario_id, &error);
+        assert(error.isEmpty());
+        assert(saved_rain.value(QStringLiteral("name")) == QStringLiteral("synthetic rain"));
+        assert(restored.rainfallScenarios(successful_id, &error).size() == 1);
+        assert(restored.rainfallRunoffWindow(successful_id, rainfall_scenario_id,
+            1, 1, 1, 1, &error).size() == 8);
         assert(error.isEmpty());
         const QJsonObject persisted_watershed = restored.watershedBoundary(
             successful_id, 1, 1, &error);

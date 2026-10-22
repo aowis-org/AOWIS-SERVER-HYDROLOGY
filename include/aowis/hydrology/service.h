@@ -3,6 +3,7 @@
 
 #include <aowis/hydrology/analysis.h>
 #include <aowis/hydrology/flow_network.h>
+#include <aowis/hydrology/rainfall.h>
 #include <aowis/hydrology/spatial_queries.h>
 #include <aowis/hydrology/terrain_source.h>
 
@@ -98,6 +99,18 @@ public:
                              double level_m, QString *error) const;
     QJsonObject basinStorageCurve(const QString &id, const QString &basin_uuid,
                                   int samples, QString *error) const;
+
+    // Rainfall scenarios reuse one immutable terrain-analysis job. The
+    // resulting row-major runoff raster is persisted separately by UUID;
+    // no D8 routing, infiltration timing, or basin filling occurs here.
+    QJsonObject createRainfallScenario(const QString &id, const QJsonObject &request,
+                                       QString *error) const;
+    QJsonArray rainfallScenarios(const QString &id, QString *error) const;
+    QJsonObject rainfallScenario(const QString &id, const QString &scenario_uuid,
+                                 QString *error) const;
+    QByteArray rainfallRunoffWindow(const QString &id, const QString &scenario_uuid,
+                                    int x, int y, int width, int height,
+                                    QString *error) const;
 
     static QByteArray layerMime(const QString &layer);
 

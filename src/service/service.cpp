@@ -1344,3 +1344,204 @@ QJsonObject AnalysisService::basinStorageCurve(const QString &id, const QString 
 }
 
 } // namespace Aowis::Hydrology
+
+namespace Aowis::Hydrology
+{
+namespace
+{
+// Scenario manifests are the commit markers. Orphaned raster files left by
+// interrupted writes are ignored by list and detail operations.
+QJsonObject loadRainfallManifest(const QString &folder, const QString &uuid)
+{
+    const QUuid parsed(QStringLiteral("{") + uuid + QStringLiteral("}"));
+    if (parsed.isNull() || parsed.toString(QUuid::WithoutBraces) != uuid)
+        throw std::invalid_argument("Invalid rainfall scenario UUID");
+    QFile file(QDir(folder).filePath(uuid + QStringLiteral("/scenario.json")));
+    if (!file.open(QIODevice::ReadOnly) || file.size() > 262144)
+        throw std::invalid_argument("Unknown rainfall scenario UUID");
+    const QJsonDocument document = QJsonDocument::fromJson(file.readAll());
+    const QJsonObject object = document.object();
+    if (!document.isObject() || object.value(QStringLiteral("id")) != uuid)
+        throw std::runtime_error("Corrupt rainfall scenario manifest");
+    return object;
+}
+}
+
+QJsonObject AnalysisService::createRainfallScenario(
+    const QString &id, const QJsonObject &request, QString *error) const
+{
+    if (error != nullptr) error->clear();
+    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
+    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
+    {
+        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
+        return {};
+    }
+    try
+    {
+        for (const QString &name : {QStringLiteral("depth_mm"),
+                                     QStringLiteral("duration_seconds"),
+                                     QStringLiteral("effective_runoff_fraction")})
+            if (!request.value(name).isDouble())
+                throw std::invalid_argument("Invalid rainfall scenario numeric field");
+        const QString name = request.value(QStringLiteral("name")).toString();
+        if (name.size() > 128 || name.contains(QChar('\n')) || name.contains(QChar('\r')) ||
+            (!request.value(QStringLiteral("name")).isUndefined() &&
+             !request.value(QStringLiteral("name")).isString()))
+            throw std::invalid_argument("Invalid rainfall scenario name");
+        RainfallScenario scenario;
+        scenario.polygons = parseGeoJsonPolygons(request);
+        scenario.depth_mm = request.value(QStringLiteral("depth_mm")).toDouble();
+        scenario.duration_seconds = request.value(QStringLiteral("duration_seconds")).toDouble();
+        scenario.effective_runoff_fraction = request.value(
+            QStringLiteral("effective_runoff_fraction")).toDouble();
+        const QString scenarios_folder = QDir(jobDirectory(id)).filePath(
+            QStringLiteral("rainfall-scenarios"));
+        const QDir existing(scenarios_folder);
+        if (existing.exists() && existing.entryList(QDir::Dirs | QDir::NoDotAndDotDot).size() >= 64)
+            throw std::invalid_argument("Too many rainfall scenarios for one terrain job");
+        const ElevationGrid source = loadOriginalElevation(jobDirectory(id), item->grid);
+        const RainfallRunoff result = calculateRainfallRunoff(source, scenario);
+        if (result.contains_missing_dem_coverage)
+            throw std::invalid_argument("Rainfall polygons intersect cells without elevation data");
+        if (result.wet_cells == 0)
+            throw std::invalid_argument("Rainfall polygon covers no DEM cells");
+        const QString uuid = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const QString folder = QDir(scenarios_folder).filePath(uuid);
+        if (!QDir().mkpath(folder))
+            throw std::runtime_error("Cannot create rainfall scenario directory");
+        try
+        {
+            writeArray(QDir(folder).filePath(QStringLiteral("runoff.f64")),
+                       result.runoff_volume_m3);
+            writeArray(QDir(folder).filePath(QStringLiteral("coverage.f32")),
+                       result.covered_fraction);
+            const QJsonObject summary{
+                {QStringLiteral("id"), uuid},
+                {QStringLiteral("job_id"), id},
+                {QStringLiteral("name"), name},
+                {QStringLiteral("model"), QStringLiteral("static_uniform_rainfall_runoff")},
+                {QStringLiteral("depth_mm"), scenario.depth_mm},
+                {QStringLiteral("duration_seconds"), scenario.duration_seconds},
+                {QStringLiteral("effective_runoff_fraction"), scenario.effective_runoff_fraction},
+                {QStringLiteral("geometry"), request.value(QStringLiteral("geometry")).isObject()
+                    ? request.value(QStringLiteral("geometry")) : QJsonValue(request)},
+                {QStringLiteral("wet_cells"), double(result.wet_cells)},
+                {QStringLiteral("covered_area_m2"), result.covered_area_m2},
+                {QStringLiteral("gross_rainfall_volume_m3"), result.gross_rainfall_volume_m3},
+                {QStringLiteral("effective_runoff_volume_m3"), result.effective_runoff_volume_m3},
+                {QStringLiteral("retained_or_lost_volume_m3"), result.retained_or_lost_volume_m3},
+                {QStringLiteral("average_effective_runoff_m3_s"), result.average_effective_runoff_m3_s},
+                {QStringLiteral("touches_domain_boundary"), result.touches_domain_boundary},
+                {QStringLiteral("runoff_raster_format"), QStringLiteral("f64le_m3_per_cell")},
+                {QStringLiteral("coverage_raster_format"), QStringLiteral("f32le_fraction")}
+            };
+            QSaveFile file(QDir(folder).filePath(QStringLiteral("scenario.json")));
+            const QByteArray json_bytes = QJsonDocument(summary).toJson(QJsonDocument::Compact);
+            if (!file.open(QIODevice::WriteOnly) ||
+                file.write(json_bytes) != json_bytes.size() || !file.commit())
+                throw std::runtime_error("Cannot persist rainfall scenario manifest");
+            return summary;
+        }
+        catch (...)
+        {
+            QDir(folder).removeRecursively();
+            throw;
+        }
+    }
+    catch (const std::exception &ex)
+    {
+        if (error != nullptr) *error = QString::fromUtf8(ex.what());
+        return {};
+    }
+}
+
+QJsonArray AnalysisService::rainfallScenarios(const QString &id, QString *error) const
+{
+    if (error != nullptr) error->clear();
+    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
+    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
+    {
+        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
+        return {};
+    }
+    try
+    {
+        QJsonArray output;
+        const QString folder = QDir(jobDirectory(id)).filePath(
+            QStringLiteral("rainfall-scenarios"));
+        const QStringList identifiers = QDir(folder).entryList(
+            QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+        for (const QString &uuid : identifiers)
+        {
+            if (QFileInfo::exists(QDir(folder).filePath(uuid + QStringLiteral("/scenario.json"))))
+                output.append(loadRainfallManifest(folder, uuid));
+        }
+        return output;
+    }
+    catch (const std::exception &ex)
+    {
+        if (error != nullptr) *error = QString::fromUtf8(ex.what());
+        return {};
+    }
+}
+
+QJsonObject AnalysisService::rainfallScenario(
+    const QString &id, const QString &scenario_uuid, QString *error) const
+{
+    if (error != nullptr) error->clear();
+    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
+    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
+    {
+        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
+        return {};
+    }
+    try
+    {
+        return loadRainfallManifest(QDir(jobDirectory(id)).filePath(
+            QStringLiteral("rainfall-scenarios")), scenario_uuid);
+    }
+    catch (const std::exception &ex)
+    {
+        if (error != nullptr) *error = QString::fromUtf8(ex.what());
+        return {};
+    }
+}
+
+QByteArray AnalysisService::rainfallRunoffWindow(
+    const QString &id, const QString &scenario_uuid,
+    int x, int y, int width, int height, QString *error) const
+{
+    if (error != nullptr) error->clear();
+    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
+    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
+    {
+        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
+        return {};
+    }
+    if (x < 0 || y < 0 || width <= 0 || height <= 0 ||
+        width > 4096 || height > 4096 || std::uint64_t(width) * height > 1000000 ||
+        std::uint64_t(x) + width > item->grid.columns ||
+        std::uint64_t(y) + height > item->grid.rows)
+    {
+        if (error != nullptr) *error = QStringLiteral("Invalid rainfall raster window");
+        return {};
+    }
+    try
+    {
+        const QString folder = QDir(jobDirectory(id)).filePath(
+            QStringLiteral("rainfall-scenarios"));
+        (void)loadRainfallManifest(folder, scenario_uuid);
+        const QString path = QDir(folder).filePath(
+            scenario_uuid + QStringLiteral("/runoff.f64"));
+        if (QFileInfo(path).size() != qint64(std::uint64_t(item->grid.columns) * item->grid.rows * 8))
+            throw std::runtime_error("Incomplete rainfall scenario runoff raster");
+        return readRectangle(path, item->grid.columns, x, y, width, height, 8);
+    }
+    catch (const std::exception &ex)
+    {
+        if (error != nullptr) *error = QString::fromUtf8(ex.what());
+        return {};
+    }
+}
+} // namespace Aowis::Hydrology

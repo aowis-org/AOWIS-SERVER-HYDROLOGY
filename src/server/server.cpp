@@ -374,6 +374,83 @@ void Server::setupRoutes()
         return jsonResponse(result);
     });
 
+    // Terrain analysis jobs may host many independent rainfall scenarios.
+    // Scenario rasters and manifests are immutable after creation, so
+    // fetching a scenario never reruns or changes the DEM analysis.
+    this->http.route("/v1/jobs/<arg>/rainfall-scenarios", QHttpServerRequest::Method::Post,
+                     [this](const QString &id, const QHttpServerRequest &request)
+    {
+        if (request.body().size() > 262144)
+            return errorResponse(QStringLiteral("Rainfall request exceeds 256 KiB"), Status::BadRequest);
+        QJsonParseError parse_error;
+        const QJsonDocument document = QJsonDocument::fromJson(request.body(), &parse_error);
+        if (parse_error.error != QJsonParseError::NoError || !document.isObject())
+            return errorResponse(QStringLiteral("Invalid rainfall scenario JSON"), Status::BadRequest);
+        const QJsonObject job = this->service.job(id);
+        if (job.isEmpty()) return errorResponse(QStringLiteral("Unknown job"), Status::NotFound);
+        if (job.value(QStringLiteral("state")) != QStringLiteral("completed"))
+            return errorResponse(QStringLiteral("Analysis not completed"), Status::Conflict);
+        QString error;
+        const QJsonObject result = this->service.createRainfallScenario(id, document.object(), &error);
+        if (!error.isEmpty())
+            return errorResponse(error, error.startsWith(QStringLiteral("Invalid")) ||
+                error.startsWith(QStringLiteral("Too many")) ||
+                error.startsWith(QStringLiteral("Antimeridian")) ||
+                error.startsWith(QStringLiteral("Rainfall polygons"))
+                ? Status::BadRequest : Status::InternalServerError);
+        return jsonResponse(result, Status::Created);
+    });
+
+    this->http.route("/v1/jobs/<arg>/rainfall-scenarios", QHttpServerRequest::Method::Get,
+                     [this](const QString &id)
+    {
+        if (this->service.job(id).isEmpty())
+            return errorResponse(QStringLiteral("Unknown job"), Status::NotFound);
+        QString error;
+        const QJsonArray items = this->service.rainfallScenarios(id, &error);
+        if (!error.isEmpty())
+            return errorResponse(error, Status::InternalServerError);
+        return jsonResponse(QJsonObject{{QStringLiteral("scenarios"), items}});
+    });
+
+    this->http.route("/v1/jobs/<arg>/rainfall-scenarios/<arg>", QHttpServerRequest::Method::Get,
+                     [this](const QString &id, const QString &scenario_id)
+    {
+        if (this->service.job(id).isEmpty())
+            return errorResponse(QStringLiteral("Unknown job"), Status::NotFound);
+        QString error;
+        const QJsonObject result = this->service.rainfallScenario(id, scenario_id, &error);
+        if (!error.isEmpty())
+            return errorResponse(error, error.startsWith(QStringLiteral("Invalid")) ||
+                error.startsWith(QStringLiteral("Unknown"))
+                ? Status::NotFound : Status::InternalServerError);
+        return jsonResponse(result);
+    });
+
+    this->http.route("/v1/jobs/<arg>/rainfall-scenarios/<arg>/runoff",
+                     QHttpServerRequest::Method::Get,
+                     [this](const QString &id, const QString &scenario_id,
+                            const QHttpServerRequest &request)
+    {
+        if (this->service.job(id).isEmpty())
+            return errorResponse(QStringLiteral("Unknown job"), Status::NotFound);
+        const QUrlQuery query(request.url());
+        int x = 0, y = 0, width = 0, height = 0;
+        if (!readInt(query, QStringLiteral("x"), &x) ||
+            !readInt(query, QStringLiteral("y"), &y) ||
+            !readInt(query, QStringLiteral("width"), &width) ||
+            !readInt(query, QStringLiteral("height"), &height))
+            return errorResponse(QStringLiteral("Invalid rainfall raster window"), Status::BadRequest);
+        QString error;
+        const QByteArray output = this->service.rainfallRunoffWindow(
+            id, scenario_id, x, y, width, height, &error);
+        if (!error.isEmpty())
+            return errorResponse(error, error.startsWith(QStringLiteral("Invalid"))
+                ? Status::BadRequest : error.startsWith(QStringLiteral("Unknown"))
+                ? Status::NotFound : Status::InternalServerError);
+        return QHttpServerResponse(QByteArrayLiteral("application/vnd.aowis.raster-f64le"), output);
+    });
+
     this->http.route("/v1/jobs/<arg>/catchment", QHttpServerRequest::Method::Get,
                      [this](const QString &id, const QHttpServerRequest &request)
     {

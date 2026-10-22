@@ -26,7 +26,7 @@ aowis-server-gui (same process)
 
 Standalone must not spawn Hydrology or Map HTTP daemons, create implicit localhost sockets, or implement an alternative hydrology algorithm. It invokes the same application-service operations in process. Map's existing configuration governs DEM availability, download policies and caches. A Map object supplied by the application is borrowed and must outlive the Hydrology service; ownership remains with the standalone application.
 
-The existing `AOWIS::Hydrology` target exposes the pure C++ `analyze()` algorithm. `AOWIS::HydrologyService` now owns the **existing terrain-analysis job API**, including background execution, persistence, cancellation, binary result retrieval and an injectable terrain callback. HTTP `Server` delegates to this library. Rainfall scenarios and final GUI wiring remain future work. Call `AnalysisService` directly instead of using HTTP server types in Standalone.
+The existing `AOWIS::Hydrology` target exposes the pure C++ `analyze()` algorithm. `AOWIS::HydrologyService` now owns the **existing terrain-analysis job API**, including background execution, persistence, cancellation, binary result retrieval and an injectable terrain callback. HTTP `Server` delegates to this library. Rainfall scenarios now use the same application service; basin overflow redistribution and final GUI wiring remain future work. Call `AnalysisService` directly instead of using HTTP server types in Standalone.
 
 ## Stable interface principles
 
@@ -45,12 +45,12 @@ The current target structure, with future growth planned for scenario operations
 | CMake target | Role | Linked by |
 | --- | --- | --- |
 | `AOWIS::Hydrology` (existing) | Pure C++ analysis algorithms | Hydrology service, core tests |
-| `AOWIS::HydrologyService` (implemented for terrain jobs; scenarios planned) | Terrain jobs, results, scheduling, injected terrain sources | HTTP adapter and future Standalone GUI |
+| `AOWIS::HydrologyService` (terrain jobs and rainfall scenarios implemented) | Terrain jobs, results, scheduling, injected terrain sources | HTTP adapter and future Standalone GUI |
 | `aowis-server-hydrology` (thin adapter/CLI) | Qt HTTP routes, CLI and process lifecycle | Distributed server deployment |
 
 Qt HttpServer is not required when linking the standalone application-service library. The standalone build already adds Map and GUI as CMake subdirectories. When Hydrology is included, Map must be added only once; the Hydrology build must reuse the parent's `AOWIS::Map` target. The optional existing local-Map build configuration recognizes a previously defined target. Standalone-specific wiring, submodule entries and GUI linking will be changed only in a separately authorized cycle.
 
-Current terrain-job service embedding (does not yet include rainfall scenarios):
+Current terrain-job and rainfall-scenario service embedding:
 
 ```cmake
 set(AOWIS_HYDROLOGY_BUILD_SERVER OFF CACHE BOOL "" FORCE)

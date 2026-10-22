@@ -12,6 +12,7 @@ The first implementation provides:
 - Regional elevation-grid analysis using **Priority-Flood depression filling**, flat-area routing without artificial elevation ramps, **D8 flow direction**, and **flow accumulation** in upstream cells and square metres.
 - **Physical depression-fill diagnostics** including per-cell potential fill depth and area-weighted total potential fill volume; the original DEM remains unchanged. See [DEM conditioning](docs/CONDITIONING.md).
 - **Depression hierarchy and basin storage (core/service/REST):** 8-connected raster-minimum and saddle topology, nested parent/child basins, physical spill capacities and bounded water-level/volume queries derived from the original terrain. See [Depression hierarchy](docs/DEPRESSION_HIERARCHY.md). Basin artifacts now persist with analysis jobs, with UUID-addressed queries and sampled curves.
+- **Rainfall scenarios (core/service/REST):** independent UUID-addressed scenarios reusing a completed terrain analysis, WGS84 GeoJSON polygons/multipolygons, exact planar clipped-cell coverage and polygon union including holes, explicit total rainfall depth/duration/runoff fraction, mass-balanced gross/effective volumes, persistent row-major runoff rasters, and scenario retrieval after restart. See [Rainfall scenarios](docs/RAINFALL_SCENARIOS.md).
 - **Catchment delineation** upstream of a chosen terrain cell.
 - **Downstream tracing and D8 channel-network extraction:** reusable flow-graph queries, length/slope metrics, tributary junctions and Strahler stream order. Includes **watershed GeoJSON polygons**, geographically selected downstream-affected channels and bounded window extraction. See [Drainage networks](docs/DRAINAGE_NETWORKS.md).
 - Optional **constrained local breaching** of short DEM obstructions, with explicit excavation and path limits, physical cut-depth diagnostics and separate unmodified DEM elevations. Disabled by default.
@@ -19,7 +20,7 @@ The first implementation provides:
 - A thin **Qt 6 REST adapter** (`aowis-server-hydrology`) exposing that service's operations over HTTP, with no separate job/analysis implementation.
 - Acquisition of source-precision floating-point elevation windows through **AOWIS-SERVER-MAP**, via HTTP in a distributed deployment and the existing Map C++ `TerrainData` instance when embedded. The Qt-independent, read-only `AOWIS::HydrologyRaster` GeoTIFF reader remains available separately for development fixtures and controlled reference comparisons; it is not a production server terrain provider.
 
-The job service has a reusable in-process interface for the same operations served over HTTP. Geographic polygons can now **select topological drainage source cells**, but rainfall depth, partial-cell overlap, Fill–Spill–Merge, SWMM execution and full standalone GUI/Map wiring are **not yet implemented**. These are separate roadmap stages.
+The job service has a reusable in-process interface for the same operations served over HTTP. Geographic polygons can select drainage source cells and define **volume-based rainfall scenarios**, but Fill–Spill–Merge redistribution, SWMM execution and full standalone GUI/Map wiring are **not yet implemented**. These are separate roadmap stages.
 
 ### Interpretation and limitations
 
@@ -127,7 +128,7 @@ add_subdirectory(AOWIS-SERVER-HYDROLOGY)
 target_link_libraries(aowis-server-gui PRIVATE AOWIS::HydrologyService)
 ```
 
-`AOWIS::HydrologyService` exports the public API in `include/aowis/hydrology/service.h`: `initialize`, `submit`, `job`, `jobs`, `cancel`, `rasterWindow`, `catchment`, `downstreamTrace` and `channelNetwork`. Supply a `ServiceConfig::terrain_reader` function for an in-process terrain source, or let the existing adapter request DEM patches from Map. The caller owns any external Map instance and must keep it alive until the service is destroyed. This makes the job functionality reusable in-process; Standalone's own CMake and GUI integration still require separate authorization.
+`AOWIS::HydrologyService` exports the public API in `include/aowis/hydrology/service.h`: `initialize`, `submit`, `job`, `jobs`, `cancel`, `rasterWindow`, `catchment`, `downstreamTrace`, `channelNetwork`, and rainfall scenario creation/retrieval. Supply a `ServiceConfig::terrain_reader` function for an in-process terrain source, or let the existing adapter request DEM patches from Map. The caller owns any external Map instance and must keep it alive until the service is destroyed. This makes the job functionality reusable in-process; Standalone's own CMake and GUI integration still require separate authorization.
 
 To build only the Qt-independent algorithm library, disable **both** `AOWIS_HYDROLOGY_BUILD_SERVER` and `AOWIS_HYDROLOGY_BUILD_SERVICE`; link `AOWIS::Hydrology`. See [Integration architecture](docs/INTEGRATION.md) for both modes.
 
@@ -199,6 +200,26 @@ formation and spill. A query may fail when the connected pond exceeds its
 2-million-cell per-sample traversal budget; clients should then use spill
 capacity from the basin summary rather than interpreting missing results
 as zero. **These values are static topographic estimates, not simulated storm flooding.**
+
+## Rainfall scenario API
+
+Completed terrain analyses can be reused for independent, UUID-addressed
+uniform-rainfall scenarios, with no repeated Map DEM fetching or D8 solving:
+
+```http
+POST /v1/jobs/{analysis-uuid}/rainfall-scenarios
+GET /v1/jobs/{analysis-uuid}/rainfall-scenarios
+GET /v1/jobs/{analysis-uuid}/rainfall-scenarios/{scenario-uuid}
+GET /v1/jobs/{analysis-uuid}/rainfall-scenarios/{scenario-uuid}/runoff?x=0&y=0&width=256&height=256
+```
+
+The JSON POST accepts a WGS84 GeoJSON `geometry` (Polygon or MultiPolygon),
+`depth_mm`, `duration_seconds`, `effective_runoff_fraction`, and an optional
+`name`. It reports total rainfall volume, effective runoff volume and the
+unrouted per-cell runoff raster. The `/runoff` endpoint returns raw little-
+endian float64 **m³ per DEM cell**. The storage/overflow model is still
+pending: runoff volumes do **not** currently represent flooded areas or
+water heights. See [docs/RAINFALL_SCENARIOS.md](docs/RAINFALL_SCENARIOS.md).
 
 ## REST API
 
