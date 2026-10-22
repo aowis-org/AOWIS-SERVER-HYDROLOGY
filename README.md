@@ -14,7 +14,7 @@ The first implementation provides:
 - **Depression hierarchy and basin storage (core/service/REST):** 8-connected raster-minimum and saddle topology, nested parent/child basins, physical spill capacities and bounded water-level/volume queries derived from the original terrain. See [Depression hierarchy](docs/DEPRESSION_HIERARCHY.md). Basin artifacts now persist with analysis jobs, with UUID-addressed queries and sampled curves.
 - **Rainfall scenarios (core/service/REST):** independent UUID-addressed scenarios reusing a completed terrain analysis, WGS84 GeoJSON polygons/multipolygons, exact planar clipped-cell coverage and polygon union including holes, explicit total rainfall depth/duration/runoff fraction, mass-balanced gross/effective volumes, persistent row-major runoff rasters, and scenario retrieval after restart. See [Rainfall scenarios](docs/RAINFALL_SCENARIOS.md).
 - **Static Fill–Spill–Merge-style runoff redistribution (core/service/REST):** original-DEM dry D8 routing, closed-basin storage, sibling/parent spill transfers, domain outflow and explicit mass balance, queried for saved rainfall scenarios. Results are cached per scenario in a versioned, integrity-checked binary archive and reused across pagination and restarts. A bounded asynchronous worker provides nonblocking REST submission, status, cancellation and cache-only retrieval. This remains a volume-only screening approximation. See [Runoff redistribution](docs/RUNOFF_REDISTRIBUTION.md), [Result caching](docs/REDISTRIBUTION_CACHE.md) and [Asynchronous jobs](docs/ASYNCHRONOUS_REDISTRIBUTION.md).
-- **Conservative static standing-water reconstruction (core/service/REST):** invert physical basin storage volumes to water levels and cell-centre depth rasters for isolated roots and fully connected merged roots; explicitly decline ambiguous partially merged sibling conditions. A separately scheduled task persists source-validated depth rasters with bounded, checksum-verified REST windows and status reporting. See [Static inundation model](docs/STATIC_INUNDATION.md) and [Inundation service API](docs/INUNDATION_SERVICE.md).
+- **Conservative static standing-water reconstruction (core/service/REST):** invert physical basin storage volumes to water levels and cell-centre depth rasters. At unformed saddles, reconstruct independent child ponds with an explicit `allocation_assumed` warning; at formed saddles, reconstruct the connected merged pond. Reject inconsistent allocations. A separately scheduled task persists source-validated depth rasters with bounded, checksum-verified REST windows and status reporting. See [Static inundation model](docs/STATIC_INUNDATION.md) and [Inundation service API](docs/INUNDATION_SERVICE.md).
 - **Catchment delineation** upstream of a chosen terrain cell.
 - **Downstream tracing and D8 channel-network extraction:** reusable flow-graph queries, length/slope metrics, tributary junctions and Strahler stream order. Includes **watershed GeoJSON polygons**, geographically selected downstream-affected channels and bounded window extraction. See [Drainage networks](docs/DRAINAGE_NETWORKS.md).
 - Optional **constrained local breaching** of short DEM obstructions, with explicit excavation and path limits, physical cut-depth diagnostics and separate unmodified DEM elevations. Disabled by default.
@@ -267,8 +267,10 @@ DELETE /v1/jobs/{analysis-uuid}/rainfall-scenarios/{scenario-uuid}/inundation
 
 `state=completed` and `cache_ready=true` do **not** necessarily mean depth
 is available. Inspect `inundation_status` / `depth_available`: an
-`unresolved_partial_merge` is a valid completed modeling result with **no
-raster**. Raster GET is cache-only and returns little-endian float32 depths in
+`unresolved_partial_merge` is a completed model result with **no raster**.
+For pre-merge child ponds, `allocation_assumed: true` indicates that the depth
+raster follows the deterministic redistribution allocation rather than a
+uniquely validated hydraulic equilibrium. Raster GET is cache-only and returns little-endian float32 depths in
 metres (cell centres, original DEM). This is *standing water in depressions*,
 not a prediction of moving floodwater. See [Inundation service and binary
 windows](docs/INUNDATION_SERVICE.md) for sequencing, limits, example payloads

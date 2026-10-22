@@ -82,7 +82,24 @@ int main()
     std::vector<double> merged_storm(35, 0.0);
     merged_storm[15] = leaf_capacity * 1.5;
     const RunoffRedistribution incomplete = redistributeRunoff(paired, merged, merged_storm);
-    const StaticInundation unresolved = reconstructStaticInundation(paired, merged, incomplete);
+    const StaticInundation separate_siblings = reconstructStaticInundation(paired, merged, incomplete);
+    assert(separate_siblings.status == InundationStatus::Available);
+    assert(separate_siblings.allocation_assumed);
+    assert(separate_siblings.depth_m.size() == 35);
+    assert(separate_siblings.surfaces.size() == 2);
+    assert(separate_siblings.surfaces[0].basin_index != 2);
+    assert(separate_siblings.surfaces[1].basin_index != 2);
+    assert(separate_siblings.depth_m[15] > 0.0f);
+    assert(separate_siblings.depth_m[19] > 0.0f);
+    assert(separate_siblings.depth_m[15] != separate_siblings.depth_m[19]);
+    assert(near(separate_siblings.reconstructed_volume_m3, incomplete.basin_storage_m3));
+
+    // If a parent contains water that is neither held by its children nor
+    // connected above their saddle, there is no defensible depth assignment.
+    RunoffRedistribution inconsistent = incomplete;
+    inconsistent.basins[2].stored_in_subtree_m3 += 100.0;
+    inconsistent.basin_storage_m3 += 100.0;
+    const StaticInundation unresolved = reconstructStaticInundation(paired, merged, inconsistent);
     assert(unresolved.status == InundationStatus::UnresolvedPartialMerge);
     assert(unresolved.depth_m.empty());
     assert(unresolved.surfaces.empty());
@@ -91,6 +108,7 @@ int main()
     const RunoffRedistribution connected = redistributeRunoff(paired, merged, merged_storm);
     const StaticInundation merged_depth = reconstructStaticInundation(paired, merged, connected);
     assert(merged_depth.status == InundationStatus::Available);
+    assert(!merged_depth.allocation_assumed);
     assert(merged_depth.surfaces.size() == 1);
     assert(merged_depth.surfaces[0].basin_index == 2);
     assert(merged_depth.surfaces[0].water_level_m >= 12.0);
@@ -112,6 +130,48 @@ int main()
     assert(near(full_merge_depth.surfaces[0].water_level_m, 16.0));
     assert(near(full_merge_depth.reconstructed_volume_m3, parent_capacity));
 
+    // Multi-level merge: two leaf ponds connect at 12 m, and that merged
+    // child remains disconnected from a third 10 m pit until the 14 m saddle.
+    // The active water surfaces are then one merged child plus one leaf,
+    // rather than incorrectly treating the whole 18 m root as one pond.
+    const ElevationGrid tiered = grid(7, 5, {
+        18, 18, 18, 18, 18, 18, 18,
+        18, 18, 18, 18, 18, 18, 18,
+        18, 10, 12, 10, 14, 10, 18,
+        18, 18, 18, 18, 18, 18, 18,
+        18, 18, 18, 18, 18, 18, 18
+    });
+    const DepressionHierarchy tiered_tree = buildDepressionHierarchy(tiered);
+    assert(tiered_tree.basins.size() == 5);
+    std::uint64_t first_merged_index = tiered_tree.basins.size();
+    std::uint64_t third_leaf_index = tiered_tree.basins.size();
+    for (std::size_t i = 0; i < tiered_tree.basins.size(); ++i)
+    {
+        const DepressionBasin &basin = tiered_tree.basins[i];
+        if (near(basin.formation_elevation_m, 12.0) &&
+            basin.child_indices.size() == 2)
+            first_merged_index = i;
+        if (basin.child_indices.empty() && basin.minimum_cell == 19)
+            third_leaf_index = i;
+    }
+    assert(first_merged_index < tiered_tree.basins.size());
+    assert(third_leaf_index < tiered_tree.basins.size());
+    std::vector<double> tiered_storm(35, 0.0);
+    tiered_storm[15] =
+        tiered_tree.basins[std::size_t(first_merged_index)].capacity_at_spill_m3 +
+        0.5 * tiered_tree.basins[std::size_t(third_leaf_index)].capacity_at_spill_m3;
+    const RunoffRedistribution tiered_runoff =
+        redistributeRunoff(tiered, tiered_tree, tiered_storm);
+    const StaticInundation tiered_depth = reconstructStaticInundation(
+        tiered, tiered_tree, tiered_runoff);
+    assert(tiered_depth.status == InundationStatus::Available);
+    assert(tiered_depth.allocation_assumed);
+    assert(tiered_depth.surfaces.size() == 2);
+    assert(tiered_depth.depth_m[15] > 0.0f);
+    assert(tiered_depth.depth_m[17] > 0.0f);
+    assert(tiered_depth.depth_m[19] > 0.0f);
+    assert(near(tiered_depth.reconstructed_volume_m3, tiered_runoff.basin_storage_m3));
+
     // Two independent closed basins with separate boundary saddles should
     // produce distinct simultaneous water levels, without any merging.
     const ElevationGrid independent = grid(9, 5, {
@@ -130,6 +190,7 @@ int main()
     const StaticInundation independent_depth = reconstructStaticInundation(
         independent, independent_hierarchy, separate);
     assert(independent_depth.status == InundationStatus::Available);
+    assert(!independent_depth.allocation_assumed);
     assert(independent_depth.surfaces.size() == 2);
     assert(independent_depth.depth_m[19] > 0.0f);
     assert(independent_depth.depth_m[25] > 0.0f);

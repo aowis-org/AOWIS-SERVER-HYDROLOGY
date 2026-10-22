@@ -425,6 +425,7 @@ int main(int argc, char **argv)
                 assert(status.value(QStringLiteral("inundation_status")) ==
                     QStringLiteral("available"));
                 assert(status.value(QStringLiteral("depth_available")).toBool());
+                assert(!status.value(QStringLiteral("allocation_assumed")).toBool());
                 assert(status.value(QStringLiteral("surfaces")).toArray().size() == 1);
                 assert(status.value(QStringLiteral("reconstructed_volume_m3")).toDouble() > 0.0);
                 break;
@@ -453,7 +454,7 @@ int main(int argc, char **argv)
         // and a subsequent POST regenerates the immutable derived result.
         const QString depth_path = QDir(configuration.output_directory).filePath(
             basin_job_id + QStringLiteral("/rainfall-scenarios/") + basin_scenario_id +
-            QStringLiteral("/inundation-v1.f32"));
+            QStringLiteral("/inundation-v2.f32"));
         QFile corrupt_depth(depth_path);
         assert(corrupt_depth.open(QIODevice::ReadWrite));
         assert(corrupt_depth.write("x", 1) == 1);
@@ -537,8 +538,9 @@ int main(int argc, char **argv)
         assert(restarted_status.value(QStringLiteral("id")).isNull());
     }
 
-    // Partially filled sibling depressions are a completed model result but
-    // MUST NOT expose a depth image, even if the calculated runoff is valid.
+    // Partially filled sibling depressions now return independent child ponds.
+    // Their depths are explicitly conditional on the stored allocation, rather
+    // than claiming an independently verified hydraulic equilibrium.
     configuration.terrain_reader = [](const ElevationGrid &geometry, const QString &,
                                       const std::atomic<bool> &) -> ElevationGrid
     {
@@ -600,10 +602,11 @@ int main(int argc, char **argv)
             if (status.value(QStringLiteral("state")) == QStringLiteral("completed"))
             {
                 assert(status.value(QStringLiteral("cache_ready")).toBool());
-                assert(!status.value(QStringLiteral("depth_available")).toBool());
+                assert(status.value(QStringLiteral("depth_available")).toBool());
+                assert(status.value(QStringLiteral("allocation_assumed")).toBool());
                 assert(status.value(QStringLiteral("inundation_status")) ==
-                    QStringLiteral("unresolved_partial_merge"));
-                assert(status.value(QStringLiteral("surfaces")).toArray().isEmpty());
+                    QStringLiteral("available"));
+                assert(!status.value(QStringLiteral("surfaces")).toArray().isEmpty());
                 complete = true;
                 break;
             }
@@ -611,9 +614,13 @@ int main(int argc, char **argv)
             QThread::msleep(5);
         }
         assert(complete);
-        assert(service.staticInundationDepthWindow(job_id, scenario_id, x, y,
-            1, 1, &error).isEmpty());
-        assert(error.startsWith(QStringLiteral("Inundation unavailable")));
+        const QByteArray wet_sibling = service.staticInundationDepthWindow(
+            job_id, scenario_id, x, y, 1, 1, &error);
+        assert(error.isEmpty() && wet_sibling.size() == 4);
+        const quint32 wet_bits = qFromLittleEndian<quint32>(wet_sibling.constData());
+        float wet_depth = 0.0f;
+        std::memcpy(&wet_depth, &wet_bits, sizeof(wet_depth));
+        assert(wet_depth > 0.0f);
     }
 
     // An incomplete raster must be rejected even if its only missing cell is

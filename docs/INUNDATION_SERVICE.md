@@ -2,10 +2,11 @@
 
 ## What this service delivers
 
-After the runoff-redistribution task completes, Hydrology can reconstruct **standing water retained in terrain depressions** at static equilibrium. The result is one of two *completed* physical-model outcomes:
+After the runoff-redistribution task completes, Hydrology can reconstruct **standing water retained in terrain depressions** from the assigned basin volumes. Completed physical-model results include:
 
-- `available`: a connected, hydrostatic surface is defensible for every wet root basin. A float32 depth raster and per-root water levels are saved and can be queried in bounded windows.
-- `unresolved_partial_merge`: the deterministic volume-only redistribution has not established a unique water surface across every partially filled sibling basin. **No depth raster is published.** This is a valid modeling outcome, not a processing failure.
+- `available`, `allocation_assumed: false`: reconstructed active connected ponds without an unresolved pre-merge sibling split.
+- `available`, `allocation_assumed: true`: separate child-pond levels reconstructed **conditional on the deterministic runoff allocation** in a not-yet-connected merge. This is a useful screening layer, **not an independently determined hydraulic split**. The `surfaces` list may contain child basin UUIDs rather than only root UUIDs.
+- `unresolved_partial_merge`: allocated volumes could not be consistently mapped to either separate children or a formed merged pond. **No depth raster is published.** This is a model availability outcome, not proof of zero flooding.
 
 The task may also be `not_started`, `queued`, `running`, `cancel_requested`, `canceled`, or `failed`. These describe the **computation lifecycle**, not the hydrological model outcome. Do not interpret `not_started` or `unresolved_partial_merge` as zero inundation.
 
@@ -61,7 +62,8 @@ The `JOB_UUID` and `SCENARIO_UUID` strings must be replaced with actual IDs. The
   "cache_ready": true,
   "inundation_status": "available",
   "depth_available": true,
-  "model": "static_standing_water_v1",
+  "model": "static_standing_water_v2",
+  "allocation_assumed": false,
   "columns": 3,
   "rows": 3,
   "reconstructed_volume_m3": 1000.0,
@@ -79,7 +81,9 @@ The `JOB_UUID` and `SCENARIO_UUID` strings must be replaced with actual IDs. The
 }
 ```
 
-Numbers and UUIDs above demonstrate **JSON field names only**, not a real result. `surfaces` contains root-basin UUIDs and their water elevations in the **source DEM vertical datum**, e.g. EGM2008; depths are metres. `reconstructed_volume_m3` accounts for retained basin storage, **not the entire rainfall runoff volume**. Runoff leaving the analysis domain is separately reported by redistribution.
+Numbers and UUIDs above demonstrate **JSON field names only**, not a real result. `surfaces` contains active-basin UUIDs (roots or nested children) and their water elevations in the **source DEM vertical datum**, e.g. EGM2008; depths are metres. `reconstructed_volume_m3` accounts for retained basin storage, **not the entire rainfall runoff volume**. Runoff leaving the analysis domain is separately reported by redistribution.
+
+For **pre-merge** cases with `allocation_assumed: true`, the depth GET is allowed because the independent pond geometry is consistent *given the modeled per-child water volumes*. The client must label the result conditional: redistribution does not model hydraulic timing or uniquely establish the split between sibling basins.
 
 For `unresolved_partial_merge`, the completed status has `cache_ready: true`, `depth_available: false`, `inundation_status: "unresolved_partial_merge"`, empty `surfaces`, and no depth data. A depth GET returns `409 Conflict`. A completed task and a physically available raster are **different facts**.
 
@@ -120,8 +124,8 @@ Methods are called on an already initialized service. A request must fit the ter
 Per saved rainfall scenario:
 
 - `redistribution-v1.aowbin` is the authoritative **cached volume allocation** for reconstruction.
-- `inundation-v1.f32` stores float32 depth samples **only when the physical model is available**.
-- `inundation-v1.json` is the versioned **commit marker**, with grid dimensions, source fingerprint, physical status, reconstructed statistics, root-basin surface metadata, and one SHA-256 hash per row.
+- `inundation-v2.f32` stores float32 depth samples **only when the physical model is available**.
+- `inundation-v2.json` is the versioned **commit marker**, with grid dimensions, source fingerprint, physical status, reconstructed statistics, active-basin surface metadata, and one SHA-256 hash per row.
 
 The depth file and manifest use atomic `QSaveFile` commits, **manifest last**. An interrupted computation must not publish a partially populated new manifest. If the source file size/timestamps or redistribution cache metadata change, the fingerprint no longer matches and the derived result must be rebuilt. This fingerprint is a pragmatic **cache invalidation mechanism**, not cryptographic proof of DEM provenance. Hashes catch accidental depth-row corruption when requested; they are not an access-control feature. Corruption detected during a depth GET removes the derived manifest so a subsequent POST can regenerate the cache.
 
@@ -137,6 +141,10 @@ Valid derived outputs survive a service restart. Transient worker UUIDs and queu
 
 ## Model interpretation and next steps
 
-The standing-water reconstruction is a stationary hydrostatic model for connected depressions. For partially formed merges, its current sibling redistribution is not sufficient to select an unambiguous water surface. **Returning `unresolved_partial_merge` is intentional.** Do not fill in missing depth values with zeros or interpolate them from basin aggregate volumes.
+The standing-water reconstruction is a stationary hydrostatic model for connected depressions. For partially formed merges, the service now draws **independent conditional child-pond surfaces** and reports `allocation_assumed: true`. This is different from claiming a unique long-term hydraulic equilibrium. `unresolved_partial_merge` remains the safe fallback for storage that cannot consistently be accounted for. Do not substitute zero depths for unavailable reconstructions.
 
 Outstanding improvements include more physically justified inter-basin connectivity, out-of-core reconstruction for very large DEMs, consistent source revision IDs from Map, reference-solver comparisons, and integration with GUI layers. See [STATIC_INUNDATION.md](STATIC_INUNDATION.md), [RUNOFF_REDISTRIBUTION.md](RUNOFF_REDISTRIBUTION.md), and [ROADMAP.md](ROADMAP.md).
+
+### Model-version and cache transition
+
+This version uses `static_standing_water_v2`, the `aowis-static-inundation-v2` manifest schema, and separate `inundation-v2.f32` / `inundation-v2.json` cache files. Earlier v1 depth rasters (including `unresolved_partial_merge` outcomes) are **not reused**. A new POST recomputes the v2 result from the existing authoritative redistribution cache. The redistribution archive format is unchanged; only the *derived* inundation cache is versioned. Previous v1 files may be removed by normal maintenance once no old binary uses them.

@@ -135,10 +135,18 @@ StaticInundation reconstructStaticInundation(
     for (std::uint64_t cell = 0; cell < count; ++cell)
         if (!std::isfinite(original_dem.elevations_m[std::size_t(cell)]))
             throw std::invalid_argument("Static inundation requires complete original DEM coverage");
-    std::vector<std::uint64_t> active_roots;
-    double accepted_storage = 0.0;
+    // The merge tree is a topographic connectivity tree, not one globally
+    // connected pond. Until all children reach a merge saddle, their water
+    // remains in separate sub-basins and each has its own hydrostatic level.
+    // Walk the tree iteratively; select the HIGHEST connected node whose
+    // children have reached the saddle, or descend into pre-merge children.
+    // Redistribution's deterministic allocation is a modeling assumption,
+    // not a unique steady-state hydraulic solution.
+    std::vector<std::uint64_t> active_basins;
+    std::vector<std::uint64_t> pending;
     double all_roots_storage = 0.0;
-    bool ambiguous = false;
+    bool unresolved = false;
+    StaticInundation result;
     for (std::size_t i = 0; i < hierarchy.basins.size(); ++i)
     {
         const DepressionBasin &basin = hierarchy.basins[i];
@@ -157,48 +165,83 @@ StaticInundation reconstructStaticInundation(
             state.stored_in_subtree_m3 > basin.capacity_at_spill_m3 +
                 1e-7 * std::max(1.0, basin.capacity_at_spill_m3))
             throw std::invalid_argument("Invalid basin storage state for static inundation");
-        if (basin.parent_index >= 0) continue;
-        const double volume = state.stored_in_subtree_m3;
-        all_roots_storage += volume;
-        if (volume <= 0.0) continue;
-        double formation_volume = 0.0;
-        for (const std::uint64_t child_index : basin.child_indices)
-        {
-            if (child_index >= hierarchy.basins.size() ||
-                hierarchy.basins[std::size_t(child_index)].parent_index != std::int64_t(i))
+        for (const std::uint64_t child : basin.child_indices)
+            if (child >= i ||
+                hierarchy.basins[std::size_t(child)].parent_index != std::int64_t(i))
                 throw std::invalid_argument("Invalid basin child relationship");
-            const double cap = hierarchy.basins[std::size_t(child_index)].capacity_at_spill_m3;
-            formation_volume += cap;
-            if (!nearVolume(redistribution.basins[std::size_t(child_index)].stored_in_subtree_m3, cap))
-                ambiguous = true;
+        if (basin.parent_index < 0)
+        {
+            all_roots_storage += state.stored_in_subtree_m3;
+            pending.push_back(std::uint64_t(i));
         }
-        if (!basin.child_indices.empty() && volume +
-            1e-7 * std::max(1.0, formation_volume) < formation_volume)
-            ambiguous = true;
-        if (ambiguous) continue;
-        accepted_storage += volume;
-        active_roots.push_back(std::uint64_t(i));
     }
-    StaticInundation result;
-    if (ambiguous)
+    if (!nearVolume(all_roots_storage, redistribution.basin_storage_m3))
+        throw std::invalid_argument("Static inundation does not match retained basin volume");
+    std::uint64_t traversals = 0;
+    double selected_storage = 0.0;
+    while (!pending.empty())
+    {
+        if ((++traversals & 4095U) == 0) checkCancellation(cancel_requested);
+        if (traversals > hierarchy.basins.size())
+            throw std::invalid_argument("Cyclic or duplicated basin hierarchy");
+        const std::uint64_t index = pending.back();
+        pending.pop_back();
+        const DepressionBasin &basin = hierarchy.basins[std::size_t(index)];
+        const BasinRedistributionState &state = redistribution.basins[std::size_t(index)];
+        if (state.stored_in_subtree_m3 <= 0.0) continue;
+        if (basin.child_indices.empty())
+        {
+            active_basins.push_back(index);
+            selected_storage += state.stored_in_subtree_m3;
+            continue;
+        }
+        double child_volume = 0.0;
+        double saddle_capacity = 0.0;
+        bool children_full = true;
+        for (const std::uint64_t child : basin.child_indices)
+        {
+            const DepressionBasin &subbasin = hierarchy.basins[std::size_t(child)];
+            const BasinRedistributionState &substate = redistribution.basins[std::size_t(child)];
+            saddle_capacity += subbasin.capacity_at_spill_m3;
+            child_volume += substate.stored_in_subtree_m3;
+            if (!nearVolume(substate.stored_in_subtree_m3, subbasin.capacity_at_spill_m3))
+                children_full = false;
+        }
+        if (children_full && state.stored_in_subtree_m3 +
+            1e-7 * std::max(1.0, saddle_capacity) >= saddle_capacity)
+        {
+            active_basins.push_back(index);
+            selected_storage += state.stored_in_subtree_m3;
+        }
+        else if (nearVolume(child_volume, state.stored_in_subtree_m3))
+        {
+            // The merge saddle was not reached: reconstruct each wet child
+            // independently. The specific distribution among them is inherited
+            // from the deterministic, non-hydrodynamic runoff allocation.
+            result.allocation_assumed = true;
+            for (const std::uint64_t child : basin.child_indices)
+                pending.push_back(child);
+        }
+        else
+            unresolved = true; // Water cannot be assigned to connected ponds.
+    }
+    if (unresolved || !nearVolume(selected_storage, redistribution.basin_storage_m3))
     {
         result.status = InundationStatus::UnresolvedPartialMerge;
-        return result; // No raster, even if only one root is unresolved.
+        result.allocation_assumed = false;
+        return result; // No depth image for an unaccounted parent storage volume.
     }
-    if (!nearVolume(all_roots_storage, redistribution.basin_storage_m3) ||
-        !nearVolume(accepted_storage, redistribution.basin_storage_m3))
-        throw std::invalid_argument("Static inundation does not match retained basin volume");
     if (count > maximum_visited_cells)
         throw std::runtime_error("Static inundation raster exceeds cell budget");
     result.depth_m.assign(std::size_t(count), 0.0f);
     std::vector<std::uint32_t> visited(std::size_t(count), 0);
     std::uint32_t stamp = 0;
     std::uint64_t budget = maximum_visited_cells;
-    for (const std::uint64_t root_index : active_roots)
+    for (const std::uint64_t root_index : active_basins)
     {
         checkCancellation(cancel_requested);
         if (stamp == std::numeric_limits<std::uint32_t>::max())
-            throw std::runtime_error("Too many independent inundation basins");
+            throw std::runtime_error("Too many active inundation basins");
         ++stamp;
         const DepressionBasin &basin = hierarchy.basins[std::size_t(root_index)];
         const BasinRedistributionState &state = redistribution.basins[std::size_t(root_index)];
@@ -225,7 +268,7 @@ StaticInundation reconstructStaticInundation(
             const double depth = std::max(0.0, level - cell.height);
             if (depth <= 0.0) continue;
             if (result.depth_m[std::size_t(cell.index)] > 0.0f)
-                throw std::runtime_error("Independent basins have overlapping inundation");
+                throw std::runtime_error("Distinct active basins have overlapping inundation");
             if (depth > std::numeric_limits<float>::max())
                 throw std::runtime_error("Inundation depth exceeds float32 range");
             result.depth_m[std::size_t(cell.index)] = float(depth);

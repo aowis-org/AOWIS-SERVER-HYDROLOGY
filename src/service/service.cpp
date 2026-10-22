@@ -2105,7 +2105,7 @@ QString inundationFingerprint(const QString &job_id, const QString &scenario_id,
                         qsizetype(identity.source_fingerprint.size()));
     contents += ':' + QByteArray::number(info.size()) + ':' +
         QByteArray::number(info.lastModified().toMSecsSinceEpoch());
-    contents += QByteArrayLiteral(":static-inundation-v1");
+    contents += QByteArrayLiteral(":static-inundation-v2");
     return QString::fromLatin1(QCryptographicHash::hash(contents,
         QCryptographicHash::Sha256).toHex());
 }
@@ -2114,7 +2114,7 @@ QJsonObject cachedInundationManifest(const QString &scenario_folder,
                                     const QString &fingerprint,
                                     std::uint32_t columns, std::uint32_t rows)
 {
-    QFile file(inundationFile(scenario_folder, QStringLiteral("inundation-v1.json")));
+    QFile file(inundationFile(scenario_folder, QStringLiteral("inundation-v2.json")));
     if (!file.open(QIODevice::ReadOnly) || file.size() < 10 || file.size() > 8000000)
         throw std::runtime_error("Inundation result not ready; submit reconstruction first");
     const QByteArray bytes = file.readAll();
@@ -2125,17 +2125,18 @@ QJsonObject cachedInundationManifest(const QString &scenario_folder,
     const QJsonObject manifest = document.object();
     const QString status = manifest.value(QStringLiteral("inundation_status")).toString();
     if (manifest.value(QStringLiteral("schema")).toString() !=
-            QStringLiteral("aowis-static-inundation-v1") ||
+            QStringLiteral("aowis-static-inundation-v2") ||
         manifest.value(QStringLiteral("source_fingerprint")).toString() != fingerprint ||
         manifest.value(QStringLiteral("columns")).toInt() != int(columns) ||
         manifest.value(QStringLiteral("rows")).toInt() != int(rows) ||
         (status != QStringLiteral("available") &&
-         status != QStringLiteral("unresolved_partial_merge")))
+         status != QStringLiteral("unresolved_partial_merge")) ||
+        !manifest.value(QStringLiteral("allocation_assumed")).isBool())
         throw std::runtime_error("Stale or invalid inundation cache manifest");
     if (status == QStringLiteral("available"))
     {
         const QJsonArray row_hashes = manifest.value(QStringLiteral("row_sha256")).toArray();
-        const QFileInfo depth(inundationFile(scenario_folder, QStringLiteral("inundation-v1.f32")));
+        const QFileInfo depth(inundationFile(scenario_folder, QStringLiteral("inundation-v2.f32")));
         if (row_hashes.size() != int(rows) || !depth.isFile() ||
             depth.size() != qint64(std::uint64_t(columns) * rows * 4))
             throw std::runtime_error("Incomplete inundation depth cache");
@@ -2160,7 +2161,9 @@ QJsonObject inundationTaskJson(const QString &job_id, const QString &scenario_id
             : manifest.value(QStringLiteral("inundation_status"))},
         {QStringLiteral("depth_available"), manifest.value(
             QStringLiteral("inundation_status")) == QStringLiteral("available")},
-        {QStringLiteral("model"), QStringLiteral("static_standing_water_v1")}
+        {QStringLiteral("allocation_assumed"), manifest.value(
+            QStringLiteral("allocation_assumed")).toBool()},
+        {QStringLiteral("model"), QStringLiteral("static_standing_water_v2")}
     };
     if (!manifest.isEmpty())
     {
@@ -2233,7 +2236,7 @@ void calculateInundationCache(const QString &job_id, const QString &scenario_id,
         if (geometry.rows > 100000 || result.depth_m.size() !=
             std::size_t(std::uint64_t(geometry.columns) * geometry.rows))
             throw std::runtime_error("Inundation cache row budget exceeded");
-        QSaveFile depth(inundationFile(scenario_folder, QStringLiteral("inundation-v1.f32")));
+        QSaveFile depth(inundationFile(scenario_folder, QStringLiteral("inundation-v2.f32")));
         if (!depth.open(QIODevice::WriteOnly))
             throw std::runtime_error("Cannot create inundation depth raster");
         QByteArray row(qsizetype(geometry.columns) * 4, '\0');
@@ -2259,11 +2262,12 @@ void calculateInundationCache(const QString &job_id, const QString &scenario_id,
     if (cancel_requested != nullptr && cancel_requested->load())
         throw std::runtime_error("Static inundation reconstruction canceled");
     const QJsonObject manifest{
-        {QStringLiteral("schema"), QStringLiteral("aowis-static-inundation-v1")},
+        {QStringLiteral("schema"), QStringLiteral("aowis-static-inundation-v2")},
         {QStringLiteral("source_fingerprint"), fingerprint},
         {QStringLiteral("columns"), int(geometry.columns)},
         {QStringLiteral("rows"), int(geometry.rows)},
         {QStringLiteral("inundation_status"), status},
+        {QStringLiteral("allocation_assumed"), result.allocation_assumed},
         {QStringLiteral("reconstructed_volume_m3"), result.reconstructed_volume_m3},
         {QStringLiteral("inundated_area_m2"), result.inundated_area_m2},
         {QStringLiteral("inundated_cells"), double(result.inundated_cells)},
@@ -2273,7 +2277,7 @@ void calculateInundationCache(const QString &job_id, const QString &scenario_id,
     const QByteArray encoded = QJsonDocument(manifest).toJson(QJsonDocument::Compact);
     if (encoded.size() > 8000000)
         throw std::runtime_error("Inundation metadata exceeds 8 MiB limit");
-    QSaveFile output(inundationFile(scenario_folder, QStringLiteral("inundation-v1.json")));
+    QSaveFile output(inundationFile(scenario_folder, QStringLiteral("inundation-v2.json")));
     if (!output.open(QIODevice::WriteOnly) || output.write(encoded) != encoded.size() ||
         !output.commit())
         throw std::runtime_error("Cannot publish inundation cache manifest");
@@ -2494,7 +2498,7 @@ QByteArray AnalysisService::staticInundationDepthWindow(
             item->grid.columns, item->grid.rows);
         if (manifest.value(QStringLiteral("inundation_status")) != QStringLiteral("available"))
             throw std::runtime_error("Inundation unavailable: unresolved partial basin merge");
-        QFile file(inundationFile(scenario_folder, QStringLiteral("inundation-v1.f32")));
+        QFile file(inundationFile(scenario_folder, QStringLiteral("inundation-v2.f32")));
         if (!file.open(QIODevice::ReadOnly))
             throw std::runtime_error("Inundation depth cache not ready");
         QByteArray output(qsizetype(width) * height * 4, '\0');
@@ -2512,7 +2516,7 @@ QByteArray AnalysisService::staticInundationDepthWindow(
                 // On-demand row checks prevent undetected damage in returned
                 // windows. A bad cache is disposable; POST regenerates it.
                 file.close();
-                QFile::remove(inundationFile(scenario_folder, QStringLiteral("inundation-v1.json")));
+                QFile::remove(inundationFile(scenario_folder, QStringLiteral("inundation-v2.json")));
                 throw std::runtime_error("Invalid inundation cache row checksum; resubmit reconstruction");
             }
             const qsizetype take = qsizetype(width) * 4;
