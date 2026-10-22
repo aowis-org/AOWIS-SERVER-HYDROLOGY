@@ -1,4 +1,7 @@
-benchmark*
+# Ignore generated benchmark reports, not benchmark source programs.
+benchmark*.json
+benchmark*.log
+
 
 # C++ objects and libs
 *.slo
