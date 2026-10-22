@@ -2,7 +2,7 @@
 
 ## Purpose and status
 
-`AOWIS::Hydrology` can now extract **raster-topological contacts at internal depression-merge saddles**. This is a geometry diagnostic and an input to a possible later hydraulic-transfer model, **not** a hydraulic-flow-rate model itself.
+`AOWIS::Hydrology` can now extract **raster-topological contacts at internal depression-merge saddles**. This is a geometry diagnostic and an input to the separate [opt-in hydraulic control primitive](SPILL_HYDRAULICS.md); **this geometry function itself is not a flow-rate model**.
 
 The existing basin hierarchy tells us **at which elevation** two or more basins become connected. It does not fully describe **where and how** their flooded regions meet. That distinction matters: a corner-only D8 connection is not a surveyed channel, while a long contact boundary is not necessarily a broad, unobstructed spillway.
 
@@ -123,4 +123,4 @@ Therefore, the contacts **do not** describe three equivalent physical channels. 
 
 The dedicated `aowis-hydrology-spill-geometry` test covers cardinal versus diagonal interfaces, connected multi-cell plateaus, equal-height but disconnected saddles, randomized nested equal-height merges, WGS84/UTM coordinates, budgets, cancellation and invalid terrain. Existing redistribution/volume-balance tests must continue to pass unchanged.
 
-The subsequent physically informed transfer model should first define how *source-grade*, preferably LiDAR-supported terrain geometry and human-provided drainage structures produce a defensible control-section description. Only then should it introduce flow-rate equations and time-stepped basin storage. Until then, the capacity-weighted or index-order policy remains a transparent static approximation, not a physical prediction.
+An initial, independently testable [free-overflow broad-crested control module](SPILL_HYDRAULICS.md) now accepts **explicit, independently supplied** effective width and discharge calibration after verifying a two-way cardinal contact. It can compute a signed rate and make a crest-limited mass-conserving transfer step, but refuses submerged or multiway conditions. It is **not connected** to the static redistribution cache or REST service. Full coupled stage–storage routing still requires actual measured control geometry, tailwater laws and time-dependent rainfall inflow. The capacity-weighted or index-order policy remains a transparent static approximation, not a physical prediction.
