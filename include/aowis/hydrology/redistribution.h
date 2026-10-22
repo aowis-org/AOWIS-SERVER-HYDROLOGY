@@ -42,6 +42,56 @@ struct RunoffRedistribution
     bool domain_boundary_is_artificial = true;
 };
 
+// Incoming overflow can be shared by several sibling depressions at a
+// common saddle. With no flow-rate/roughness model the distribution is not
+// unique. These two orders are deliberately alternative *allocation rules*,
+// NOT lower/upper hydraulic bounds or different time-stepping solvers.
+enum class SiblingAllocationOrder
+{
+    BasinIndexAscending,
+    BasinIndexDescending
+};
+
+struct SiblingAllocationDifference
+{
+    std::uint64_t leaf_basin_index = 0;
+    double ascending_storage_m3 = 0.0;
+    double descending_storage_m3 = 0.0;
+};
+
+struct SiblingAllocationSensitivity
+{
+    // Only leaf storage is compared; summing nested subtree differences
+    // would count the same water repeatedly.
+    std::vector<SiblingAllocationDifference> differing_leaf_basins;
+    double maximum_leaf_difference_m3 = 0.0;
+    double generated_runoff_m3 = 0.0;
+    double retained_storage_m3 = 0.0;
+    double boundary_outflow_m3 = 0.0;
+    // If false, agreement under these two rules does NOT prove uniqueness:
+    // there may be more than two admissible sibling allocations.
+    bool allocation_sensitive = false;
+};
+
+// Return a deterministic redistribution using a selected sibling traversal.
+// All other model assumptions are identical to redistributeRunoff().
+RunoffRedistribution redistributeRunoffWithSiblingOrder(
+    const ElevationGrid &original_dem,
+    const DepressionHierarchy &hierarchy,
+    const std::vector<double> &runoff_volume_m3,
+    SiblingAllocationOrder order,
+    const std::atomic<bool> *cancel_requested = nullptr);
+
+// Diagnostic: recompute the same scenario in BOTH sibling orders. It does
+// not change persistent scenario results, cache format, or the default API.
+// Two complete solves are required; use explicitly, not on every REST read.
+// Reports alternate LEAF allocations only, and is not a confidence interval.
+SiblingAllocationSensitivity assessSiblingAllocationSensitivity(
+    const ElevationGrid &original_dem,
+    const DepressionHierarchy &hierarchy,
+    const std::vector<double> &runoff_volume_m3,
+    const std::atomic<bool> *cancel_requested = nullptr);
+
 // All valid cells must have finite original elevations; every invalid DEM
 // cell is rejected rather than silently becoming an outlet. Runoff units are
 // m3/cell, with one nonnegative finite value for every input raster cell.

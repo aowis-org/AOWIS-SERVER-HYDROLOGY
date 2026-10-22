@@ -1,5 +1,13 @@
 # Static standing-water depth reconstruction
 
+**Allocation uncertainty:** Separate pre-merge child surfaces use the
+volumes assigned by the redistribution solver. When a shared saddle has
+multiple receivers, that allocation may depend on child visitation order.
+The opt-in C++ [sibling allocation sensitivity diagnostic](SIBLING_ALLOCATION_SENSITIVITY.md)
+compares two alternative orders and lists affected leaf ponds. This does not
+make either raster a hydraulic prediction, and `allocation_assumed` does not
+mean that the diagnostic has been run.
+
 ## Purpose
 
 The Hydrology service converts **retained runoff volume**, produced by the static Fill–Spill–Merge-style redistribution, into estimated pond water levels and cell-centre depth values. It uses the **original DEM**, not the depression-filled or breached D8 processing surface. Its physical domain is **water stored in closed topographic depressions**, not water moving across slopes or through infrastructure.

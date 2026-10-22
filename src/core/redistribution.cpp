@@ -35,7 +35,8 @@ bool boundaryCell(const ElevationGrid &grid, std::uint64_t cell)
 double addToSubtree(std::uint64_t index, double water,
                     const DepressionHierarchy &hierarchy,
                     std::vector<BasinRedistributionState> &states,
-                    std::uint64_t *visit_budget)
+                    std::uint64_t *visit_budget,
+                    SiblingAllocationOrder order)
 {
     if (water <= 0.0) return 0.0;
     struct Frame
@@ -70,7 +71,10 @@ double addToSubtree(std::uint64_t index, double water,
         if (top.remaining_for_children > 0.0 &&
             top.next_child < basin.child_indices.size())
         {
-            const std::uint64_t child = basin.child_indices[top.next_child++];
+            const std::size_t ordinal = top.next_child++;
+            const std::size_t position = order == SiblingAllocationOrder::BasinIndexDescending ?
+                basin.child_indices.size() - ordinal - 1 : ordinal;
+            const std::uint64_t child = basin.child_indices[position];
             push(child, top.remaining_for_children);
             continue;
         }
@@ -89,11 +93,14 @@ double addToSubtree(std::uint64_t index, double water,
 }
 }
 
-RunoffRedistribution redistributeRunoff(
+RunoffRedistribution redistributeRunoffWithSiblingOrder(
     const ElevationGrid &original_dem, const DepressionHierarchy &hierarchy,
-    const std::vector<double> &runoff_volume_m3,
+    const std::vector<double> &runoff_volume_m3, SiblingAllocationOrder order,
     const std::atomic<bool> *cancel_requested)
 {
+    if (order != SiblingAllocationOrder::BasinIndexAscending &&
+        order != SiblingAllocationOrder::BasinIndexDescending)
+        throw std::invalid_argument("Invalid sibling allocation order");
     checkCancellation(cancel_requested);
     const std::uint64_t cells = std::uint64_t(original_dem.columns) * original_dem.rows;
     if (original_dem.columns < 2 || original_dem.rows < 2 ||
@@ -246,7 +253,8 @@ RunoffRedistribution redistributeRunoff(
         for (const std::uint64_t child : basin.child_indices)
             state.stored_in_subtree_m3 += result.basins[std::size_t(child)].stored_in_subtree_m3;
         std::uint64_t budget = basin_count + 1;
-        const double added = addToSubtree(std::uint64_t(i), available, hierarchy, result.basins, &budget);
+        const double added = addToSubtree(std::uint64_t(i), available, hierarchy,
+                                          result.basins, &budget, order);
         state.overflow_m3 = std::max(0.0, available - added);
         if (basin.parent_index < 0)
         {
@@ -263,6 +271,59 @@ RunoffRedistribution redistributeRunoff(
         std::abs(result.mass_balance_error_m3) > 1e-8 * magnitude)
         throw std::runtime_error("Runoff redistribution mass balance failure");
     return result;
+}
+
+RunoffRedistribution redistributeRunoff(
+    const ElevationGrid &original_dem, const DepressionHierarchy &hierarchy,
+    const std::vector<double> &runoff_volume_m3,
+    const std::atomic<bool> *cancel_requested)
+{
+    return redistributeRunoffWithSiblingOrder(original_dem, hierarchy, runoff_volume_m3,
+        SiblingAllocationOrder::BasinIndexAscending, cancel_requested);
+}
+
+SiblingAllocationSensitivity assessSiblingAllocationSensitivity(
+    const ElevationGrid &original_dem, const DepressionHierarchy &hierarchy,
+    const std::vector<double> &runoff_volume_m3,
+    const std::atomic<bool> *cancel_requested)
+{
+    const RunoffRedistribution ascending = redistributeRunoffWithSiblingOrder(
+        original_dem, hierarchy, runoff_volume_m3,
+        SiblingAllocationOrder::BasinIndexAscending, cancel_requested);
+    checkCancellation(cancel_requested);
+    const RunoffRedistribution descending = redistributeRunoffWithSiblingOrder(
+        original_dem, hierarchy, runoff_volume_m3,
+        SiblingAllocationOrder::BasinIndexDescending, cancel_requested);
+    // Child visitation order may alter only the allocation within a root,
+    // never generated volume, root storage, or out-of-domain runoff.
+    const double scale = std::max(1.0, ascending.generated_runoff_m3);
+    if (std::abs(ascending.generated_runoff_m3 - descending.generated_runoff_m3) > 1e-8 * scale ||
+        std::abs(ascending.basin_storage_m3 - descending.basin_storage_m3) > 1e-8 * scale ||
+        std::abs(ascending.total_boundary_outflow_m3 - descending.total_boundary_outflow_m3) >
+            1e-8 * scale)
+        throw std::runtime_error("Sibling-order change altered global water balance");
+
+    SiblingAllocationSensitivity sensitivity;
+    sensitivity.generated_runoff_m3 = ascending.generated_runoff_m3;
+    sensitivity.retained_storage_m3 = ascending.basin_storage_m3;
+    sensitivity.boundary_outflow_m3 = ascending.total_boundary_outflow_m3;
+    for (std::size_t index = 0; index < hierarchy.basins.size(); ++index)
+    {
+        if ((index & 4095U) == 0) checkCancellation(cancel_requested);
+        if (!hierarchy.basins[index].child_indices.empty()) continue;
+        const double first = ascending.basins[index].stored_in_subtree_m3;
+        const double second = descending.basins[index].stored_in_subtree_m3;
+        const double difference = std::abs(first - second);
+        // A leaf's own volume is the relevant numerical scale. Global storm
+        // volume can dwarf a locally important, but small, ponding difference.
+        if (difference <= 1e-9 * std::max({1.0, std::abs(first), std::abs(second)}))
+            continue;
+        sensitivity.differing_leaf_basins.push_back({std::uint64_t(index), first, second});
+        sensitivity.maximum_leaf_difference_m3 = std::max(
+            sensitivity.maximum_leaf_difference_m3, difference);
+    }
+    sensitivity.allocation_sensitive = !sensitivity.differing_leaf_basins.empty();
+    return sensitivity;
 }
 
 } // namespace Aowis::Hydrology

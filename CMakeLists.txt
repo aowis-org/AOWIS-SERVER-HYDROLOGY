@@ -141,6 +141,11 @@ if(BUILD_TESTING)
     add_test(NAME aowis-hydrology-redistribution COMMAND aowis-hydrology-redistribution-test)
     set_tests_properties(aowis-hydrology-redistribution PROPERTIES LABELS "hydrology;aowis")
 
+    add_executable(aowis-hydrology-sibling-allocation-test tests/test_sibling_allocation.cpp)
+    target_link_libraries(aowis-hydrology-sibling-allocation-test PRIVATE AOWIS::Hydrology)
+    add_test(NAME aowis-hydrology-sibling-allocation COMMAND aowis-hydrology-sibling-allocation-test)
+    set_tests_properties(aowis-hydrology-sibling-allocation PROPERTIES LABELS "hydrology;aowis")
+
     add_executable(aowis-hydrology-inundation-test tests/test_inundation.cpp)
     target_link_libraries(aowis-hydrology-inundation-test PRIVATE AOWIS::Hydrology)
     add_test(NAME aowis-hydrology-inundation COMMAND aowis-hydrology-inundation-test)

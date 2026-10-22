@@ -85,6 +85,8 @@ Numbers and UUIDs above demonstrate **JSON field names only**, not a real result
 
 For **pre-merge** cases with `allocation_assumed: true`, the depth GET is allowed because the independent pond geometry is consistent *given the modeled per-child water volumes*. The client must label the result conditional: redistribution does not model hydraulic timing or uniquely establish the split between sibling basins.
 
+A new optional **C++-only** [sibling allocation sensitivity diagnostic](SIBLING_ALLOCATION_SENSITIVITY.md) can compare the cached model's ascending sibling order with an alternative descending order. It identifies leaf basins whose assigned volume is order-dependent, but is **not** part of the inundation REST status or cache and is not implied by `allocation_assumed`. In particular, `allocation_assumed: false` is not independent proof of hydraulic accuracy.
+
 For `unresolved_partial_merge`, the completed status has `cache_ready: true`, `depth_available: false`, `inundation_status: "unresolved_partial_merge"`, empty `surfaces`, and no depth data. A depth GET returns `409 Conflict`. A completed task and a physically available raster are **different facts**.
 
 For `failed`, the status `error` contains the processing failure (missing files, invalid input, budget, disk I/O, etc.) and `cache_ready` is false. Repair the problem and submit again.
