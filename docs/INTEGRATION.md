@@ -100,3 +100,16 @@ raster. The server obtains no new Map data for these queries. Raster
 computation domain and requested downstream distance remain separate: a
 trace ending at a domain boundary is explicitly reported as boundary-limited.
 See [DRAINAGE_NETWORKS.md](DRAINAGE_NETWORKS.md).
+
+## Static standing-water outputs (Stage 8)
+
+After the rainfall redistribution cache is ready, a separate asynchronous
+`startStaticInundation()` operation can reconstruct connected-basin water
+levels and persist a derived f32 raster. The C++ library and REST transport
+expose the same `staticInundationStatus()` and bounded
+`staticInundationDepthWindow()` operations. Client GET requests never launch
+calculation. On incomplete sibling merges the status is
+`unresolved_partial_merge` and no depth is available; callers **must not**
+substitute a zero-depth map. The complete sequence, binary framing and
+source-invalidation rules are documented in
+[INUNDATION_SERVICE.md](INUNDATION_SERVICE.md).

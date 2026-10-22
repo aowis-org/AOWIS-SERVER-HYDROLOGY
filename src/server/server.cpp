@@ -523,6 +523,75 @@ void Server::setupRoutes()
         return jsonResponse(result);
     });
 
+
+    // Inundation is a separately cached, conservative standing-water
+    // reconstruction. POST queues work, GET status is nonblocking and
+    // GET depth returns only fully published, checksum-checked raster windows.
+    this->http.route("/v1/jobs/<arg>/rainfall-scenarios/<arg>/inundation",
+                     QHttpServerRequest::Method::Post,
+                     [this](const QString &id, const QString &scenario_id)
+    {
+        QString error;
+        const QJsonObject result = this->service.startStaticInundation(id, scenario_id, &error);
+        if (!error.isEmpty())
+            return errorResponse(error, error.startsWith(QStringLiteral("Invalid"))
+                ? Status::BadRequest : error.startsWith(QStringLiteral("Unknown"))
+                ? Status::NotFound : error.startsWith(QStringLiteral("Redistribution result not ready")) ||
+                error.startsWith(QStringLiteral("Inundation queue full"))
+                ? Status::Conflict : Status::InternalServerError);
+        return jsonResponse(result, result.value(QStringLiteral("cache_ready")).toBool()
+            ? Status::Ok : Status::Accepted);
+    });
+
+    this->http.route("/v1/jobs/<arg>/rainfall-scenarios/<arg>/inundation/status",
+                     QHttpServerRequest::Method::Get,
+                     [this](const QString &id, const QString &scenario_id)
+    {
+        QString error;
+        const QJsonObject result = this->service.staticInundationStatus(id, scenario_id, &error);
+        if (!error.isEmpty())
+            return errorResponse(error, error.startsWith(QStringLiteral("Invalid"))
+                ? Status::BadRequest : error.startsWith(QStringLiteral("Unknown"))
+                ? Status::NotFound : Status::InternalServerError);
+        return jsonResponse(result);
+    });
+
+    this->http.route("/v1/jobs/<arg>/rainfall-scenarios/<arg>/inundation",
+                     QHttpServerRequest::Method::Delete,
+                     [this](const QString &id, const QString &scenario_id)
+    {
+        QString error;
+        if (!this->service.cancelStaticInundation(id, scenario_id, &error))
+            return errorResponse(error, Status::Conflict);
+        return jsonResponse(QJsonObject{{QStringLiteral("state"),
+            QStringLiteral("cancel_requested")}}, Status::Accepted);
+    });
+
+    this->http.route("/v1/jobs/<arg>/rainfall-scenarios/<arg>/inundation/depth",
+                     QHttpServerRequest::Method::Get,
+                     [this](const QString &id, const QString &scenario_id,
+                            const QHttpServerRequest &request)
+    {
+        const QUrlQuery query(request.url());
+        int x = 0, y = 0, width = 0, height = 0;
+        if (!readInt(query, QStringLiteral("x"), &x) ||
+            !readInt(query, QStringLiteral("y"), &y) ||
+            !readInt(query, QStringLiteral("width"), &width) ||
+            !readInt(query, QStringLiteral("height"), &height))
+            return errorResponse(QStringLiteral("Invalid inundation raster window"), Status::BadRequest);
+        QString error;
+        const QByteArray result = this->service.staticInundationDepthWindow(
+            id, scenario_id, x, y, width, height, &error);
+        if (!error.isEmpty())
+            return errorResponse(error, error.startsWith(QStringLiteral("Invalid inundation raster window"))
+                ? Status::BadRequest : error.startsWith(QStringLiteral("Unknown"))
+                ? Status::NotFound : error.startsWith(QStringLiteral("Inundation unavailable")) ||
+                  error.startsWith(QStringLiteral("Inundation result not ready")) ||
+                  error.startsWith(QStringLiteral("Redistribution result not ready"))
+                ? Status::Conflict : Status::InternalServerError);
+        return QHttpServerResponse(QByteArrayLiteral("application/vnd.aowis.raster-f32le"), result);
+    });
+
     this->http.route("/v1/jobs/<arg>/catchment", QHttpServerRequest::Method::Get,
                      [this](const QString &id, const QHttpServerRequest &request)
     {

@@ -4,6 +4,8 @@
 #include <aowis/hydrology/service.h>
 
 #include <QCoreApplication>
+#include <QtEndian>
+#include <cstring>
 #include <QElapsedTimer>
 #include <QDir>
 #include <QFile>
@@ -391,6 +393,96 @@ int main(int argc, char **argv)
         assert(async_balance.value(QStringLiteral("cache_hit")).toBool());
         assert(async_balance.value(QStringLiteral("basins")) ==
             basin_balance.value(QStringLiteral("basins")));
+        // A depth GET must not trigger reconstruction. The separate POST task
+        // consumes the completed redistribution cache, not the runoff inputs.
+        const int basin_columns = meta.value(QStringLiteral("columns")).toInt();
+        const int basin_rows = meta.value(QStringLiteral("rows")).toInt();
+        assert(service.staticInundationDepthWindow(basin_job_id, basin_scenario_id,
+            middle_x, middle_y, 1, 1, &error).isEmpty());
+        assert(error.startsWith(QStringLiteral("Inundation result not ready")));
+        const QJsonObject initial_depth = service.staticInundationStatus(
+            basin_job_id, basin_scenario_id, &error);
+        assert(error.isEmpty() && initial_depth.value(QStringLiteral("state")) ==
+            QStringLiteral("not_started"));
+        const QJsonObject depth_task = service.startStaticInundation(
+            basin_job_id, basin_scenario_id, &error);
+        assert(error.isEmpty() && !depth_task.value(QStringLiteral("id")).toString().isEmpty());
+        const QJsonObject depth_duplicate = service.startStaticInundation(
+            basin_job_id, basin_scenario_id, &error);
+        assert(error.isEmpty() && depth_duplicate.value(QStringLiteral("id")) ==
+            depth_task.value(QStringLiteral("id")));
+        QElapsedTimer depth_timer;
+        depth_timer.start();
+        bool depth_complete = false;
+        while (depth_timer.elapsed() < 10000)
+        {
+            const QJsonObject status = service.staticInundationStatus(
+                basin_job_id, basin_scenario_id, &error);
+            assert(error.isEmpty());
+            if (status.value(QStringLiteral("state")) == QStringLiteral("completed"))
+            {
+                depth_complete = true;
+                assert(status.value(QStringLiteral("inundation_status")) ==
+                    QStringLiteral("available"));
+                assert(status.value(QStringLiteral("depth_available")).toBool());
+                assert(status.value(QStringLiteral("surfaces")).toArray().size() == 1);
+                assert(status.value(QStringLiteral("reconstructed_volume_m3")).toDouble() > 0.0);
+                break;
+            }
+            assert(status.value(QStringLiteral("state")) != QStringLiteral("failed"));
+            QThread::msleep(5);
+        }
+        assert(depth_complete);
+        const QByteArray depth_cell = service.staticInundationDepthWindow(
+            basin_job_id, basin_scenario_id, middle_x, middle_y, 1, 1, &error);
+        assert(error.isEmpty() && depth_cell.size() == 4);
+        const quint32 depth_bits = qFromLittleEndian<quint32>(depth_cell.constData());
+        float depth_value = 0.0f;
+        std::memcpy(&depth_value, &depth_bits, sizeof(depth_value));
+        assert(depth_value > 0.0f);
+        const QByteArray whole_depth = service.staticInundationDepthWindow(
+            basin_job_id, basin_scenario_id, 0, 0, basin_columns, basin_rows, &error);
+        assert(error.isEmpty() && whole_depth.size() == basin_columns * basin_rows * 4);
+        assert(service.staticInundationDepthWindow(basin_job_id, basin_scenario_id,
+            basin_columns, 0, 1, 1, &error).isEmpty());
+        assert(error.startsWith(QStringLiteral("Invalid")));
+        assert(!service.cancelStaticInundation(basin_job_id, basin_scenario_id, &error));
+        assert(error == QStringLiteral("No active inundation task"));
+
+        // A corrupted row must never be returned. The manifest is discarded
+        // and a subsequent POST regenerates the immutable derived result.
+        const QString depth_path = QDir(configuration.output_directory).filePath(
+            basin_job_id + QStringLiteral("/rainfall-scenarios/") + basin_scenario_id +
+            QStringLiteral("/inundation-v1.f32"));
+        QFile corrupt_depth(depth_path);
+        assert(corrupt_depth.open(QIODevice::ReadWrite));
+        assert(corrupt_depth.write("x", 1) == 1);
+        corrupt_depth.close();
+        assert(service.staticInundationDepthWindow(basin_job_id, basin_scenario_id,
+            0, 0, 1, 1, &error).isEmpty());
+        assert(error.contains(QStringLiteral("checksum")));
+        const QJsonObject refresh = service.startStaticInundation(
+            basin_job_id, basin_scenario_id, &error);
+        assert(error.isEmpty() && !refresh.value(QStringLiteral("id")).toString().isEmpty());
+        depth_timer.restart();
+        depth_complete = false;
+        while (depth_timer.elapsed() < 10000)
+        {
+            const QJsonObject status = service.staticInundationStatus(
+                basin_job_id, basin_scenario_id, &error);
+            assert(error.isEmpty());
+            if (status.value(QStringLiteral("state")) == QStringLiteral("completed"))
+            {
+                depth_complete = true;
+                break;
+            }
+            assert(status.value(QStringLiteral("state")) != QStringLiteral("failed"));
+            QThread::msleep(5);
+        }
+        assert(depth_complete);
+        const QByteArray repaired = service.staticInundationDepthWindow(
+            basin_job_id, basin_scenario_id, 0, 0, 1, 1, &error);
+        assert(error.isEmpty() && repaired == whole_depth.left(4));
         assert(!service.cancelRainfallRedistribution(basin_job_id, basin_scenario_id, &error));
         assert(error == QStringLiteral("No active redistribution task"));
         assert(service.startRainfallRedistribution(basin_job_id, basin_scenario_id,
@@ -430,11 +522,98 @@ int main(int argc, char **argv)
             basin_job_id, basin_scenario_id, 0, 1, &error);
         assert(error.isEmpty() && cached_after_restart.value(QStringLiteral("cache_hit")).toBool());
         assert(cached_after_restart.value(QStringLiteral("total_basins")).toInt() == 1);
+        const QJsonObject restarted_depth = restored.staticInundationStatus(
+            basin_job_id, basin_scenario_id, &error);
+        assert(error.isEmpty() && restarted_depth.value(QStringLiteral("cache_ready")).toBool());
+        assert(restarted_depth.value(QStringLiteral("inundation_status")) ==
+            QStringLiteral("available"));
+        const QByteArray post_restart_depth = restored.staticInundationDepthWindow(
+            basin_job_id, basin_scenario_id, 0, 0, 1, 1, &error);
+        assert(error.isEmpty() && post_restart_depth.size() == 4);
         const QJsonObject restarted_status = restored.rainfallRedistributionStatus(
             basin_job_id, basin_scenario_id, &error);
         assert(error.isEmpty() && restarted_status.value(QStringLiteral("cache_ready")).toBool());
         assert(restarted_status.value(QStringLiteral("state")) == QStringLiteral("completed"));
         assert(restarted_status.value(QStringLiteral("id")).isNull());
+    }
+
+    // Partially filled sibling depressions are a completed model result but
+    // MUST NOT expose a depth image, even if the calculated runoff is valid.
+    configuration.terrain_reader = [](const ElevationGrid &geometry, const QString &,
+                                      const std::atomic<bool> &) -> ElevationGrid
+    {
+        ElevationGrid grid = geometry;
+        grid.elevations_m.assign(std::size_t(grid.columns) * grid.rows, 16.0f);
+        const std::size_t y = grid.rows / 2;
+        const std::size_t x = grid.columns / 2;
+        assert(x > 4 && x + 4 < grid.columns && y > 2 && y + 2 < grid.rows);
+        for (int dx = -1; dx <= 1; ++dx)
+            grid.elevations_m[y * grid.columns + std::size_t(std::int64_t(x) + dx)] = 12.0f;
+        grid.elevations_m[y * grid.columns + x - 2] = 10.0f;
+        grid.elevations_m[y * grid.columns + x + 2] = 10.0f;
+        return grid;
+    };
+    {
+        AnalysisService service(configuration);
+        QString error;
+        assert(service.initialize(&error));
+        const QString job_id = service.submit(smallRequest(), &error);
+        assert(!job_id.isEmpty() && error.isEmpty());
+        waitForState(service, job_id, QStringLiteral("completed"));
+        const QJsonObject job_info = service.job(job_id);
+        const int x = job_info.value(QStringLiteral("columns")).toInt() / 2 - 2;
+        const int y = job_info.value(QStringLiteral("rows")).toInt() / 2;
+        const double west = job_info.value(QStringLiteral("west")).toDouble() +
+            x * job_info.value(QStringLiteral("step_lon_deg")).toDouble();
+        const double east = west + job_info.value(QStringLiteral("step_lon_deg")).toDouble();
+        const double north = job_info.value(QStringLiteral("north")).toDouble() -
+            y * job_info.value(QStringLiteral("step_lat_deg")).toDouble();
+        const double south = north - job_info.value(QStringLiteral("step_lat_deg")).toDouble();
+        const QJsonObject partial_polygon{
+            {QStringLiteral("type"), QStringLiteral("Polygon")},
+            {QStringLiteral("coordinates"), QJsonArray{QJsonArray{
+                QJsonArray{west, south}, QJsonArray{east, south},
+                QJsonArray{east, north}, QJsonArray{west, north},
+                QJsonArray{west, south}}}}
+        };
+        const QJsonObject rain{
+            {QStringLiteral("geometry"), partial_polygon},
+            {QStringLiteral("depth_mm"), 5.0},
+            {QStringLiteral("duration_seconds"), 600.0},
+            {QStringLiteral("effective_runoff_fraction"), 1.0}
+        };
+        const QJsonObject scenario = service.createRainfallScenario(job_id, rain, &error);
+        assert(error.isEmpty() && !scenario.isEmpty());
+        const QString scenario_id = scenario.value(QStringLiteral("id")).toString();
+        const QJsonObject balance = service.rainfallRedistribution(
+            job_id, scenario_id, 0, 1, &error);
+        assert(error.isEmpty() && balance.value(QStringLiteral("basin_storage_m3")).toDouble() > 0.0);
+        const QJsonObject started = service.startStaticInundation(job_id, scenario_id, &error);
+        assert(error.isEmpty() && !started.isEmpty());
+        QElapsedTimer timer;
+        timer.start();
+        bool complete = false;
+        while (timer.elapsed() < 10000)
+        {
+            const QJsonObject status = service.staticInundationStatus(job_id, scenario_id, &error);
+            assert(error.isEmpty());
+            if (status.value(QStringLiteral("state")) == QStringLiteral("completed"))
+            {
+                assert(status.value(QStringLiteral("cache_ready")).toBool());
+                assert(!status.value(QStringLiteral("depth_available")).toBool());
+                assert(status.value(QStringLiteral("inundation_status")) ==
+                    QStringLiteral("unresolved_partial_merge"));
+                assert(status.value(QStringLiteral("surfaces")).toArray().isEmpty());
+                complete = true;
+                break;
+            }
+            assert(status.value(QStringLiteral("state")) != QStringLiteral("failed"));
+            QThread::msleep(5);
+        }
+        assert(complete);
+        assert(service.staticInundationDepthWindow(job_id, scenario_id, x, y,
+            1, 1, &error).isEmpty());
+        assert(error.startsWith(QStringLiteral("Inundation unavailable")));
     }
 
     // An incomplete raster must be rejected even if its only missing cell is

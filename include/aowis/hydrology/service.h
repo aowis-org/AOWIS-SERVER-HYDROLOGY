@@ -133,11 +133,25 @@ public:
     QJsonObject rainfallRedistributionReady(const QString &id, const QString &scenario_uuid,
                                             int offset, int limit, QString *error) const;
 
+    // Static standing-water reconstruction is a separate derived, asynchronous
+    // artifact. GET methods never recalculate a missing or invalid cache.
+    QJsonObject startStaticInundation(const QString &id, const QString &scenario_uuid,
+                                      QString *error);
+    QJsonObject staticInundationStatus(const QString &id, const QString &scenario_uuid,
+                                       QString *error) const;
+    QByteArray staticInundationDepthWindow(const QString &id, const QString &scenario_uuid,
+                                           int x, int y, int width, int height,
+                                           QString *error) const;
+    bool cancelStaticInundation(const QString &id, const QString &scenario_uuid,
+                                QString *error);
+
     static QByteArray layerMime(const QString &layer);
 
 private:
     struct Job;
     struct RedistributionTask;
+    struct InundationTask;
+    void runInundationTask(const QSharedPointer<InundationTask> &task);
     void runRedistributionTask(const QSharedPointer<RedistributionTask> &task);
     QJsonObject rainfallRedistributionImpl(const QString &id, const QString &scenario_uuid,
                                            int offset, int limit, bool allow_calculation,
@@ -155,6 +169,7 @@ private:
     mutable QMutex redistribution_cache_mutex;
     mutable QMutex redistribution_tasks_mutex;
     QHash<QString, QSharedPointer<RedistributionTask>> redistribution_tasks;
+    QHash<QString, QSharedPointer<InundationTask>> inundation_tasks;
     QThreadPool redistribution_workers;
     QHash<QString, QSharedPointer<Job>> job_map;
     QThreadPool workers;

@@ -1,5 +1,6 @@
 #include <aowis/hydrology/service.h>
 #include <aowis/hydrology/depression_archive.h>
+#include <aowis/hydrology/inundation.h>
 #include <aowis/hydrology/redistribution.h>
 #include <aowis/hydrology/redistribution_archive.h>
 #include <aowis/hydrology/spatial_queries.h>
@@ -46,6 +47,16 @@ struct AnalysisService::Job
     double breach_excavation_m3 = 0.0;
     float maximum_breach_cut_m = 0.0f;
     std::uint64_t basin_count = 0;
+    std::atomic<bool> cancelled {false};
+};
+
+struct AnalysisService::InundationTask
+{
+    QString id;
+    QString analysis_id;
+    QString scenario_id;
+    QString state = QStringLiteral("queued");
+    QString error;
     std::atomic<bool> cancelled {false};
 };
 
@@ -472,6 +483,9 @@ AnalysisService::~AnalysisService()
         QMutexLocker locker(&this->redistribution_tasks_mutex);
         for (const QSharedPointer<RedistributionTask> &task :
              std::as_const(this->redistribution_tasks))
+            task->cancelled.store(true);
+        for (const QSharedPointer<InundationTask> &task :
+             std::as_const(this->inundation_tasks))
             task->cancelled.store(true);
     }
     this->redistribution_workers.waitForDone();
@@ -2062,4 +2076,456 @@ bool AnalysisService::cancelRainfallRedistribution(
     task->state = QStringLiteral("cancel_requested");
     return true;
 }
+} // namespace Aowis::Hydrology
+
+namespace Aowis::Hydrology
+{
+namespace
+{
+// The derived depth file is published first and its manifest last. Both use
+// QSaveFile; the manifest is the only commit marker. Old, stale results are
+// never accepted if the DEM, rainfall, or redistribution file metadata changes.
+QString inundationFile(const QString &scenario_folder, const QString &name)
+{
+    return QDir(scenario_folder).filePath(name);
+}
+
+QString inundationFingerprint(const QString &job_id, const QString &scenario_id,
+                              const QString &job_folder, const QString &scenario_folder,
+                              std::uint32_t columns, std::uint32_t rows)
+{
+    const RedistributionArchiveIdentity identity = redistributionIdentity(job_id,
+        scenario_id, job_folder, scenario_folder, columns, rows);
+    const QString redistribution_path = inundationFile(scenario_folder,
+        QStringLiteral("redistribution-v1.aowbin"));
+    const QFileInfo info(redistribution_path);
+    if (!info.isFile() || info.size() < qint64(RedistributionArchiveHeaderBytes))
+        throw std::runtime_error("Redistribution result not ready; submit redistribution first");
+    QByteArray contents(reinterpret_cast<const char *>(identity.source_fingerprint.data()),
+                        qsizetype(identity.source_fingerprint.size()));
+    contents += ':' + QByteArray::number(info.size()) + ':' +
+        QByteArray::number(info.lastModified().toMSecsSinceEpoch());
+    contents += QByteArrayLiteral(":static-inundation-v1");
+    return QString::fromLatin1(QCryptographicHash::hash(contents,
+        QCryptographicHash::Sha256).toHex());
+}
+
+QJsonObject cachedInundationManifest(const QString &scenario_folder,
+                                    const QString &fingerprint,
+                                    std::uint32_t columns, std::uint32_t rows)
+{
+    QFile file(inundationFile(scenario_folder, QStringLiteral("inundation-v1.json")));
+    if (!file.open(QIODevice::ReadOnly) || file.size() < 10 || file.size() > 8000000)
+        throw std::runtime_error("Inundation result not ready; submit reconstruction first");
+    const QByteArray bytes = file.readAll();
+    QJsonParseError parse_error;
+    const QJsonDocument document = QJsonDocument::fromJson(bytes, &parse_error);
+    if (parse_error.error != QJsonParseError::NoError || !document.isObject())
+        throw std::runtime_error("Invalid inundation cache manifest");
+    const QJsonObject manifest = document.object();
+    const QString status = manifest.value(QStringLiteral("inundation_status")).toString();
+    if (manifest.value(QStringLiteral("schema")).toString() !=
+            QStringLiteral("aowis-static-inundation-v1") ||
+        manifest.value(QStringLiteral("source_fingerprint")).toString() != fingerprint ||
+        manifest.value(QStringLiteral("columns")).toInt() != int(columns) ||
+        manifest.value(QStringLiteral("rows")).toInt() != int(rows) ||
+        (status != QStringLiteral("available") &&
+         status != QStringLiteral("unresolved_partial_merge")))
+        throw std::runtime_error("Stale or invalid inundation cache manifest");
+    if (status == QStringLiteral("available"))
+    {
+        const QJsonArray row_hashes = manifest.value(QStringLiteral("row_sha256")).toArray();
+        const QFileInfo depth(inundationFile(scenario_folder, QStringLiteral("inundation-v1.f32")));
+        if (row_hashes.size() != int(rows) || !depth.isFile() ||
+            depth.size() != qint64(std::uint64_t(columns) * rows * 4))
+            throw std::runtime_error("Incomplete inundation depth cache");
+    }
+    return manifest;
+}
+
+QJsonObject inundationTaskJson(const QString &job_id, const QString &scenario_id,
+                               const QString &task_id, const QString &state,
+                               const QString &error, const QJsonObject &manifest)
+{
+    QJsonObject output{
+        {QStringLiteral("job_id"), job_id},
+        {QStringLiteral("scenario_id"), scenario_id},
+        {QStringLiteral("id"), task_id.isEmpty() ? QJsonValue(QJsonValue::Null)
+                                                  : QJsonValue(task_id)},
+        {QStringLiteral("state"), state},
+        {QStringLiteral("error"), error},
+        {QStringLiteral("cache_ready"), !manifest.isEmpty()},
+        {QStringLiteral("inundation_status"), manifest.isEmpty()
+            ? QJsonValue(QJsonValue::Null)
+            : manifest.value(QStringLiteral("inundation_status"))},
+        {QStringLiteral("depth_available"), manifest.value(
+            QStringLiteral("inundation_status")) == QStringLiteral("available")},
+        {QStringLiteral("model"), QStringLiteral("static_standing_water_v1")}
+    };
+    if (!manifest.isEmpty())
+    {
+        output.insert(QStringLiteral("reconstructed_volume_m3"),
+            manifest.value(QStringLiteral("reconstructed_volume_m3")));
+        output.insert(QStringLiteral("inundated_area_m2"),
+            manifest.value(QStringLiteral("inundated_area_m2")));
+        output.insert(QStringLiteral("inundated_cells"),
+            manifest.value(QStringLiteral("inundated_cells")));
+        output.insert(QStringLiteral("surfaces"), manifest.value(QStringLiteral("surfaces")));
+        output.insert(QStringLiteral("columns"), manifest.value(QStringLiteral("columns")));
+        output.insert(QStringLiteral("rows"), manifest.value(QStringLiteral("rows")));
+    }
+    return output;
+}
+
+void calculateInundationCache(const QString &job_id, const QString &scenario_id,
+                              const QString &job_folder, const QString &scenario_folder,
+                              const ElevationGrid &geometry, std::uint64_t maximum_cells,
+                              const std::atomic<bool> *cancel_requested)
+{
+    const QString fingerprint = inundationFingerprint(job_id, scenario_id, job_folder,
+        scenario_folder, geometry.columns, geometry.rows);
+    const RedistributionArchiveIdentity identity = redistributionIdentity(job_id,
+        scenario_id, job_folder, scenario_folder, geometry.columns, geometry.rows);
+    const DepressionHierarchy hierarchy = loadHierarchy(job_folder,
+        geometry.columns, geometry.rows);
+    if (hierarchy.basins.size() > std::size_t(std::numeric_limits<int>::max()))
+        throw std::runtime_error("Too many basins for inundation reconstruction");
+    const CachedRedistributionPage cached = loadRedistributionPage(
+        inundationFile(scenario_folder, QStringLiteral("redistribution-v1.aowbin")),
+        identity, 0, int(hierarchy.basins.size()));
+    if (cached.header.basin_count != hierarchy.basins.size() ||
+        cached.records.size() != hierarchy.basins.size())
+        throw std::runtime_error("Inundation and redistribution basin counts disagree");
+    const QJsonObject scenario = loadRainfallManifest(
+        QDir(job_folder).filePath(QStringLiteral("rainfall-scenarios")), scenario_id);
+    const double expected = scenario.value(QStringLiteral("effective_runoff_volume_m3")).toDouble();
+    if (std::abs(expected - cached.header.summary.generated_runoff_m3) >
+        1e-7 * std::max(1.0, std::abs(expected)))
+        throw std::runtime_error("Inundation source runoff total disagrees with scenario");
+    RunoffRedistribution redistribution = cached.header.summary;
+    redistribution.basins.reserve(cached.records.size());
+    for (std::size_t index = 0; index < cached.records.size(); ++index)
+    {
+        if ((index & 4095U) == 0 && cancel_requested != nullptr && cancel_requested->load())
+            throw std::runtime_error("Static inundation reconstruction canceled");
+        redistribution.basins.push_back(cached.records[index].state);
+    }
+    const ElevationGrid elevation = loadOriginalElevation(job_folder, geometry, cancel_requested);
+    const StaticInundation result = reconstructStaticInundation(elevation, hierarchy,
+        redistribution, maximum_cells, cancel_requested);
+    if (cancel_requested != nullptr && cancel_requested->load())
+        throw std::runtime_error("Static inundation reconstruction canceled");
+
+    const QString status = result.status == InundationStatus::Available
+        ? QStringLiteral("available") : QStringLiteral("unresolved_partial_merge");
+    QJsonArray surfaces;
+    for (const BasinWaterSurface &surface : result.surfaces)
+        surfaces.append(QJsonObject{
+            {QStringLiteral("basin_id"), basinUuid(job_id, surface.basin_index)},
+            {QStringLiteral("water_level_m"), surface.water_level_m},
+            {QStringLiteral("stored_volume_m3"), surface.stored_volume_m3},
+            {QStringLiteral("inundated_area_m2"), surface.inundated_area_m2},
+            {QStringLiteral("inundated_cells"), double(surface.inundated_cells)}
+        });
+    QJsonArray hashes;
+    if (result.status == InundationStatus::Available)
+    {
+        if (geometry.rows > 100000 || result.depth_m.size() !=
+            std::size_t(std::uint64_t(geometry.columns) * geometry.rows))
+            throw std::runtime_error("Inundation cache row budget exceeded");
+        QSaveFile depth(inundationFile(scenario_folder, QStringLiteral("inundation-v1.f32")));
+        if (!depth.open(QIODevice::WriteOnly))
+            throw std::runtime_error("Cannot create inundation depth raster");
+        QByteArray row(qsizetype(geometry.columns) * 4, '\0');
+        for (std::uint32_t y = 0; y < geometry.rows; ++y)
+        {
+            if (cancel_requested != nullptr && cancel_requested->load())
+                throw std::runtime_error("Static inundation reconstruction canceled");
+            for (std::uint32_t x = 0; x < geometry.columns; ++x)
+            {
+                const float value = result.depth_m[std::size_t(y) * geometry.columns + x];
+                quint32 bits = 0;
+                std::memcpy(&bits, &value, sizeof(bits));
+                qToLittleEndian(bits, row.data() + qsizetype(x) * 4);
+            }
+            hashes.append(QString::fromLatin1(QCryptographicHash::hash(row,
+                QCryptographicHash::Sha256).toHex()));
+            if (depth.write(row) != row.size())
+                throw std::runtime_error("Cannot write inundation depth raster");
+        }
+        if (!depth.commit())
+            throw std::runtime_error("Cannot publish inundation depth raster");
+    }
+    if (cancel_requested != nullptr && cancel_requested->load())
+        throw std::runtime_error("Static inundation reconstruction canceled");
+    const QJsonObject manifest{
+        {QStringLiteral("schema"), QStringLiteral("aowis-static-inundation-v1")},
+        {QStringLiteral("source_fingerprint"), fingerprint},
+        {QStringLiteral("columns"), int(geometry.columns)},
+        {QStringLiteral("rows"), int(geometry.rows)},
+        {QStringLiteral("inundation_status"), status},
+        {QStringLiteral("reconstructed_volume_m3"), result.reconstructed_volume_m3},
+        {QStringLiteral("inundated_area_m2"), result.inundated_area_m2},
+        {QStringLiteral("inundated_cells"), double(result.inundated_cells)},
+        {QStringLiteral("surfaces"), surfaces},
+        {QStringLiteral("row_sha256"), hashes}
+    };
+    const QByteArray encoded = QJsonDocument(manifest).toJson(QJsonDocument::Compact);
+    if (encoded.size() > 8000000)
+        throw std::runtime_error("Inundation metadata exceeds 8 MiB limit");
+    QSaveFile output(inundationFile(scenario_folder, QStringLiteral("inundation-v1.json")));
+    if (!output.open(QIODevice::WriteOnly) || output.write(encoded) != encoded.size() ||
+        !output.commit())
+        throw std::runtime_error("Cannot publish inundation cache manifest");
+}
+
+} // namespace
+
+QJsonObject AnalysisService::staticInundationStatus(
+    const QString &id, const QString &scenario_uuid, QString *error) const
+{
+    if (error != nullptr) error->clear();
+    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
+    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
+    {
+        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
+        return {};
+    }
+    try
+    {
+        const QString job_folder = jobDirectory(id);
+        const QString scenario_root = QDir(job_folder).filePath(QStringLiteral("rainfall-scenarios"));
+        (void)loadRainfallManifest(scenario_root, scenario_uuid);
+        const QString scenario_folder = QDir(scenario_root).filePath(scenario_uuid);
+        QJsonObject manifest;
+        try
+        {
+            const QString fingerprint = inundationFingerprint(id, scenario_uuid,
+                job_folder, scenario_folder, item->grid.columns, item->grid.rows);
+            const RedistributionArchiveIdentity identity = redistributionIdentity(
+                id, scenario_uuid, job_folder, scenario_folder, item->grid.columns, item->grid.rows);
+            (void)loadRedistributionPage(inundationFile(scenario_folder,
+                QStringLiteral("redistribution-v1.aowbin")), identity, 0, 0);
+            manifest = cachedInundationManifest(scenario_folder, fingerprint,
+                item->grid.columns, item->grid.rows);
+        }
+        catch (const std::exception &)
+        {
+            // A missing, stale or malformed cache is a cache miss. POST can
+            // regenerate it once the redistribution source is ready.
+        }
+        QString task_id;
+        QString state = QStringLiteral("not_started");
+        QString message;
+        {
+            QMutexLocker locker(&this->redistribution_tasks_mutex);
+            const QSharedPointer<InundationTask> task = this->inundation_tasks.value(
+                redistributionTaskKey(id, scenario_uuid));
+            if (task)
+            {
+                task_id = task->id;
+                state = task->state;
+                message = task->error;
+            }
+        }
+        if (!manifest.isEmpty())
+        {
+            state = QStringLiteral("completed");
+            message.clear();
+        }
+        else if (state == QStringLiteral("completed")) state = QStringLiteral("not_started");
+        return inundationTaskJson(id, scenario_uuid, task_id, state, message, manifest);
+    }
+    catch (const std::exception &ex)
+    {
+        if (error != nullptr) *error = QString::fromUtf8(ex.what());
+        return {};
+    }
+}
+
+QJsonObject AnalysisService::startStaticInundation(
+    const QString &id, const QString &scenario_uuid, QString *error)
+{
+    const QJsonObject current = staticInundationStatus(id, scenario_uuid, error);
+    if (current.isEmpty()) return {};
+    if (current.value(QStringLiteral("cache_ready")).toBool()) return current;
+    try
+    {
+        const QSharedPointer<Job> job_item = findJob(id);
+        const QString folder = jobDirectory(id);
+        const QString scenario_folder = QDir(folder).filePath(
+            QStringLiteral("rainfall-scenarios/") + scenario_uuid);
+        const RedistributionArchiveIdentity identity = redistributionIdentity(id, scenario_uuid,
+            folder, scenario_folder, job_item->grid.columns, job_item->grid.rows);
+        const CachedRedistributionPage page = loadRedistributionPage(
+            inundationFile(scenario_folder, QStringLiteral("redistribution-v1.aowbin")),
+            identity, 0, 0);
+        const QJsonObject rainfall = loadRainfallManifest(
+            QDir(folder).filePath(QStringLiteral("rainfall-scenarios")), scenario_uuid);
+        const double expected = rainfall.value(QStringLiteral("effective_runoff_volume_m3")).toDouble();
+        if (std::abs(expected - page.header.summary.generated_runoff_m3) >
+            1e-7 * std::max(1.0, std::abs(expected)))
+            throw std::runtime_error("Redistribution result not ready; source totals disagree");
+    }
+    catch (const std::exception &ex)
+    {
+        if (error != nullptr) *error = QString::fromUtf8(ex.what());
+        return {};
+    }
+    const QString key = redistributionTaskKey(id, scenario_uuid);
+    QSharedPointer<InundationTask> task;
+    {
+        QMutexLocker locker(&this->redistribution_tasks_mutex);
+        const QSharedPointer<InundationTask> existing = this->inundation_tasks.value(key);
+        if (existing && (existing->state == QStringLiteral("queued") ||
+                         existing->state == QStringLiteral("running") ||
+                         existing->state == QStringLiteral("cancel_requested")))
+            return inundationTaskJson(id, scenario_uuid, existing->id, existing->state,
+                                      existing->error, {});
+        std::size_t pending = 0;
+        for (const QSharedPointer<InundationTask> &entry : std::as_const(this->inundation_tasks))
+            if (entry->state == QStringLiteral("queued") ||
+                entry->state == QStringLiteral("running") ||
+                entry->state == QStringLiteral("cancel_requested")) ++pending;
+        if (pending >= 8)
+        {
+            if (error != nullptr) *error = QStringLiteral("Inundation queue full (8 active/queued jobs)");
+            return {};
+        }
+        task = QSharedPointer<InundationTask>::create();
+        task->id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        task->analysis_id = id;
+        task->scenario_id = scenario_uuid;
+        this->inundation_tasks.insert(key, task);
+    }
+    this->redistribution_workers.start([this, task]() { runInundationTask(task); });
+    return inundationTaskJson(id, scenario_uuid, task->id, QStringLiteral("queued"),
+                               QString(), {});
+}
+
+void AnalysisService::runInundationTask(const QSharedPointer<InundationTask> &task)
+{
+    {
+        QMutexLocker locker(&this->redistribution_tasks_mutex);
+        if (!task->cancelled.load()) task->state = QStringLiteral("running");
+    }
+    QString error;
+    try
+    {
+        if (!task->cancelled.load())
+        {
+            const QSharedPointer<Job> job_item = findJob(task->analysis_id);
+            if (!job_item) throw std::runtime_error("Unknown terrain job");
+            const QString folder = jobDirectory(task->analysis_id);
+            const QString scenario_folder = QDir(folder).filePath(
+                QStringLiteral("rainfall-scenarios/") + task->scenario_id);
+            calculateInundationCache(task->analysis_id, task->scenario_id, folder,
+                scenario_folder, job_item->grid, this->config.maximum_cells, &task->cancelled);
+        }
+    }
+    catch (const std::exception &ex) { error = QString::fromUtf8(ex.what()); }
+    {
+        QMutexLocker locker(&this->redistribution_tasks_mutex);
+        if (task->cancelled.load())
+        {
+            task->state = QStringLiteral("canceled");
+            task->error.clear();
+        }
+        else if (!error.isEmpty())
+        {
+            task->state = QStringLiteral("failed");
+            task->error = error;
+        }
+        else
+        {
+            task->state = QStringLiteral("completed");
+            task->error.clear();
+        }
+    }
+}
+
+bool AnalysisService::cancelStaticInundation(
+    const QString &id, const QString &scenario_uuid, QString *error)
+{
+    if (error != nullptr) error->clear();
+    const QString key = redistributionTaskKey(id, scenario_uuid);
+    QMutexLocker locker(&this->redistribution_tasks_mutex);
+    const QSharedPointer<InundationTask> task = this->inundation_tasks.value(key);
+    if (!task || (task->state != QStringLiteral("queued") &&
+                  task->state != QStringLiteral("running") &&
+                  task->state != QStringLiteral("cancel_requested")))
+    {
+        if (error != nullptr) *error = QStringLiteral("No active inundation task");
+        return false;
+    }
+    task->cancelled.store(true);
+    task->state = QStringLiteral("cancel_requested");
+    return true;
+}
+
+QByteArray AnalysisService::staticInundationDepthWindow(
+    const QString &id, const QString &scenario_uuid,
+    int x, int y, int width, int height, QString *error) const
+{
+    if (error != nullptr) error->clear();
+    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
+    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
+    {
+        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
+        return {};
+    }
+    if (x < 0 || y < 0 || width <= 0 || height <= 0 || width > 4096 || height > 4096 ||
+        std::uint64_t(width) * height > 1000000 ||
+        std::uint64_t(x) + width > item->grid.columns ||
+        std::uint64_t(y) + height > item->grid.rows)
+    {
+        if (error != nullptr) *error = QStringLiteral("Invalid inundation raster window");
+        return {};
+    }
+    try
+    {
+        const QString job_folder = jobDirectory(id);
+        const QString scenario_root = QDir(job_folder).filePath(QStringLiteral("rainfall-scenarios"));
+        (void)loadRainfallManifest(scenario_root, scenario_uuid);
+        const QString scenario_folder = QDir(scenario_root).filePath(scenario_uuid);
+        const QString fingerprint = inundationFingerprint(id, scenario_uuid,
+            job_folder, scenario_folder, item->grid.columns, item->grid.rows);
+        const QJsonObject manifest = cachedInundationManifest(scenario_folder, fingerprint,
+            item->grid.columns, item->grid.rows);
+        if (manifest.value(QStringLiteral("inundation_status")) != QStringLiteral("available"))
+            throw std::runtime_error("Inundation unavailable: unresolved partial basin merge");
+        QFile file(inundationFile(scenario_folder, QStringLiteral("inundation-v1.f32")));
+        if (!file.open(QIODevice::ReadOnly))
+            throw std::runtime_error("Inundation depth cache not ready");
+        QByteArray output(qsizetype(width) * height * 4, '\0');
+        const QJsonArray hashes = manifest.value(QStringLiteral("row_sha256")).toArray();
+        for (int row_index = 0; row_index < height; ++row_index)
+        {
+            const int source_row = y + row_index;
+            if (!file.seek(qint64(std::uint64_t(source_row) * item->grid.columns * 4)))
+                throw std::runtime_error("Invalid inundation cache row offset");
+            const QByteArray row = file.read(qsizetype(item->grid.columns) * 4);
+            if (row.size() != qsizetype(item->grid.columns) * 4 ||
+                QString::fromLatin1(QCryptographicHash::hash(row,
+                    QCryptographicHash::Sha256).toHex()) != hashes.at(source_row).toString())
+            {
+                // On-demand row checks prevent undetected damage in returned
+                // windows. A bad cache is disposable; POST regenerates it.
+                file.close();
+                QFile::remove(inundationFile(scenario_folder, QStringLiteral("inundation-v1.json")));
+                throw std::runtime_error("Invalid inundation cache row checksum; resubmit reconstruction");
+            }
+            const qsizetype take = qsizetype(width) * 4;
+            std::memcpy(output.data() + qsizetype(row_index) * take,
+                row.constData() + qsizetype(x) * 4, std::size_t(take));
+        }
+        return output;
+    }
+    catch (const std::exception &ex)
+    {
+        if (error != nullptr) *error = QString::fromUtf8(ex.what());
+        return {};
+    }
+}
+
 } // namespace Aowis::Hydrology

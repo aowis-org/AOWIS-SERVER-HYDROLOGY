@@ -4,7 +4,7 @@
 
 AOWIS already computes **event-total runoff volume** and allocates that volume to closed depressions in a DEM-derived merge hierarchy. This guide describes the first, deliberately **restricted** conversion from retained basin volume to a physical water level and a raster of **standing-water depth at cell centres**.
 
-The new API is `reconstructStaticInundation()` in `include/aowis/hydrology/inundation.h` and is part of the Qt-independent `AOWIS::Hydrology` library. **There is no service/REST endpoint, persisted depth cache, flooded-area polygon or GUI layer yet.** The implementation rejects insufficiently constrained merged-basin cases instead of filling gaps with guesses. Its data must not be presented as observed or calibrated flood depths.
+The new API is `reconstructStaticInundation()` in `include/aowis/hydrology/inundation.h` and is part of the Qt-independent `AOWIS::Hydrology` library. **The service/REST layer now schedules reconstruction and serves persisted, bounded depth windows; see [INUNDATION_SERVICE.md](INUNDATION_SERVICE.md). There is still no flooded-area polygon or GUI layer.** The implementation rejects insufficiently constrained merged-basin cases instead of filling gaps with guesses. Its data must not be presented as observed or calibrated flood depths.
 
 This reconstructs only water **retained in terrain depressions at static equilibrium**. Water traversing slopes, streams and storm drains is *not* in the raster. Runoff duration and movement times do not influence the result.
 
@@ -120,4 +120,4 @@ Internal basin indices are not persistent public IDs. When the service layer is 
 ./compile_linux_tests.sh --both
 ```
 
-The next integration increment should support **cached, bounded raster windows** through `AOWIS::HydrologyService` and REST, with a status response and provenance checks. It must preserve the `UnresolvedPartialMerge` state without returning a misleading image. More physically complete inter-basin and transient inundation require a stronger hydraulic model rather than a cosmetic depth interpolation.
+The **cached and bounded service/REST integration is implemented** (see [INUNDATION_SERVICE.md](INUNDATION_SERVICE.md)). It preserves `UnresolvedPartialMerge` without returning a misleading image. More physically complete inter-basin and transient inundation require a stronger hydraulic model rather than a cosmetic depth interpolation.
