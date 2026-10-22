@@ -70,6 +70,17 @@ and REST responses retain the existing ascending-order result. See
 [SIBLING_ALLOCATION_SENSITIVITY.md](SIBLING_ALLOCATION_SENSITIVITY.md) for
 usage, analytical tests, runtime costs and interpretation.
 
+**Capacity-weighted alternative (C++ only).**
+`redistributeRunoffWithSiblingPolicy(..., RemainingCapacityWeighted)` removes
+child-index priority by splitting eligible overflow in proportion to each
+receiving child's remaining storage below spill. This is a reproducible
+**allocation heuristic**, not an actual hydraulic flow model. It does **not**
+change persisted scenarios, cache contents, asynchronous REST jobs or the
+`allocation_assumed` flag for conditional pre-merge inundation. Compare it
+explicitly rather than substituting it silently for the default. The formula,
+API and limitations are documented in
+[CAPACITY_WEIGHTED_SIBLING_ALLOCATION.md](CAPACITY_WEIGHTED_SIBLING_ALLOCATION.md).
+
 ### D. Storage aggregation and accounting
 
 `stored_in_subtree_m3` for an **internal parent** already includes water stored in all its descendants. Never add all basin rows together. To obtain total retained water, **sum only root basins**, exactly as the service does.

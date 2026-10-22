@@ -41,6 +41,12 @@ At every level, only the highest appropriate **active** connected nodes are reco
 
 The existing runoff solver assigns excess water among same-saddle siblings **deterministically**, using stored tree order. This is useful and volume-conserving but **does not independently establish the real hydraulic split** between cavities: arrival times, constriction capacities, spill velocities, and a complete hydraulic equilibration model are absent.
 
+The core also provides an opt-in [capacity-weighted sibling allocation
+heuristic](CAPACITY_WEIGHTED_SIBLING_ALLOCATION.md). Its use would likewise
+require `allocation_assumed = true` for unformed saddles; a symmetric split
+is not necessarily the real hydraulic split. The current REST depth cache
+continues to derive from the **original index-ascending** redistribution.
+
 When `allocation_assumed = true`, the depth raster answers:
 
 > **Given the runoff volume that our redistribution model assigned to each not-yet-connected child basin, what standing-water depths follow from those allocations?**

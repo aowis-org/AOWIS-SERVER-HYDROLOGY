@@ -139,6 +139,19 @@ redistribution API. The explicit order API rejects unrecognized enum values.
   bounded tasks, with a cached or paginated result, rather than executed
   synchronously inside an HTTP GET handler.
 
+## Additional opt-in capacity-weighted policy
+
+A separate `SiblingAllocationPolicy::RemainingCapacityWeighted` policy is now
+available through `redistributeRunoffWithSiblingPolicy()` in the C++ core. It
+shares surplus among eligible siblings according to their **remaining storage
+capacity** instead of accepting whichever child index happens to be visited
+first. Unlike this document's *two-order sensitivity diagnostic*, it is a
+third, explicitly selected **heuristic**; it is not one of the two orders the
+diagnostic currently compares. The default service and saved results remain
+index-ascending. See
+[CAPACITY_WEIGHTED_SIBLING_ALLOCATION.md](CAPACITY_WEIGHTED_SIBLING_ALLOCATION.md)
+for formulas, guarantees, examples and caveats.
+
 ## What is still required for hydraulically defensible redistribution
 
 A more physically determined split requires, at minimum, identification of

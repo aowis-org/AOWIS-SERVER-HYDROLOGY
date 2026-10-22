@@ -36,7 +36,7 @@ double addToSubtree(std::uint64_t index, double water,
                     const DepressionHierarchy &hierarchy,
                     std::vector<BasinRedistributionState> &states,
                     std::uint64_t *visit_budget,
-                    SiblingAllocationOrder order)
+                    SiblingAllocationOrder order, bool weighted)
 {
     if (water <= 0.0) return 0.0;
     struct Frame
@@ -45,6 +45,10 @@ double addToSubtree(std::uint64_t index, double water,
         double accepted;
         double remaining_for_children;
         std::size_t next_child = 0;
+        // Only populated for the optional symmetric allocation. Both arrays
+        // are sorted by stable basin index, not the hierarchy's child order.
+        std::vector<std::uint64_t> weighted_children;
+        std::vector<double> weighted_quotas;
     };
     const std::size_t count = hierarchy.basins.size();
     std::vector<Frame> stack;
@@ -54,13 +58,63 @@ double addToSubtree(std::uint64_t index, double water,
         if (*visit_budget == 0 || basin_index >= count)
             throw std::runtime_error("Invalid or cyclic depression hierarchy");
         --*visit_budget;
-        const double cap = hierarchy.basins[std::size_t(basin_index)].capacity_at_spill_m3;
+        const DepressionBasin &basin = hierarchy.basins[std::size_t(basin_index)];
+        const double cap = basin.capacity_at_spill_m3;
         if (!std::isfinite(cap) || cap < 0.0)
             throw std::invalid_argument("Runoff reached a basin without finite spill capacity");
         const double remaining = std::max(0.0,
             cap - states[std::size_t(basin_index)].stored_in_subtree_m3);
         const double accepted = std::min(available, remaining);
-        stack.push_back({basin_index, accepted, accepted, 0});
+        Frame frame{basin_index, accepted, accepted};
+        if (weighted && !basin.child_indices.empty() && accepted > 0.0)
+        {
+            frame.weighted_children = basin.child_indices;
+            std::sort(frame.weighted_children.begin(), frame.weighted_children.end());
+            std::vector<double> deficits;
+            deficits.reserve(frame.weighted_children.size());
+            double total_deficit = 0.0;
+            for (const std::uint64_t child_index : frame.weighted_children)
+            {
+                if (child_index >= count)
+                    throw std::invalid_argument("Invalid depression child index");
+                const double child_cap = hierarchy.basins[std::size_t(child_index)].capacity_at_spill_m3;
+                const double child_stored = states[std::size_t(child_index)].stored_in_subtree_m3;
+                if (!std::isfinite(child_cap) || !std::isfinite(child_stored) ||
+                    child_cap < 0.0 || child_stored < 0.0 || child_stored > child_cap +
+                        1e-8 * std::max(1.0, child_cap))
+                    throw std::invalid_argument("Invalid child storage capacity");
+                const double deficit = std::max(0.0, child_cap - child_stored);
+                deficits.push_back(deficit);
+                total_deficit += deficit;
+            }
+            if (!std::isfinite(total_deficit))
+                throw std::invalid_argument("Nonfinite sibling storage capacity");
+            const double distributable = std::min(accepted, total_deficit);
+            frame.weighted_quotas.resize(deficits.size(), 0.0);
+            if (total_deficit > 0.0 && distributable > 0.0)
+            {
+                // Progressive normalized shares avoid a large final
+                // correction and assign the exact remaining budget to the
+                // final eligible child, within its physical deficit.
+                double remaining_budget = distributable;
+                double remaining_deficit = total_deficit;
+                for (std::size_t i = 0; i < deficits.size(); ++i)
+                {
+                    const double deficit = deficits[i];
+                    if (deficit <= 0.0) continue;
+                    const double quota = deficit >= remaining_deficit ?
+                        remaining_budget :
+                        remaining_budget * (deficit / remaining_deficit);
+                    frame.weighted_quotas[i] = std::min(deficit,
+                        std::max(0.0, quota));
+                    remaining_budget = std::max(0.0,
+                        remaining_budget - frame.weighted_quotas[i]);
+                    remaining_deficit = std::max(0.0,
+                        remaining_deficit - deficit);
+                }
+            }
+        }
+        stack.push_back(std::move(frame));
     };
     push(index, water);
     double finished = 0.0;
@@ -68,7 +122,15 @@ double addToSubtree(std::uint64_t index, double water,
     {
         Frame &top = stack.back();
         const DepressionBasin &basin = hierarchy.basins[std::size_t(top.basin)];
-        if (top.remaining_for_children > 0.0 &&
+        if (weighted && top.next_child < top.weighted_children.size())
+        {
+            const std::size_t position = top.next_child++;
+            const double quota = top.weighted_quotas[position];
+            if (quota > 0.0)
+                push(top.weighted_children[position], quota);
+            continue;
+        }
+        if (!weighted && top.remaining_for_children > 0.0 &&
             top.next_child < basin.child_indices.size())
         {
             const std::size_t ordinal = top.next_child++;
@@ -93,10 +155,12 @@ double addToSubtree(std::uint64_t index, double water,
 }
 }
 
-RunoffRedistribution redistributeRunoffWithSiblingOrder(
+namespace
+{
+RunoffRedistribution redistributeWithAllocation(
     const ElevationGrid &original_dem, const DepressionHierarchy &hierarchy,
     const std::vector<double> &runoff_volume_m3, SiblingAllocationOrder order,
-    const std::atomic<bool> *cancel_requested)
+    bool weighted, const std::atomic<bool> *cancel_requested)
 {
     if (order != SiblingAllocationOrder::BasinIndexAscending &&
         order != SiblingAllocationOrder::BasinIndexDescending)
@@ -254,7 +318,7 @@ RunoffRedistribution redistributeRunoffWithSiblingOrder(
             state.stored_in_subtree_m3 += result.basins[std::size_t(child)].stored_in_subtree_m3;
         std::uint64_t budget = basin_count + 1;
         const double added = addToSubtree(std::uint64_t(i), available, hierarchy,
-                                          result.basins, &budget, order);
+                                          result.basins, &budget, order, weighted);
         state.overflow_m3 = std::max(0.0, available - added);
         if (basin.parent_index < 0)
         {
@@ -271,6 +335,30 @@ RunoffRedistribution redistributeRunoffWithSiblingOrder(
         std::abs(result.mass_balance_error_m3) > 1e-8 * magnitude)
         throw std::runtime_error("Runoff redistribution mass balance failure");
     return result;
+}
+} // namespace
+
+RunoffRedistribution redistributeRunoffWithSiblingOrder(
+    const ElevationGrid &original_dem, const DepressionHierarchy &hierarchy,
+    const std::vector<double> &runoff_volume_m3, SiblingAllocationOrder order,
+    const std::atomic<bool> *cancel_requested)
+{
+    return redistributeWithAllocation(original_dem, hierarchy, runoff_volume_m3,
+        order, false, cancel_requested);
+}
+
+RunoffRedistribution redistributeRunoffWithSiblingPolicy(
+    const ElevationGrid &original_dem, const DepressionHierarchy &hierarchy,
+    const std::vector<double> &runoff_volume_m3, SiblingAllocationPolicy policy,
+    const std::atomic<bool> *cancel_requested)
+{
+    if (policy != SiblingAllocationPolicy::IndexAscending &&
+        policy != SiblingAllocationPolicy::RemainingCapacityWeighted)
+        throw std::invalid_argument("Invalid sibling allocation policy");
+    return redistributeWithAllocation(original_dem, hierarchy, runoff_volume_m3,
+        SiblingAllocationOrder::BasinIndexAscending,
+        policy == SiblingAllocationPolicy::RemainingCapacityWeighted,
+        cancel_requested);
 }
 
 RunoffRedistribution redistributeRunoff(

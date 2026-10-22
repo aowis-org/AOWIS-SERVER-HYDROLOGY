@@ -52,6 +52,27 @@ enum class SiblingAllocationOrder
     BasinIndexDescending
 };
 
+// Optional, deterministic alternative to first-child-wins allocation.
+// At a shared saddle, distribute incremental overflow among eligible child
+// subtrees in proportion to their remaining PRE-SPILL capacities. This removes
+// child traversal order as a tie breaker; it is NOT a hydraulic conveyance law.
+// The persisted/default redistribution remains index-ascending.
+enum class SiblingAllocationPolicy
+{
+    IndexAscending,
+    RemainingCapacityWeighted
+};
+
+// Explicit opt-in calculation. Does not alter the saved scenario results or
+// REST cache format. A weighted result must not be mistaken for an observed
+// water surface: actual splits depend on flow resistance and time.
+RunoffRedistribution redistributeRunoffWithSiblingPolicy(
+    const ElevationGrid &original_dem,
+    const DepressionHierarchy &hierarchy,
+    const std::vector<double> &runoff_volume_m3,
+    SiblingAllocationPolicy policy,
+    const std::atomic<bool> *cancel_requested = nullptr);
+
 struct SiblingAllocationDifference
 {
     std::uint64_t leaf_basin_index = 0;

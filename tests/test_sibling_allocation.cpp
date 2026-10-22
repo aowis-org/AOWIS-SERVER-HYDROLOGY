@@ -88,6 +88,43 @@ int main()
             descending.basins[std::size_t(difference.leaf_basin_index)].stored_in_subtree_m3));
     }
 
+    // Optional capacity-weighted rule distributes the same 0.4 C overflow
+    // among the two receiving basins according to their available capacities.
+    // It must NOT depend on how child_indices happens to be enumerated.
+    const RunoffRedistribution weighted = redistributeRunoffWithSiblingPolicy(
+        terrain, hierarchy, runoff, SiblingAllocationPolicy::RemainingCapacityWeighted);
+    const RunoffRedistribution weighted_legacy = redistributeRunoffWithSiblingPolicy(
+        terrain, hierarchy, runoff, SiblingAllocationPolicy::IndexAscending);
+    assert(nearlyEqual(weighted.generated_runoff_m3, ordinary.generated_runoff_m3));
+    assert(nearlyEqual(weighted.basin_storage_m3, ordinary.basin_storage_m3));
+    assert(nearlyEqual(weighted.total_boundary_outflow_m3, ordinary.total_boundary_outflow_m3));
+    double receiving_capacity = 0.0;
+    for (const std::uint64_t child : parent.child_indices)
+        if (hierarchy.basins[std::size_t(child)].minimum_cell != 6)
+            receiving_capacity += hierarchy.basins[std::size_t(child)].capacity_at_spill_m3;
+    assert(receiving_capacity > 0.0);
+    for (const std::uint64_t child : parent.child_indices)
+    {
+        const DepressionBasin &basin = hierarchy.basins[std::size_t(child)];
+        const double actual = weighted.basins[std::size_t(child)].stored_in_subtree_m3;
+        if (basin.minimum_cell == 6)
+            assert(nearlyEqual(actual, basin.capacity_at_spill_m3));
+        else
+            assert(nearlyEqual(actual, capacity * 0.4 *
+                basin.capacity_at_spill_m3 / receiving_capacity));
+        assert(nearlyEqual(weighted_legacy.basins[std::size_t(child)].stored_in_subtree_m3,
+                           ordinary.basins[std::size_t(child)].stored_in_subtree_m3));
+    }
+    DepressionHierarchy reordered = hierarchy;
+    std::reverse(reordered.basins.back().child_indices.begin(),
+                 reordered.basins.back().child_indices.end());
+    const RunoffRedistribution weighted_reordered = redistributeRunoffWithSiblingPolicy(
+        terrain, reordered, runoff, SiblingAllocationPolicy::RemainingCapacityWeighted);
+    for (std::size_t i = 0; i < weighted.basins.size(); ++i)
+        assert(nearlyEqual(weighted.basins[i].stored_in_subtree_m3,
+                           weighted_reordered.basins[i].stored_in_subtree_m3));
+    assert(nearlyEqual(weighted.mass_balance_error_m3, 0.0));
+
     // With enough water to fill every leaf, traversal order cannot change
     // any leaf volume. Agreement alone is not evidence of hydraulic truth.
     runoff[6] = parent.capacity_at_spill_m3 * 1.5;
@@ -135,6 +172,22 @@ int main()
         assert(nearlyEqual(comparison.generated_runoff_m3,
                            comparison.retained_storage_m3 + comparison.boundary_outflow_m3));
         assert(comparison.allocation_sensitive == !comparison.differing_leaf_basins.empty());
+        const RunoffRedistribution proportional = redistributeRunoffWithSiblingPolicy(
+            landscape, basins, random_runoff,
+            SiblingAllocationPolicy::RemainingCapacityWeighted);
+        DepressionHierarchy altered = basins;
+        for (DepressionBasin &basin : altered.basins)
+            std::reverse(basin.child_indices.begin(), basin.child_indices.end());
+        const RunoffRedistribution proportional_reordered = redistributeRunoffWithSiblingPolicy(
+            landscape, altered, random_runoff,
+            SiblingAllocationPolicy::RemainingCapacityWeighted);
+        assert(nearlyEqual(proportional.generated_runoff_m3, standard.generated_runoff_m3));
+        assert(nearlyEqual(proportional.basin_storage_m3, standard.basin_storage_m3));
+        assert(nearlyEqual(proportional.total_boundary_outflow_m3,
+                           standard.total_boundary_outflow_m3));
+        for (std::size_t i = 0; i < basins.basins.size(); ++i)
+            assert(nearlyEqual(proportional.basins[i].stored_in_subtree_m3,
+                               proportional_reordered.basins[i].stored_in_subtree_m3));
     }
 
     std::atomic<bool> canceled{true};
@@ -146,5 +199,14 @@ int main()
     try { (void)redistributeRunoffWithSiblingOrder(terrain, hierarchy, runoff,
         static_cast<SiblingAllocationOrder>(99)); }
     catch (const std::invalid_argument &) { rejected = true; }
+    rejected = false;
+    try { (void)redistributeRunoffWithSiblingPolicy(terrain, hierarchy, runoff,
+        static_cast<SiblingAllocationPolicy>(99)); }
+    catch (const std::invalid_argument &) { rejected = true; }
+    assert(rejected);
+    rejected = false;
+    try { (void)redistributeRunoffWithSiblingPolicy(terrain, hierarchy, runoff,
+        SiblingAllocationPolicy::RemainingCapacityWeighted, &canceled); }
+    catch (const std::runtime_error &) { rejected = true; }
     assert(rejected);
 }
