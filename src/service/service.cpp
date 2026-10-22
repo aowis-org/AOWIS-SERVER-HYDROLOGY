@@ -1,0 +1,1043 @@
+#include <aowis/hydrology/service.h>
+#include <aowis/hydrology/spatial_queries.h>
+
+#include <QDir>
+#include <QFile>
+#include <QJsonDocument>
+#include <QMutexLocker>
+#include <QStringList>
+#include <QSaveFile>
+#include <QUuid>
+#include <QtEndian>
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <utility>
+
+namespace Aowis::Hydrology
+{
+struct AnalysisService::Job
+{
+    QString id;
+    QString state = QStringLiteral("queued");
+    QString error;
+    QString dataset;
+    ElevationGrid grid;
+    AnalysisOptions options;
+    std::uint64_t conditioned_cells = 0;
+    float maximum_fill_m = 0.0f;
+    std::uint64_t potential_fill_cells = 0;
+    double potential_fill_volume_m3 = 0.0;
+    float maximum_potential_fill_m = 0.0f;
+    std::uint64_t breached_cells = 0;
+    std::uint32_t accepted_breach_paths = 0;
+    std::uint32_t rejected_breach_candidates = 0;
+    double breach_excavation_m3 = 0.0;
+    float maximum_breach_cut_m = 0.0f;
+    std::atomic<bool> cancelled {false};
+};
+
+namespace
+{
+bool safeJobId(const QString &id)
+{
+    return !id.isEmpty() && id.size() <= 40 &&
+        std::all_of(id.cbegin(), id.cend(), [](QChar character)
+        {
+            return character.isLetterOrNumber() || character == QChar('-');
+        });
+}
+
+// IEEE754 and integer arrays are written to stable little-endian files.
+// Outputs are immutable for the lifetime of a completed job.
+template <typename T>
+void writeArray(const QString &path, const std::vector<T> &values)
+{
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly))
+        throw std::runtime_error(QStringLiteral("Cannot create analysis result: %1")
+            .arg(path).toStdString());
+    QByteArray buffer(32768, '\0');
+    qsizetype used = 0;
+    for (const T &value : values)
+    {
+        static_assert(sizeof(T) == 4 || sizeof(T) == 8);
+        if (used + qsizetype(sizeof(T)) > buffer.size())
+        {
+            if (file.write(buffer.constData(), used) != used)
+                throw std::runtime_error("Cannot write analysis result");
+            used = 0;
+        }
+        if constexpr (sizeof(T) == 4)
+        {
+            quint32 bits = 0;
+            std::memcpy(&bits, &value, sizeof(T));
+            qToLittleEndian(bits, buffer.data() + used);
+        }
+        else
+        {
+            quint64 bits = 0;
+            std::memcpy(&bits, &value, sizeof(T));
+            qToLittleEndian(bits, buffer.data() + used);
+        }
+        used += sizeof(T);
+    }
+    if (used > 0 && file.write(buffer.constData(), used) != used)
+        throw std::runtime_error("Cannot write analysis result");
+    if (!file.commit())
+        throw std::runtime_error("Cannot commit analysis result");
+}
+
+struct Layer
+{
+    QString file;
+    int bytes_per_cell = 0;
+    QByteArray mime;
+};
+
+Layer layerSpec(const QString &layer)
+{
+    if (layer == QStringLiteral("elevation"))
+        return {QStringLiteral("elevation.f32"), 4, QByteArrayLiteral("application/vnd.aowis.raster-f32le")};
+    if (layer == QStringLiteral("conditioned"))
+        return {QStringLiteral("conditioned.f32"), 4, QByteArrayLiteral("application/vnd.aowis.raster-f32le")};
+    if (layer == QStringLiteral("potential-fill-depth"))
+        return {QStringLiteral("potential-fill-depth.f32"), 4, QByteArrayLiteral("application/vnd.aowis.raster-f32le")};
+    if (layer == QStringLiteral("breach-cut-depth"))
+        return {QStringLiteral("breach-cut-depth.f32"), 4, QByteArrayLiteral("application/vnd.aowis.raster-f32le")};
+    if (layer == QStringLiteral("upstream-area"))
+        return {QStringLiteral("upstream-area.f64"), 8, QByteArrayLiteral("application/vnd.aowis.raster-f64le")};
+    if (layer == QStringLiteral("upstream-count"))
+        return {QStringLiteral("upstream-count.u64"), 8, QByteArrayLiteral("application/vnd.aowis.raster-u64le")};
+    if (layer == QStringLiteral("downstream"))
+        return {QStringLiteral("downstream.i64"), 8, QByteArrayLiteral("application/vnd.aowis.raster-i64le")};
+    return {};
+}
+
+QByteArray readRectangle(const QString &path, std::uint32_t grid_columns,
+                         int x, int y, int width, int height, int bytes_per_cell)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly))
+        throw std::runtime_error("Cannot open completed analysis raster");
+    QByteArray data(qsizetype(width) * height * bytes_per_cell, '\0');
+    for (int row = 0; row < height; ++row)
+    {
+        const qint64 start = (qint64(y + row) * grid_columns + x) * bytes_per_cell;
+        const qsizetype size = qsizetype(width) * bytes_per_cell;
+        if (!file.seek(start) || file.read(data.data() + qsizetype(row) * size, size) != size)
+            throw std::runtime_error("Completed analysis raster is truncated");
+    }
+    return data;
+}
+
+std::int64_t downstreamValue(const char *ptr)
+{
+    const quint64 raw = qFromLittleEndian<quint64>(ptr);
+    std::int64_t value = 0;
+    std::memcpy(&value, &raw, sizeof(value));
+    return value;
+}
+
+std::uint64_t countValue(const char *ptr)
+{
+    return qFromLittleEndian<quint64>(ptr);
+}
+
+bool parseGeographicRing(const QJsonArray &input, GeographicRing *ring,
+                         std::uint64_t *total_vertices)
+{
+    if (input.size() < 4 || input.size() > 2048 ||
+        *total_vertices + std::uint64_t(input.size()) > 30000)
+        return false;
+    ring->clear();
+    for (const QJsonValue &value : input)
+    {
+        if (!value.isArray()) return false;
+        const QJsonArray coordinate = value.toArray();
+        if (coordinate.size() != 2 || !coordinate[0].isDouble() ||
+            !coordinate[1].isDouble()) return false;
+        const double longitude = coordinate[0].toDouble();
+        const double latitude = coordinate[1].toDouble();
+        if (!std::isfinite(longitude) || !std::isfinite(latitude) ||
+            longitude < -180.0 || longitude > 180.0 ||
+            latitude < -90.0 || latitude > 90.0) return false;
+        ring->push_back({longitude, latitude});
+    }
+    *total_vertices += std::uint64_t(input.size());
+    return ring->front().x == ring->back().x &&
+           ring->front().y == ring->back().y;
+}
+
+bool parseGeographicPolygon(const QJsonArray &rings,
+                            GeographicPolygon *polygon, std::uint64_t *vertices)
+{
+    if (rings.isEmpty() || rings.size() > 65 || !rings[0].isArray() ||
+        !parseGeographicRing(rings[0].toArray(), &polygon->exterior, vertices))
+        return false;
+    for (qsizetype index = 1; index < rings.size(); ++index)
+    {
+        if (!rings[index].isArray()) return false;
+        GeographicRing hole;
+        if (!parseGeographicRing(rings[index].toArray(), &hole, vertices))
+            return false;
+        polygon->holes.push_back(std::move(hole));
+    }
+    return true;
+}
+
+std::vector<GeographicPolygon> parseGeoJsonPolygons(const QJsonObject &object)
+{
+    QJsonObject geometry = object.value(QStringLiteral("geometry")).toObject();
+    if (geometry.isEmpty()) geometry = object;
+    const QString type = geometry.value(QStringLiteral("type")).toString();
+    const QJsonValue value = geometry.value(QStringLiteral("coordinates"));
+    if (!value.isArray())
+        throw std::invalid_argument("Invalid polygon GeoJSON coordinates");
+    const QJsonArray coordinates = value.toArray();
+    std::vector<GeographicPolygon> polygons;
+    std::uint64_t total_vertices = 0;
+    if (type == QStringLiteral("Polygon"))
+    {
+        GeographicPolygon polygon;
+        if (!parseGeographicPolygon(coordinates, &polygon, &total_vertices))
+            throw std::invalid_argument("Invalid GeoJSON polygon or ring");
+        polygons.push_back(std::move(polygon));
+    }
+    else if (type == QStringLiteral("MultiPolygon"))
+    {
+        if (coordinates.isEmpty() || coordinates.size() > 32)
+            throw std::invalid_argument("Invalid number of polygons");
+        for (const QJsonValue &value : coordinates)
+        {
+            if (!value.isArray())
+                throw std::invalid_argument("Invalid GeoJSON multipolygon element");
+            GeographicPolygon polygon;
+            if (!parseGeographicPolygon(value.toArray(), &polygon, &total_vertices))
+                throw std::invalid_argument("Invalid GeoJSON multipolygon ring");
+            polygons.push_back(std::move(polygon));
+        }
+    }
+    else throw std::invalid_argument("Invalid geometry type: expected Polygon or MultiPolygon");
+    return polygons;
+}
+
+AnalysisResult readStoredChannelGraph(const ElevationGrid &geometry, const QString &directory)
+{
+    const std::uint64_t cells = std::uint64_t(geometry.columns) * geometry.rows;
+    QFile links(QDir(directory).filePath(QStringLiteral("downstream.i64")));
+    QFile areas(QDir(directory).filePath(QStringLiteral("upstream-area.f64")));
+    if (!links.open(QIODevice::ReadOnly) || !areas.open(QIODevice::ReadOnly) ||
+        links.size() != qint64(cells * 8) || areas.size() != qint64(cells * 8))
+        throw std::runtime_error("Missing or incomplete stored flow graph");
+    AnalysisResult result;
+    result.source = geometry;
+    result.downstream.resize(std::size_t(cells));
+    result.upstream_area_m2.resize(std::size_t(cells));
+    constexpr qsizetype chunk_cells = 4096;
+    for (std::uint64_t offset = 0; offset < cells; offset += chunk_cells)
+    {
+        const qsizetype bytes = qsizetype(std::min<std::uint64_t>(chunk_cells, cells - offset)) * 8;
+        const QByteArray link_data = links.read(bytes);
+        const QByteArray area_data = areas.read(bytes);
+        if (link_data.size() != bytes || area_data.size() != bytes)
+            throw std::runtime_error("Truncated persisted channel data");
+        for (qsizetype index = 0; index < bytes / 8; ++index)
+        {
+            const std::size_t cell = std::size_t(offset + std::uint64_t(index));
+            result.downstream[cell] = downstreamValue(link_data.constData() + index * 8);
+            const quint64 bits = qFromLittleEndian<quint64>(area_data.constData() + index * 8);
+            std::memcpy(&result.upstream_area_m2[cell], &bits, sizeof(bits));
+        }
+    }
+    return result;
+}
+
+QJsonObject channelNetworkJson(const ChannelNetwork &network,
+                               const ElevationGrid &grid)
+{
+    QJsonArray features;
+    for (const ChannelSegment &segment : network.segments)
+    {
+        QJsonArray coordinates;
+        for (std::uint64_t cell : segment.cells)
+        {
+            const MapCoordinate coordinate = pixelCentreWgs84(grid.geometry,
+                std::uint32_t(cell % grid.columns), std::uint32_t(cell / grid.columns));
+            coordinates.append(QJsonArray{coordinate.x, coordinate.y});
+        }
+        features.append(QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("Feature")},
+            {QStringLiteral("geometry"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("LineString")},
+                {QStringLiteral("coordinates"), coordinates}}},
+            {QStringLiteral("properties"), QJsonObject{
+                {QStringLiteral("id"), double(segment.id)},
+                {QStringLiteral("from_cell"), double(segment.from_cell)},
+                {QStringLiteral("to_cell"), double(segment.to_cell)},
+                {QStringLiteral("strahler_order"), int(segment.strahler_order)},
+                {QStringLiteral("length_m"), segment.length_m},
+                {QStringLiteral("upstream_area_at_end_m2"), segment.upstream_area_at_end_m2}}}
+        });
+    }
+    QJsonArray nodes;
+    for (const ChannelNode &node : network.nodes)
+    {
+        const MapCoordinate coordinate = pixelCentreWgs84(grid.geometry,
+            std::uint32_t(node.cell_index % grid.columns),
+            std::uint32_t(node.cell_index / grid.columns));
+        nodes.append(QJsonObject{
+            {QStringLiteral("cell_index"), double(node.cell_index)},
+            {QStringLiteral("incoming_channels"), int(node.incoming_channels)},
+            {QStringLiteral("strahler_order"), int(node.strahler_order)},
+            {QStringLiteral("coordinates"), QJsonArray{coordinate.x, coordinate.y}}
+        });
+    }
+    return QJsonObject{
+        {QStringLiteral("type"), QStringLiteral("FeatureCollection")},
+        {QStringLiteral("features"), features},
+        {QStringLiteral("nodes"), nodes},
+        {QStringLiteral("threshold_m2"), network.threshold_m2},
+        {QStringLiteral("selected_cells"), double(network.selected_cells)},
+        {QStringLiteral("boundary_truncation_possible"), true}
+    };
+}
+
+} // namespace
+
+AnalysisService::AnalysisService(const ServiceConfig &config)
+    : config(config)
+{
+    this->workers.setMaxThreadCount(1);
+}
+
+AnalysisService::~AnalysisService()
+{
+    // Finish any active work before member objects (including the job map and
+    // the shared Map source) can be destroyed. QThreadPool alone would be
+    // destroyed after the job map due to member destruction order.
+    {
+        QMutexLocker locker(&this->jobs_mutex);
+        for (const QSharedPointer<Job> &job : std::as_const(this->job_map))
+        {
+            if (job->state != QStringLiteral("completed") &&
+                job->state != QStringLiteral("failed") &&
+                job->state != QStringLiteral("canceled"))
+                job->cancelled.store(true);
+        }
+    }
+    this->workers.waitForDone();
+}
+
+bool AnalysisService::initialize(QString *error)
+{
+    if (this->config.output_directory.isEmpty() ||
+        !QDir().mkpath(this->config.output_directory))
+    {
+        if (error != nullptr)
+            *error = QStringLiteral("Cannot create hydrology output directory");
+        return false;
+    }
+    restoreJobs();
+    return true;
+}
+
+QString AnalysisService::jobDirectory(const QString &id) const
+{
+    return QDir(this->config.output_directory).filePath(id);
+}
+
+QSharedPointer<AnalysisService::Job> AnalysisService::findJob(const QString &id) const
+{
+    QMutexLocker locker(&this->jobs_mutex);
+    return this->job_map.value(id);
+}
+
+QJsonObject AnalysisService::jobJson(const QSharedPointer<Job> &job) const
+{
+    QMutexLocker locker(&this->jobs_mutex);
+    QJsonObject result;
+    result.insert(QStringLiteral("id"), job->id);
+    result.insert(QStringLiteral("state"), job->state);
+    result.insert(QStringLiteral("error"), job->error);
+    result.insert(QStringLiteral("dataset"), job->dataset);
+    result.insert(QStringLiteral("west"), job->grid.geometry.origin_x);
+    result.insert(QStringLiteral("north"), job->grid.geometry.origin_y);
+    result.insert(QStringLiteral("step_lon_deg"), job->grid.geometry.pixel_width);
+    result.insert(QStringLiteral("step_lat_deg"), job->grid.geometry.pixel_height);
+    result.insert(QStringLiteral("columns"), int(job->grid.columns));
+    result.insert(QStringLiteral("rows"), int(job->grid.rows));
+    result.insert(QStringLiteral("horizontal_crs"), QStringLiteral("EPSG:4326"));
+    result.insert(QStringLiteral("vertical_datum"),
+        job->grid.geometry.vertical_datum == VerticalDatum::Egm2008
+            ? QStringLiteral("EGM2008") : QStringLiteral("unknown"));
+    result.insert(QStringLiteral("fill_depressions"), job->options.fill_depressions);
+    result.insert(QStringLiteral("breach_depressions"), job->options.breach_depressions);
+    result.insert(QStringLiteral("maximum_breach_cut_depth_m"), job->options.maximum_breach_cut_depth_m);
+    result.insert(QStringLiteral("maximum_breach_path_cells"), int(job->options.maximum_breach_path_cells));
+    result.insert(QStringLiteral("maximum_breach_excavation_m3"), job->options.maximum_breach_excavation_m3);
+    result.insert(QStringLiteral("maximum_breach_candidates"), int(job->options.maximum_breach_candidates));
+    result.insert(QStringLiteral("breached_cells"), double(job->breached_cells));
+    result.insert(QStringLiteral("accepted_breach_paths"), int(job->accepted_breach_paths));
+    result.insert(QStringLiteral("rejected_breach_candidates"), int(job->rejected_breach_candidates));
+    result.insert(QStringLiteral("breach_excavation_m3"), job->breach_excavation_m3);
+    result.insert(QStringLiteral("maximum_breach_cut_m"), double(job->maximum_breach_cut_m));
+    result.insert(QStringLiteral("conditioned_cells"), double(job->conditioned_cells));
+    result.insert(QStringLiteral("maximum_fill_m"), double(job->maximum_fill_m));
+    result.insert(QStringLiteral("potential_fill_cells"), double(job->potential_fill_cells));
+    result.insert(QStringLiteral("potential_fill_volume_m3"), job->potential_fill_volume_m3);
+    result.insert(QStringLiteral("maximum_potential_fill_m"), double(job->maximum_potential_fill_m));
+    return result;
+}
+
+bool AnalysisService::writeManifest(const QSharedPointer<Job> &job) const
+{
+    QSaveFile file(QDir(jobDirectory(job->id)).filePath(QStringLiteral("job.json")));
+    if (!file.open(QIODevice::WriteOnly))
+        return false;
+    const QByteArray data = QJsonDocument(jobJson(job)).toJson(QJsonDocument::Indented);
+    return file.write(data) == data.size() && file.commit();
+}
+
+void AnalysisService::restoreJobs()
+{
+    const QDir output(this->config.output_directory);
+    for (const QString &id : output.entryList(QDir::Dirs | QDir::NoDotAndDotDot))
+    {
+        if (!safeJobId(id))
+            continue;
+        QFile file(output.filePath(id + QStringLiteral("/job.json")));
+        if (!file.open(QIODevice::ReadOnly))
+            continue;
+        const QJsonDocument document = QJsonDocument::fromJson(file.readAll());
+        if (!document.isObject())
+            continue;
+        const QJsonObject saved = document.object();
+        QSharedPointer<Job> job = QSharedPointer<Job>::create();
+        job->id = id;
+        job->dataset = saved.value(QStringLiteral("dataset")).toString();
+        job->state = saved.value(QStringLiteral("state")).toString();
+        job->error = saved.value(QStringLiteral("error")).toString();
+        job->grid.columns = std::uint32_t(saved.value(QStringLiteral("columns")).toInt());
+        job->grid.rows = std::uint32_t(saved.value(QStringLiteral("rows")).toInt());
+        job->grid.geometry.origin_x = saved.value(QStringLiteral("west")).toDouble();
+        job->grid.geometry.origin_y = saved.value(QStringLiteral("north")).toDouble();
+        job->grid.geometry.pixel_width = saved.value(QStringLiteral("step_lon_deg")).toDouble();
+        job->grid.geometry.pixel_height = saved.value(QStringLiteral("step_lat_deg")).toDouble();
+        job->grid.geometry.vertical_datum = saved.value(QStringLiteral("vertical_datum")) ==
+            QStringLiteral("EGM2008") ? VerticalDatum::Egm2008 : VerticalDatum::Unknown;
+        job->options.fill_depressions = saved.value(QStringLiteral("fill_depressions")).toBool(true);
+        job->options.breach_depressions = saved.value(QStringLiteral("breach_depressions")).toBool(false);
+        job->options.maximum_breach_cut_depth_m = saved.value(QStringLiteral("maximum_breach_cut_depth_m")).toDouble(3.0);
+        job->options.maximum_breach_path_cells = std::uint32_t(saved.value(QStringLiteral("maximum_breach_path_cells")).toInt(8));
+        job->options.maximum_breach_excavation_m3 = saved.value(QStringLiteral("maximum_breach_excavation_m3")).toDouble(100000.0);
+        job->options.maximum_breach_candidates = std::uint32_t(saved.value(QStringLiteral("maximum_breach_candidates")).toInt(2000));
+        job->breached_cells = std::uint64_t(saved.value(QStringLiteral("breached_cells")).toDouble());
+        job->accepted_breach_paths = std::uint32_t(saved.value(QStringLiteral("accepted_breach_paths")).toInt());
+        job->rejected_breach_candidates = std::uint32_t(saved.value(QStringLiteral("rejected_breach_candidates")).toInt());
+        job->breach_excavation_m3 = saved.value(QStringLiteral("breach_excavation_m3")).toDouble();
+        job->maximum_breach_cut_m = float(saved.value(QStringLiteral("maximum_breach_cut_m")).toDouble());
+        job->conditioned_cells = std::uint64_t(saved.value(QStringLiteral("conditioned_cells")).toDouble());
+        job->maximum_fill_m = float(saved.value(QStringLiteral("maximum_fill_m")).toDouble());
+        job->potential_fill_cells = std::uint64_t(saved.value(QStringLiteral("potential_fill_cells")).toDouble());
+        job->potential_fill_volume_m3 = saved.value(QStringLiteral("potential_fill_volume_m3")).toDouble();
+        job->maximum_potential_fill_m = float(saved.value(QStringLiteral("maximum_potential_fill_m")).toDouble());
+        if (job->state != QStringLiteral("completed") && job->state != QStringLiteral("failed") &&
+            job->state != QStringLiteral("canceled"))
+        {
+            job->state = QStringLiteral("failed");
+            job->error = QStringLiteral("Server interrupted before completing job");
+            QMutexLocker locker(&this->jobs_mutex);
+            this->job_map.insert(id, job);
+            locker.unlock();
+            writeManifest(job);
+            continue;
+        }
+        QMutexLocker locker(&this->jobs_mutex);
+        this->job_map.insert(id, job);
+    }
+}
+
+void AnalysisService::runJob(const QSharedPointer<Job> &job)
+{
+    try
+    {
+        if (job->cancelled.load())
+            throw std::runtime_error("Job canceled");
+        {
+            QMutexLocker locker(&this->jobs_mutex);
+            job->state = QStringLiteral("fetching-terrain");
+        }
+        writeManifest(job);
+        ElevationGrid source = this->config.terrain_reader
+            ? this->config.terrain_reader(job->grid, job->dataset, job->cancelled)
+            : readTerrain(this->config.source, job->grid, job->dataset, job->cancelled);
+        if (source.columns != job->grid.columns || source.rows != job->grid.rows ||
+            source.geometry.origin_x != job->grid.geometry.origin_x ||
+            source.geometry.origin_y != job->grid.geometry.origin_y ||
+            source.geometry.pixel_width != job->grid.geometry.pixel_width ||
+            source.geometry.pixel_height != job->grid.geometry.pixel_height ||
+            source.geometry.horizontal_crs != job->grid.geometry.horizontal_crs ||
+            source.geometry.utm_zone != job->grid.geometry.utm_zone ||
+            source.geometry.northern_hemisphere != job->grid.geometry.northern_hemisphere ||
+            source.geometry.vertical_datum != job->grid.geometry.vertical_datum)
+            throw std::runtime_error("Terrain source returned incompatible grid geometry");
+        // A source gap at an outer edge can silently become a false watershed
+        // outlet. Reject incomplete input throughout the computation domain.
+        std::size_t missing_cells = 0;
+        std::size_t first_missing = 0;
+        for (std::size_t index = 0; index < source.elevations_m.size(); ++index)
+        {
+            if ((index & 0xFFFFU) == 0 && job->cancelled.load())
+                throw std::runtime_error("Job canceled");
+            if (!std::isfinite(source.elevations_m[index]))
+            {
+                if (missing_cells == 0) first_missing = index;
+                ++missing_cells;
+            }
+        }
+        if (missing_cells != 0)
+            throw std::runtime_error("DEM coverage incomplete: " +
+                std::to_string(missing_cells) + " missing cells, first at x=" +
+                std::to_string(first_missing % source.columns) + ", y=" +
+                std::to_string(first_missing / source.columns));
+        if (job->cancelled.load())
+            throw std::runtime_error("Job canceled");
+        {
+            QMutexLocker locker(&this->jobs_mutex);
+            job->state = QStringLiteral("analyzing");
+        }
+        writeManifest(job);
+        AnalysisResult result = analyze(source, job->options, &job->cancelled);
+        if (job->cancelled.load())
+            throw std::runtime_error("Job canceled");
+        {
+            QMutexLocker locker(&this->jobs_mutex);
+            job->state = QStringLiteral("saving");
+            job->conditioned_cells = result.conditioned_cell_count;
+            job->maximum_fill_m = result.maximum_fill_m;
+            job->potential_fill_cells = result.potential_fill_cell_count;
+            job->potential_fill_volume_m3 = result.potential_fill_volume_m3;
+            job->maximum_potential_fill_m = result.maximum_potential_fill_m;
+            job->breached_cells = result.breached_cell_count;
+            job->accepted_breach_paths = result.accepted_breach_paths;
+            job->rejected_breach_candidates = result.rejected_breach_candidates;
+            job->breach_excavation_m3 = result.breach_excavation_m3;
+            job->maximum_breach_cut_m = result.maximum_breach_cut_m;
+        }
+        writeManifest(job);
+        const QDir folder(jobDirectory(job->id));
+        writeArray(folder.filePath(QStringLiteral("elevation.f32")), result.source.elevations_m);
+        writeArray(folder.filePath(QStringLiteral("conditioned.f32")), result.conditioned_elevations_m);
+        writeArray(folder.filePath(QStringLiteral("potential-fill-depth.f32")), result.potential_fill_depth_m);
+        writeArray(folder.filePath(QStringLiteral("breach-cut-depth.f32")), result.breach_cut_depth_m);
+        writeArray(folder.filePath(QStringLiteral("upstream-area.f64")), result.upstream_area_m2);
+        writeArray(folder.filePath(QStringLiteral("upstream-count.u64")), result.upstream_cell_count);
+        writeArray(folder.filePath(QStringLiteral("downstream.i64")), result.downstream);
+        if (job->cancelled.load())
+            throw std::runtime_error("Job canceled");
+        {
+            QMutexLocker locker(&this->jobs_mutex);
+            job->state = QStringLiteral("completed");
+        }
+        if (!writeManifest(job))
+            throw std::runtime_error("Could not persist job completion metadata");
+    }
+    catch (const std::exception &error)
+    {
+        {
+            QMutexLocker locker(&this->jobs_mutex);
+            job->state = job->cancelled.load()
+                ? QStringLiteral("canceled") : QStringLiteral("failed");
+            job->error = QString::fromUtf8(error.what());
+        }
+        writeManifest(job);
+    }
+}
+
+QString AnalysisService::submit(const AnalysisRequest &request, QString *error)
+{
+    if (error != nullptr) error->clear();
+    const QString dataset = request.dataset.isEmpty() ? this->config.dataset : request.dataset;
+    if (dataset != this->config.dataset ||
+        !std::isfinite(request.west) || !std::isfinite(request.south) ||
+        !std::isfinite(request.east) || !std::isfinite(request.north) ||
+        !std::isfinite(request.resolution_m) ||
+        request.west < -180 || request.east > 180 || request.west >= request.east ||
+        request.south < -85 || request.north > 85 || request.south >= request.north ||
+        request.resolution_m < 30.0 || request.resolution_m > 5000.0)
+    {
+        if (error != nullptr) *error = QStringLiteral("Invalid terrain dataset, bounds or resolution");
+        return {};
+    }
+    if (request.breach_depressions &&
+        (!std::isfinite(request.maximum_breach_cut_depth_m) ||
+         request.maximum_breach_cut_depth_m <= 0.0 ||
+         !std::isfinite(request.maximum_breach_excavation_m3) ||
+         request.maximum_breach_excavation_m3 <= 0.0 ||
+         request.maximum_breach_path_cells < 2 ||
+         request.maximum_breach_path_cells > 32 ||
+         request.maximum_breach_candidates == 0 ||
+         request.maximum_breach_candidates > 100000))
+    {
+        if (error != nullptr) *error = QStringLiteral("Invalid constrained breach limits");
+        return {};
+    }
+    constexpr double metres_per_degree = 111195.08;
+    constexpr double radians_per_degree = 0.017453292519943295;
+    const double latitude_radians = 0.5 * (request.north + request.south) * radians_per_degree;
+    const double columns_d = std::ceil((request.east - request.west) *
+        metres_per_degree * std::cos(latitude_radians) / request.resolution_m);
+    const double rows_d = std::ceil((request.north - request.south) *
+        metres_per_degree / request.resolution_m);
+    if (!std::isfinite(columns_d) || !std::isfinite(rows_d) ||
+        columns_d < 2 || rows_d < 2 || columns_d > 100000 || rows_d > 100000 ||
+        columns_d * rows_d > double(this->config.maximum_cells))
+    {
+        if (error != nullptr) *error = QStringLiteral("Analysis exceeds configured cell limit or is too small");
+        return {};
+    }
+    const QString id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QSharedPointer<Job> job = QSharedPointer<Job>::create();
+    job->id = id;
+    job->dataset = dataset;
+    job->grid.columns = std::uint32_t(columns_d);
+    job->grid.rows = std::uint32_t(rows_d);
+    job->grid.geometry.horizontal_crs = HorizontalCrs::Wgs84Geographic;
+    job->grid.geometry.vertical_datum = dataset == QStringLiteral("copernicus-glo30")
+        ? VerticalDatum::Egm2008 : VerticalDatum::Unknown;
+    job->grid.geometry.origin_x = request.west;
+    job->grid.geometry.origin_y = request.north;
+    job->grid.geometry.pixel_width = (request.east - request.west) / columns_d;
+    job->grid.geometry.pixel_height = (request.north - request.south) / rows_d;
+    job->options.fill_depressions = request.fill_depressions;
+    job->options.breach_depressions = request.breach_depressions;
+    job->options.maximum_breach_cut_depth_m = request.maximum_breach_cut_depth_m;
+    job->options.maximum_breach_path_cells = request.maximum_breach_path_cells;
+    job->options.maximum_breach_excavation_m3 = request.maximum_breach_excavation_m3;
+    job->options.maximum_breach_candidates = request.maximum_breach_candidates;
+    if (!QDir().mkpath(jobDirectory(id)))
+    {
+        if (error != nullptr) *error = QStringLiteral("Cannot create job directory");
+        return {};
+    }
+    {
+        QMutexLocker locker(&this->jobs_mutex);
+        this->job_map.insert(id, job);
+    }
+    if (!writeManifest(job))
+    {
+        {
+            QMutexLocker locker(&this->jobs_mutex);
+            this->job_map.remove(id);
+        }
+        QDir(jobDirectory(id)).removeRecursively();
+        if (error != nullptr) *error = QStringLiteral("Cannot persist job metadata");
+        return {};
+    }
+    // Unlike QtConcurrent::run, QThreadPool::start is a fire-and-forget API.
+    this->workers.start([this, job]() { runJob(job); });
+    return id;
+}
+
+QJsonObject AnalysisService::job(const QString &id) const
+{
+    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
+    return item ? jobJson(item) : QJsonObject();
+}
+
+QJsonArray AnalysisService::jobs() const
+{
+    QStringList ids;
+    {
+        QMutexLocker locker(&this->jobs_mutex);
+        ids = this->job_map.keys();
+    }
+    ids.sort();
+    QJsonArray response;
+    for (const QString &id : ids)
+    {
+        const QSharedPointer<Job> item = findJob(id);
+        if (item) response.append(jobJson(item));
+    }
+    return response;
+}
+
+bool AnalysisService::cancel(const QString &id)
+{
+    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
+    if (!item) return false;
+    QMutexLocker locker(&this->jobs_mutex);
+    if (item->state != QStringLiteral("completed") &&
+        item->state != QStringLiteral("failed") &&
+        item->state != QStringLiteral("canceled"))
+        item->cancelled.store(true);
+    return true;
+}
+
+QByteArray AnalysisService::layerMime(const QString &layer)
+{
+    return layerSpec(layer).mime;
+}
+
+QByteArray AnalysisService::rasterWindow(const QString &id, const QString &layer,
+    int x, int y, int width, int height, QString *error) const
+{
+    if (error != nullptr) error->clear();
+    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
+    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
+    {
+        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
+        return {};
+    }
+    const Layer spec = layerSpec(layer);
+    if (spec.bytes_per_cell == 0 || x < 0 || y < 0 || width < 1 || height < 1 ||
+        width > 512 || height > 512 || std::int64_t(x) + width > item->grid.columns ||
+        std::int64_t(y) + height > item->grid.rows)
+    {
+        if (error != nullptr) *error = QStringLiteral("Invalid raster layer or window");
+        return {};
+    }
+    try
+    {
+        return readRectangle(QDir(jobDirectory(id)).filePath(spec.file),
+                             item->grid.columns, x, y, width, height, spec.bytes_per_cell);
+    }
+    catch (const std::exception &ex)
+    {
+        if (error != nullptr) *error = QString::fromUtf8(ex.what());
+        return {};
+    }
+}
+
+QByteArray AnalysisService::catchment(const QString &id, int x, int y, QString *error) const
+{
+    if (error != nullptr) error->clear();
+    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
+    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
+    {
+        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
+        return {};
+    }
+    if (x < 0 || y < 0 || x >= item->grid.columns || y >= item->grid.rows)
+    {
+        if (error != nullptr) *error = QStringLiteral("Invalid catchment outlet cell");
+        return {};
+    }
+    try
+    {
+        const std::uint64_t cells = std::uint64_t(item->grid.columns) * item->grid.rows;
+        const QString folder = jobDirectory(id);
+        QFile links(QDir(folder).filePath(QStringLiteral("downstream.i64")));
+        QFile counts(QDir(folder).filePath(QStringLiteral("upstream-count.u64")));
+        if (!links.open(QIODevice::ReadOnly) || !counts.open(QIODevice::ReadOnly) ||
+            links.size() != qint64(cells * 8) || counts.size() != qint64(cells * 8))
+            throw std::runtime_error("Missing or incomplete flow graph");
+        const QByteArray links_bytes = links.readAll();
+        const QByteArray counts_bytes = counts.readAll();
+        if (links_bytes.size() != qsizetype(cells * 8) ||
+            counts_bytes.size() != qsizetype(cells * 8))
+            throw std::runtime_error("Cannot read complete flow graph");
+        AnalysisResult result;
+        result.source = item->grid;
+        result.downstream.resize(std::size_t(cells));
+        result.upstream_cell_count.resize(std::size_t(cells));
+        for (std::uint64_t cell = 0; cell < cells; ++cell)
+        {
+            result.downstream[std::size_t(cell)] = downstreamValue(
+                links_bytes.constData() + qsizetype(cell * 8));
+            result.upstream_cell_count[std::size_t(cell)] = countValue(
+                counts_bytes.constData() + qsizetype(cell * 8));
+        }
+        const std::vector<std::uint8_t> mask = delineateCatchment(result,
+            std::uint64_t(y) * item->grid.columns + std::uint64_t(x));
+        return QByteArray(reinterpret_cast<const char *>(mask.data()), qsizetype(mask.size()));
+    }
+    catch (const std::exception &ex)
+    {
+        if (error != nullptr) *error = QString::fromUtf8(ex.what());
+        return {};
+    }
+}
+
+QJsonObject AnalysisService::downstreamTrace(const QString &id, int x, int y,
+                                               double maximum_distance_km,
+                                               QString *error) const
+{
+    if (error != nullptr) error->clear();
+    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
+    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
+    {
+        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
+        return {};
+    }
+    if (x < 0 || y < 0 || x >= item->grid.columns || y >= item->grid.rows ||
+        !std::isfinite(maximum_distance_km) || maximum_distance_km <= 0.0 ||
+        maximum_distance_km > 1000.0)
+    {
+        if (error != nullptr) *error = QStringLiteral("Invalid trace origin or distance");
+        return {};
+    }
+    try
+    {
+        const std::uint64_t cells = std::uint64_t(item->grid.columns) * item->grid.rows;
+        const QDir folder(jobDirectory(id));
+        QFile links(folder.filePath(QStringLiteral("downstream.i64")));
+        QFile heights(folder.filePath(QStringLiteral("conditioned.f32")));
+        if (!links.open(QIODevice::ReadOnly) || !heights.open(QIODevice::ReadOnly) ||
+            links.size() != qint64(cells * 8) || heights.size() != qint64(cells * 4))
+            throw std::runtime_error("Missing or incomplete stored trace layers");
+        const FlowTrace path = traceDownstream(item->grid.geometry,
+            item->grid.columns, item->grid.rows,
+            std::uint64_t(y) * item->grid.columns + std::uint64_t(x),
+            maximum_distance_km * 1000.0, 10000,
+            [&links](std::uint64_t cell)
+            {
+                if (!links.seek(qint64(cell * 8)))
+                    throw std::runtime_error("Cannot seek downstream raster");
+                const QByteArray data = links.read(8);
+                if (data.size() != 8)
+                    throw std::runtime_error("Truncated downstream raster");
+                return downstreamValue(data.constData());
+            },
+            [&heights](std::uint64_t cell)
+            {
+                if (!heights.seek(qint64(cell * 4)))
+                    throw std::runtime_error("Cannot seek conditioned terrain raster");
+                const QByteArray data = heights.read(4);
+                if (data.size() != 4)
+                    throw std::runtime_error("Truncated conditioned terrain raster");
+                const quint32 bits = qFromLittleEndian<quint32>(data.constData());
+                float height = 0.0f;
+                std::memcpy(&height, &bits, sizeof(height));
+                return height;
+            });
+        QString reason;
+        switch (path.termination)
+        {
+            case TraceTermination::DomainOutlet: reason = QStringLiteral("domain_boundary"); break;
+            case TraceTermination::InternalSink: reason = QStringLiteral("internal_sink"); break;
+            case TraceTermination::DistanceLimit: reason = QStringLiteral("distance_limit"); break;
+            case TraceTermination::PointLimit: reason = QStringLiteral("point_limit"); break;
+        }
+        QJsonArray coordinates;
+        QJsonArray points;
+        for (const TracePoint &point : path.points)
+        {
+            const MapCoordinate coordinate = pixelCentreWgs84(item->grid.geometry,
+                std::uint32_t(point.cell_index % item->grid.columns),
+                std::uint32_t(point.cell_index / item->grid.columns));
+            coordinates.append(QJsonArray{coordinate.x, coordinate.y});
+            points.append(QJsonObject{
+                {QStringLiteral("cell_index"), double(point.cell_index)},
+                {QStringLiteral("distance_m"), point.distance_from_start_m},
+                {QStringLiteral("elevation_m"), double(point.conditioned_elevation_m)}
+            });
+        }
+        return QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("Feature")},
+            {QStringLiteral("geometry"), QJsonObject{
+                {QStringLiteral("type"), path.points.size() == 1
+                    ? QStringLiteral("Point") : QStringLiteral("LineString")},
+                {QStringLiteral("coordinates"), path.points.size() == 1
+                    ? QJsonValue(coordinates.first()) : QJsonValue(coordinates)}
+            }},
+            {QStringLiteral("properties"), QJsonObject{
+                {QStringLiteral("termination"), reason},
+                {QStringLiteral("traced_length_m"), path.traced_length_m},
+                {QStringLiteral("net_slope"), path.net_slope},
+                {QStringLiteral("points"), points},
+                {QStringLiteral("domain_boundary_reached"),
+                    path.termination == TraceTermination::DomainOutlet}
+            }}
+        };
+    }
+    catch (const std::exception &ex)
+    {
+        if (error != nullptr) *error = QString::fromUtf8(ex.what());
+        return {};
+    }
+}
+
+QJsonObject AnalysisService::channelNetwork(const QString &id,
+                                             double minimum_area_km2,
+                                             QString *error) const
+{
+    if (error != nullptr) error->clear();
+    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
+    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
+    {
+        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
+        return {};
+    }
+    if (!std::isfinite(minimum_area_km2) || minimum_area_km2 <= 0.0 ||
+        minimum_area_km2 > 1.0e9)
+    {
+        if (error != nullptr) *error = QStringLiteral("Invalid minimum contributing area");
+        return {};
+    }
+    try
+    {
+        const AnalysisResult result = readStoredChannelGraph(item->grid, jobDirectory(id));
+        return channelNetworkJson(extractChannelNetwork(result,
+            minimum_area_km2 * 1.0e6, 25000, 2000), item->grid);
+    }
+    catch (const std::exception &ex)
+    {
+        if (error != nullptr) *error = QString::fromUtf8(ex.what());
+        return {};
+    }
+}
+
+QJsonObject AnalysisService::channelNetworkWindow(const QString &id,
+    double minimum_area_km2, const DrainageWindow &window, QString *error) const
+{
+    if (error != nullptr) error->clear();
+    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
+    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
+    {
+        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
+        return {};
+    }
+    if (!std::isfinite(minimum_area_km2) || minimum_area_km2 <= 0.0 ||
+        minimum_area_km2 > 1.0e9)
+    {
+        if (error != nullptr) *error = QStringLiteral("Invalid minimum contributing area");
+        return {};
+    }
+    try
+    {
+        const AnalysisResult graph = readStoredChannelGraph(item->grid, jobDirectory(id));
+        QJsonObject output = channelNetworkJson(extractWindowChannelNetwork(
+            graph, minimum_area_km2 * 1.0e6, window), item->grid);
+        output.insert(QStringLiteral("window_clipped"), true);
+        output.insert(QStringLiteral("local_stream_order"), true);
+        return output;
+    }
+    catch (const std::exception &ex)
+    {
+        if (error != nullptr) *error = QString::fromUtf8(ex.what());
+        return {};
+    }
+}
+
+QJsonObject AnalysisService::watershedBoundary(const QString &id, int x, int y,
+                                                QString *error) const
+{
+    if (error != nullptr) error->clear();
+    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
+    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
+    {
+        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
+        return {};
+    }
+    if (x < 0 || y < 0 || x >= item->grid.columns || y >= item->grid.rows)
+    {
+        if (error != nullptr) *error = QStringLiteral("Invalid watershed outlet");
+        return {};
+    }
+    const QByteArray mask_bytes = catchment(id, x, y, error);
+    if (error != nullptr && !error->isEmpty()) return {};
+    try
+    {
+        const std::vector<std::uint8_t> mask(mask_bytes.cbegin(), mask_bytes.cend());
+        const WatershedBoundary boundary = polygonizeCatchment(item->grid, mask, 100000);
+        QJsonArray polygons;
+        for (const WatershedPolygon &polygon : boundary.polygons)
+        {
+            QJsonArray rings;
+            for (const std::vector<GridVertex> &ring : polygon.rings)
+            {
+                QJsonArray coordinates;
+                for (const GridVertex &vertex : ring)
+                {
+                    const MapCoordinate point = gridVertexWgs84(item->grid.geometry, vertex);
+                    coordinates.append(QJsonArray{point.x, point.y});
+                }
+                rings.append(coordinates);
+            }
+            polygons.append(rings);
+        }
+        return QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("Feature")},
+            {QStringLiteral("geometry"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("MultiPolygon")},
+                {QStringLiteral("coordinates"), polygons}}},
+            {QStringLiteral("properties"), QJsonObject{
+                {QStringLiteral("outlet_cell"), double(std::uint64_t(y) * item->grid.columns + x)},
+                {QStringLiteral("contributing_cells"), double(boundary.contributing_cells)},
+                {QStringLiteral("contributing_area_m2"), boundary.contributing_area_m2},
+                {QStringLiteral("touches_domain_boundary"), boundary.touches_domain_boundary},
+                {QStringLiteral("boundary_truncation_possible"), boundary.touches_domain_boundary}}}
+        };
+    }
+    catch (const std::exception &ex)
+    {
+        if (error != nullptr) *error = QString::fromUtf8(ex.what());
+        return {};
+    }
+}
+
+QJsonObject AnalysisService::affectedNetwork(const QString &id,
+                                              const QJsonObject &request,
+                                              QString *error) const
+{
+    if (error != nullptr) error->clear();
+    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
+    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
+    {
+        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
+        return {};
+    }
+    const QJsonValue threshold_value = request.value(QStringLiteral("min_upstream_area_km2"));
+    if (!threshold_value.isDouble() || !std::isfinite(threshold_value.toDouble()) ||
+        threshold_value.toDouble() <= 0.0 || threshold_value.toDouble() > 1.0e9)
+    {
+        if (error != nullptr) *error = QStringLiteral("Invalid minimum contributing area");
+        return {};
+    }
+    try
+    {
+        const std::vector<GeographicPolygon> polygons = parseGeoJsonPolygons(request);
+        DrainageWindow window;
+        if (request.contains(QStringLiteral("window")))
+        {
+            const QJsonValue value = request.value(QStringLiteral("window"));
+            if (!value.isObject())
+                throw std::invalid_argument("Invalid WGS84 spatial window");
+            const QJsonObject input = value.toObject();
+            for (const QString &name : {QStringLiteral("west"), QStringLiteral("east"),
+                                        QStringLiteral("south"), QStringLiteral("north")})
+                if (!input.value(name).isDouble())
+                    throw std::invalid_argument("Invalid WGS84 spatial window coordinate");
+            window.west = input.value(QStringLiteral("west")).toDouble();
+            window.east = input.value(QStringLiteral("east")).toDouble();
+            window.south = input.value(QStringLiteral("south")).toDouble();
+            window.north = input.value(QStringLiteral("north")).toDouble();
+        }
+        const AnalysisResult graph = readStoredChannelGraph(item->grid, jobDirectory(id));
+        const PolygonDrainageResult affected = downstreamNetworkFromPolygon(
+            graph, polygons, threshold_value.toDouble() * 1.0e6, window);
+        QJsonObject output = channelNetworkJson(affected.network, item->grid);
+        output.insert(QStringLiteral("source_cells"), double(affected.source_cells));
+        output.insert(QStringLiteral("downstream_affected_cells"),
+                      double(affected.downstream_affected_cells));
+        output.insert(QStringLiteral("affected_domain_boundary_cells"),
+                      double(affected.affected_boundary_cells));
+        output.insert(QStringLiteral("window_clipped"), affected.clipped_to_window);
+        output.insert(QStringLiteral("local_stream_order"), true);
+        output.insert(QStringLiteral("model"), QStringLiteral("topological_d8_influence"));
+        return output;
+    }
+    catch (const std::exception &ex)
+    {
+        if (error != nullptr) *error = QString::fromUtf8(ex.what());
+        return {};
+    }
+}
+
+} // namespace Aowis::Hydrology
