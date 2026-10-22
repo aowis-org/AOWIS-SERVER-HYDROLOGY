@@ -327,6 +327,71 @@ acquisition time. To distinguish Map's DEM sampling CPU from HTTP delivery,
 we must instrument **AOWIS-SERVER-MAP** separately; the present service
 measurements cannot distinguish those two costs.
 
+
+### Map HTTP concurrency probe (read-only)
+
+Repeated job measurements on one 352 × 556 Copernicus GLO-30 area, with six
+source patches, show that approximately **99.85% of Hydrology's terrain-fetch
+wall time** occurs inside the six Map HTTP requests. Copying returned samples
+into the DEM takes approximately 0.13 ms. That request measurement includes
+**Map processing, Qt/HTTP delivery, and client waiting together**; it does
+not establish whether TCP or raster sampling dominates inside Map.
+
+Before changing the production acquisition path to parallel requests, use
+`tools/benchmark_map_concurrency.py` to probe whether the *existing* Map
+server can serve independent DEM patch GET requests concurrently. This is a
+**read-only experiment**: provide an already completed Hydrology job, and the
+probe reconstructs the original full-grid Map patch requests from the saved
+analysis geometry. It does not create jobs, delete caches, change Map settings,
+or change Hydrology's sequential production fetch policy.
+
+```bash
+./tools/benchmark_map_concurrency.py \
+  --existing-job <completed-analysis-uuid> \
+  --hydrology-url http://127.0.0.1:8123 \
+  --map-url http://127.0.0.1:8122 \
+  --source-patch-size 256 \
+  --workers 1,2,4 --rounds 5 --warmup-rounds 1 \
+  > benchmark-map-concurrency.json
+
+jq '{patches: .patch_count, results: [.results[] | {
+  workers, speedup: .speedup_vs_sequential_median,
+  wall_ms: .wall.median_ms, sum_http_ms: .sum_http.median_ms
+}]}' benchmark-map-concurrency.json
+```
+
+For the 352 × 556 example, the probe reads six source patches per pass.
+Each worker count runs one warmup plus five measured passes, for 108 Map
+requests in total (6 patches × 3 worker levels × 6 passes). Avoid running
+this on a busy or production Map server; parallel sampling may increase
+CPU, memory pressure, and unrelated users' latency. Select lower concurrency
+or fewer rounds when needed. The default --max-cells is 250,000; worker
+levels are limited to 1–8, with 1 required as baseline. Round order is
+rotated to reduce systematic cache/time bias.
+
+Every received patch must have the declared MIME and byte count, and its
+SHA-256 must remain **exactly identical** across all warmups, rounds and
+concurrency levels, otherwise the probe fails. Metrics distinguish:
+
+- `wall_ms`: elapsed time to obtain the entire set of source patches;
+- `sum_http_ms`: sum of individual Map GET durations (may exceed wall time
+  under overlap);
+- `speedup_vs_sequential_median`: sequential wall-time median divided by
+  each level's median, descriptive rather than a guarantee of speedup.
+
+Concurrent requests may be serviced in parallel by Map, but faster results
+here would **not** establish that changing Hydrology to concurrent acquisition
+will produce the same speedup: the Python client has different HTTP behavior,
+thread scheduling, and cache locality. Map's internal sampling CPU and
+transport costs still require instrumenting AOWIS-SERVER-MAP. Keep the
+existing single-worker baseline and verify output identity before pursuing
+production concurrency.
+
+**Repository packaging:** `.gitignore` ignores `benchmark*.json` and
+`benchmark*.log` result files, but not `tools/benchmark_map_series.py` or
+`tools/benchmark_map_concurrency.py`. The source scripts must appear in
+`tools/zip_hydrology.sh` repository archives even when untracked.
+
 ## Verification and reference comparisons
 
 The benchmark ensures **internal conservation**, not physical correctness.

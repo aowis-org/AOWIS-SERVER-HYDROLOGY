@@ -109,6 +109,10 @@ Hydrology jobs and compares server-side Map-call, raster-copy and worker-stage
 timing distributions, while verifying DEM hashes and basin-result identity.
 Use it after starting the instrumented server; the single-job
 `benchmark_map_http.py --repeats` option only repeats saved-result reads.
+A separate **read-only** `tools/benchmark_map_concurrency.py` probes 1, 2
+and 4 concurrent Map DEM patch requests against an existing completed job,
+verifying identical per-patch SHA-256 results before reporting any timing
+comparison. It does not enable parallel acquisition in production.
 
 `tools/benchmark_map_http.py` benchmarks a live Map → Hydrology terrain job,
 repeated bounded raster and basin queries, DEM window parity between Map and
