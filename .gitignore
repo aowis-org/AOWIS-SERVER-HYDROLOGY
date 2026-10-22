@@ -1,3 +1,5 @@
+benchmark*
+
 # C++ objects and libs
 *.slo
 *.lo
@@ -54,3 +56,5 @@ compile_commands.json
 *creator.user*
 
 *_qmlcache.qrc
+
+
