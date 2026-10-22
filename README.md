@@ -13,7 +13,7 @@ The first implementation provides:
 - **Physical depression-fill diagnostics** including per-cell potential fill depth and area-weighted total potential fill volume; the original DEM remains unchanged. See [DEM conditioning](docs/CONDITIONING.md).
 - **Depression hierarchy and basin storage (core/service/REST):** 8-connected raster-minimum and saddle topology, nested parent/child basins, physical spill capacities and bounded water-level/volume queries derived from the original terrain. See [Depression hierarchy](docs/DEPRESSION_HIERARCHY.md). Basin artifacts now persist with analysis jobs, with UUID-addressed queries and sampled curves.
 - **Rainfall scenarios (core/service/REST):** independent UUID-addressed scenarios reusing a completed terrain analysis, WGS84 GeoJSON polygons/multipolygons, exact planar clipped-cell coverage and polygon union including holes, explicit total rainfall depth/duration/runoff fraction, mass-balanced gross/effective volumes, persistent row-major runoff rasters, and scenario retrieval after restart. See [Rainfall scenarios](docs/RAINFALL_SCENARIOS.md).
-- **Static Fill–Spill–Merge-style runoff redistribution (core/service/REST):** original-DEM dry D8 routing, closed-basin storage, sibling/parent spill transfers, domain outflow and explicit mass balance, queried for saved rainfall scenarios. Results are cached per scenario in a versioned, integrity-checked binary archive and reused across pagination and restarts. This remains a volume-only screening approximation. See [Runoff redistribution](docs/RUNOFF_REDISTRIBUTION.md) and [Result caching](docs/REDISTRIBUTION_CACHE.md).
+- **Static Fill–Spill–Merge-style runoff redistribution (core/service/REST):** original-DEM dry D8 routing, closed-basin storage, sibling/parent spill transfers, domain outflow and explicit mass balance, queried for saved rainfall scenarios. Results are cached per scenario in a versioned, integrity-checked binary archive and reused across pagination and restarts. A bounded asynchronous worker provides nonblocking REST submission, status, cancellation and cache-only retrieval. This remains a volume-only screening approximation. See [Runoff redistribution](docs/RUNOFF_REDISTRIBUTION.md), [Result caching](docs/REDISTRIBUTION_CACHE.md) and [Asynchronous jobs](docs/ASYNCHRONOUS_REDISTRIBUTION.md).
 - **Catchment delineation** upstream of a chosen terrain cell.
 - **Downstream tracing and D8 channel-network extraction:** reusable flow-graph queries, length/slope metrics, tributary junctions and Strahler stream order. Includes **watershed GeoJSON polygons**, geographically selected downstream-affected channels and bounded window extraction. See [Drainage networks](docs/DRAINAGE_NETWORKS.md).
 - Optional **constrained local breaching** of short DEM obstructions, with explicit excavation and path limits, physical cut-depth diagnostics and separate unmodified DEM elevations. Disabled by default.
@@ -231,7 +231,10 @@ allows water to pass between merged depressions after a spill threshold, and
 reports how much water leaves the analysis domain.
 
 ```http
+POST /v1/jobs/{analysis-uuid}/rainfall-scenarios/{scenario-uuid}/redistribution
+GET /v1/jobs/{analysis-uuid}/rainfall-scenarios/{scenario-uuid}/redistribution/status
 GET /v1/jobs/{analysis-uuid}/rainfall-scenarios/{scenario-uuid}/redistribution?offset=0&limit=50
+DELETE /v1/jobs/{analysis-uuid}/rainfall-scenarios/{scenario-uuid}/redistribution
 ```
 
 The JSON response contains `generated_runoff_m3`, `basin_storage_m3`,
@@ -241,12 +244,16 @@ UUID-addressed basin states. **Only root basin storage is included in the
 summary:** internal basin results include their children and must not be
 summed together. This is a **static volume-only screening model**. It does
 not compute flood timing, velocity, detailed inundation extent or depth,
-urban drainage, or discharge outside the analyzed DEM. The computation is
-still synchronous for the **first query**, then persisted as a derived per-scenario
-cache. Subsequent pages and post-restart queries read only their basin records.
-The response includes `cache_hit`; missing, stale or damaged cache files are
-recomputed atomically. Incomplete DEM coverage is rejected.
+urban drainage, or discharge outside the analyzed DEM. **HTTP POST** starts a
+bounded background calculation, and **GET status** reports readiness. **GET
+results never starts computation**; it reads the persisted per-scenario cache
+or returns HTTP 409 until ready. A missing, stale or damaged derived cache is
+recomputed atomically upon a new POST, while later pages and post-restart reads
+reuse the valid cache. The legacy C++ method remains synchronous for existing
+in-process callers. Incomplete DEM coverage is rejected.
 
+Read **[Asynchronous redistribution jobs](docs/ASYNCHRONOUS_REDISTRIBUTION.md)**
+for the HTTP workflow, state machine and cancellation contract.
 Read **[Runoff redistribution and basin overflow](docs/RUNOFF_REDISTRIBUTION.md)**
 for the physical assumptions, water-balance equations, worked example,
 query lifecycle, C++ usage and known accuracy limits. See also

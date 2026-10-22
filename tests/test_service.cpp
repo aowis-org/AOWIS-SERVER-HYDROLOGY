@@ -152,6 +152,14 @@ int main(int argc, char **argv)
         const QByteArray runoff_window = service.rainfallRunoffWindow(
             successful_id, rainfall_scenario_id, 1, 1, 1, 1, &error);
         assert(error.isEmpty() && runoff_window.size() == 8);
+        const QJsonObject initially_pending = service.rainfallRedistributionStatus(
+            successful_id, rainfall_scenario_id, &error);
+        assert(error.isEmpty() && initially_pending.value(QStringLiteral("state")) ==
+            QStringLiteral("not_started"));
+        assert(!initially_pending.value(QStringLiteral("cache_ready")).toBool());
+        assert(service.rainfallRedistributionReady(successful_id, rainfall_scenario_id,
+            0, 20, &error).isEmpty());
+        assert(error.startsWith(QStringLiteral("Redistribution result not ready")));
         const QJsonObject redistributed = service.rainfallRedistribution(
             successful_id, rainfall_scenario_id, 0, 20, &error);
         assert(error.isEmpty());
@@ -163,6 +171,11 @@ int main(int argc, char **argv)
             redistributed.value(QStringLiteral("total_boundary_outflow_m3")).toDouble()) < 1.e-6);
         assert(redistributed.value(QStringLiteral("total_basins")).toDouble() == 0);
         assert(!redistributed.value(QStringLiteral("cache_hit")).toBool());
+        assert(service.rainfallRedistributionStatus(successful_id, rainfall_scenario_id,
+            &error).value(QStringLiteral("cache_ready")).toBool());
+        assert(service.rainfallRedistributionReady(successful_id, rainfall_scenario_id,
+            0, 20, &error).value(QStringLiteral("cache_hit")).toBool());
+        assert(error.isEmpty());
         const QJsonObject cached_empty = service.rainfallRedistribution(
             successful_id, rainfall_scenario_id, 20, 1, &error);
         assert(error.isEmpty() && cached_empty.value(QStringLiteral("cache_hit")).toBool());
@@ -337,6 +350,53 @@ int main(int argc, char **argv)
         assert(basin_balance.value(QStringLiteral("basins")).toArray().first().toObject()
             .value(QStringLiteral("basin_id")).toString() == basin_id);
 
+        // A cache-only query cannot accidentally trigger a costly rebuild.
+        assert(QFile::remove(cache_path));
+        const QJsonObject not_ready = service.rainfallRedistributionStatus(
+            basin_job_id, basin_scenario_id, &error);
+        assert(error.isEmpty() && not_ready.value(QStringLiteral("state")) ==
+            QStringLiteral("not_started"));
+        assert(service.rainfallRedistributionReady(basin_job_id, basin_scenario_id,
+            0, 1, &error).isEmpty());
+        assert(error.startsWith(QStringLiteral("Redistribution result not ready")));
+        const QJsonObject started = service.startRainfallRedistribution(
+            basin_job_id, basin_scenario_id, &error);
+        assert(error.isEmpty());
+        const QString task_id = started.value(QStringLiteral("id")).toString();
+        assert(!QUuid(QStringLiteral("{") + task_id + QStringLiteral("}")).isNull());
+        const QJsonObject duplicate = service.startRainfallRedistribution(
+            basin_job_id, basin_scenario_id, &error);
+        assert(error.isEmpty());
+        assert(duplicate.value(QStringLiteral("id")).toString() == task_id);
+        QElapsedTimer redistribution_timer;
+        redistribution_timer.start();
+        bool async_complete = false;
+        while (redistribution_timer.elapsed() < 10000)
+        {
+            const QJsonObject status = service.rainfallRedistributionStatus(
+                basin_job_id, basin_scenario_id, &error);
+            assert(error.isEmpty());
+            if (status.value(QStringLiteral("state")) == QStringLiteral("completed"))
+            {
+                async_complete = true;
+                break;
+            }
+            assert(status.value(QStringLiteral("state")) != QStringLiteral("failed"));
+            QThread::msleep(5);
+        }
+        assert(async_complete);
+        const QJsonObject async_balance = service.rainfallRedistributionReady(
+            basin_job_id, basin_scenario_id, 0, 1, &error);
+        assert(error.isEmpty());
+        assert(async_balance.value(QStringLiteral("cache_hit")).toBool());
+        assert(async_balance.value(QStringLiteral("basins")) ==
+            basin_balance.value(QStringLiteral("basins")));
+        assert(!service.cancelRainfallRedistribution(basin_job_id, basin_scenario_id, &error));
+        assert(error == QStringLiteral("No active redistribution task"));
+        assert(service.startRainfallRedistribution(basin_job_id, basin_scenario_id,
+            &error).value(QStringLiteral("cache_ready")).toBool());
+        assert(error.isEmpty());
+
         assert(service.basins(basin_job_id, 1, 1, &error)
                .value(QStringLiteral("basins")).toArray().isEmpty());
         assert(service.basins(basin_job_id, 0, 0, &error).isEmpty());
@@ -370,6 +430,11 @@ int main(int argc, char **argv)
             basin_job_id, basin_scenario_id, 0, 1, &error);
         assert(error.isEmpty() && cached_after_restart.value(QStringLiteral("cache_hit")).toBool());
         assert(cached_after_restart.value(QStringLiteral("total_basins")).toInt() == 1);
+        const QJsonObject restarted_status = restored.rainfallRedistributionStatus(
+            basin_job_id, basin_scenario_id, &error);
+        assert(error.isEmpty() && restarted_status.value(QStringLiteral("cache_ready")).toBool());
+        assert(restarted_status.value(QStringLiteral("state")) == QStringLiteral("completed"));
+        assert(restarted_status.value(QStringLiteral("id")).isNull());
     }
 
     // An incomplete raster must be rejected even if its only missing cell is

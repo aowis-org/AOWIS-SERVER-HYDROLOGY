@@ -22,43 +22,50 @@ Map terrain -> completed Hydrology terrain job
                            `-- redistribution-v1.aowbin (derived, disposable cache)
 ```
 
-The derived file is built on demand at the **first successful redistribution
-query** for each rainfall scenario. It is not an independent analysis job or a
+The derived file is built by an asynchronous POST request (or the legacy
+synchronous in-process query) for each rainfall scenario. It is not an independent analysis job or a
 new AOWIS database entity. Changing query pagination never alters the stored
 physical result. Each scenario has its own cache; it cannot be shared across
 jobs or rainfall scenarios. Scenario and job IDs are UUIDs.
 
 ## Request lifecycle
 
-1. Verify that the terrain analysis is completed, the requested scenario UUID
-   exists, and `offset >= 0`, `1 <= limit <= 100`.
+1. Verify that the terrain analysis is completed and the requested scenario
+   UUID exists. Result-page queries additionally require `offset >= 0`,
+   `1 <= limit <= 100`.
 2. Read the scenario manifest and a **cheap metadata fingerprint** for the four
    immutable inputs (original elevation, basin archive, runoff, scenario manifest).
 3. If the cache exists and matches the current job/scenario UUIDs, grid
    dimensions, file fingerprint and archive version, validate its header and
    the requested page of records. Return the global totals and only those
    records. **No DEM is reloaded and no D8 routing is run.**
-4. If the cache is absent, stale, incomplete, or fails one of the integrity
-   checks, load the source DEM, hierarchy and per-cell runoff, then execute the
-   original static `redistributeRunoff()` calculation. Check mass conservation
-   and agreement with the scenario's effective runoff volume.
+4. If the cache is absent, stale, incomplete, or fails integrity checks,
+   **POST** schedules a background calculation: load the source DEM,
+   hierarchy and per-cell runoff, execute `redistributeRunoff()`, then check
+   mass conservation and agreement with the scenario's runoff volume.
+   Cache-only **GET** never executes this step; it reports not ready.
 5. Write the result with a Qt `QSaveFile`: the temporary file is committed
    atomically only when all records have been written. Read back the page
    using the normal cache reader and return it.
 
-Requests handled by one `AnalysisService` instance serialize cache validation
+Cache writers handled by one `AnalysisService` instance serialize validation
 and rebuilding with a mutex. This prevents duplicate work on simultaneous
 first-use requests in the same process. The cache file uses atomic replacement,
 so a process interruption before commit leaves either the previous complete
 cache or no cache; it does not publish a half-written result.
 
-**Limitations:** the first query is synchronous, can consume substantial CPU and
-RAM, and blocks its HTTP handler until complete. Later requests are bounded by
-page size for basin-record reads but still perform input-file metadata checks.
-There is not yet an asynchronous redistribution job, progress endpoint, or
-cancellation API at the service-query boundary. Independently running server
-processes are not coordinated by the in-process mutex; they may redundantly
-build the same deterministic derived cache.
+**Execution model:** the HTTP API schedules a background task using POST and
+reads only completed cache pages using GET. Missing, stale or damaged caches
+are not rebuilt by GET; instead GET returns `409 Conflict` and the caller
+submits POST. The legacy C++ `rainfallRedistribution()` remains synchronous
+and can block. Background computations still consume substantial CPU/RAM;
+the worker count and queued task count are bounded. Independently running
+server processes are not coordinated by the in-process mutex and may
+redundantly build the same deterministic derived cache.
+
+See [ASYNCHRONOUS_REDISTRIBUTION.md](ASYNCHRONOUS_REDISTRIBUTION.md) for task
+states, nonblocking HTTP operation, cancellation, restart behavior and the
+in-process API.
 
 ## REST response and pagination
 
@@ -69,9 +76,10 @@ GET /v1/jobs/{job-uuid}/rainfall-scenarios/{scenario-uuid}/redistribution?offset
 The JSON schema for all physical quantities and basin rows is unchanged.
 A new informational Boolean field is included:
 
-- `cache_hit: false` — this request performed a new redistribution calculation
-  and committed a fresh cache, whether because it was missing or invalid.
-- `cache_hit: true` — the result came from an existing, validated cache.
+- `cache_hit: false` — the legacy synchronous C++ request performed a fresh
+  calculation or rebuilt an invalidated result.
+- `cache_hit: true` — the result came from an existing, validated cache;
+  this is always true for the HTTP cache-only GET endpoint.
 
 It is not a physics flag; do not use it to interpret a water level or inundation
 area. Both paths return the same deterministic result, given unchanged inputs.
@@ -85,10 +93,12 @@ reads only that window; it **does not rerun the event**.
 # Replace the UUID placeholders with values returned by the preceding APIs.
 BASE=http://127.0.0.1:8123/v1/jobs/JOB_UUID/rainfall-scenarios/SCENARIO_UUID
 
-# Computes once, creates redistribution-v1.aowbin; normally cache_hit=false.
-curl "$BASE/redistribution?offset=0&limit=50"
+# Submit the calculation; poll until state=completed and cache_ready=true.
+curl -X POST "$BASE/redistribution"
+curl "$BASE/redistribution/status"
 
-# Reads the next page from that same result; normally cache_hit=true.
+# Both result pages are cache reads (normally cache_hit=true).
+curl "$BASE/redistribution?offset=0&limit=50"
 curl "$BASE/redistribution?offset=50&limit=50"
 
 # Restart the Hydrology server, then query again: the file is reused.
@@ -96,8 +106,10 @@ curl "$BASE/redistribution?offset=0&limit=50"
 ```
 
 The in-process API is
-`AnalysisService::rainfallRedistribution(jobUuid, scenarioUuid, offset, limit, &error)`;
-there is no separate HTTP-only implementation.
+`AnalysisService::rainfallRedistributionReady(jobUuid, scenarioUuid, offset, limit, &error)`
+for cache-only reads. The older `rainfallRedistribution(...)` C++ method
+remains available for synchronous calculation; the REST handler deliberately
+uses the cache-only method.
 
 ## Binary archive contract
 
@@ -186,5 +198,6 @@ For operations, start with a small synthetic or real complete DEM. Verify that
 `cache_hit` changes from false to true for consecutive reads, then restart the
 server and confirm it stays true. Compare global volume balance and selected
 basin IDs before and after restart. Keep the source file timestamps stable.
-On large datasets benchmark **first query**, **cached first page**, and
-**cached later page** separately; those measure very different work.
+On large datasets benchmark **first POST-to-completion duration**, **cached
+first page**, and **cached later page** separately; those measure very
+different work.

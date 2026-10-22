@@ -118,10 +118,31 @@ public:
     QJsonObject rainfallRedistribution(const QString &id, const QString &scenario_uuid,
                                        int offset, int limit, QString *error) const;
 
+    // Schedule a bounded background redistribution. Repeated submissions for
+    // one scenario return its active task, or the completed cached result.
+    // Task IDs are UUIDs; task states are transient, but result caches survive
+    // restarts. No HTTP or GUI dependency.
+    QJsonObject startRainfallRedistribution(const QString &id, const QString &scenario_uuid,
+                                           QString *error);
+    QJsonObject rainfallRedistributionStatus(const QString &id,
+                                              const QString &scenario_uuid,
+                                              QString *error) const;
+    bool cancelRainfallRedistribution(const QString &id, const QString &scenario_uuid,
+                                      QString *error);
+    // Cache-only result lookup: never runs a synchronous calculation.
+    QJsonObject rainfallRedistributionReady(const QString &id, const QString &scenario_uuid,
+                                            int offset, int limit, QString *error) const;
+
     static QByteArray layerMime(const QString &layer);
 
 private:
     struct Job;
+    struct RedistributionTask;
+    void runRedistributionTask(const QSharedPointer<RedistributionTask> &task);
+    QJsonObject rainfallRedistributionImpl(const QString &id, const QString &scenario_uuid,
+                                           int offset, int limit, bool allow_calculation,
+                                           const std::atomic<bool> *cancel_requested,
+                                           QString *error) const;
     QSharedPointer<Job> findJob(const QString &id) const;
     QJsonObject jobJson(const QSharedPointer<Job> &job) const;
     void restoreJobs();
@@ -132,6 +153,9 @@ private:
     ServiceConfig config;
     mutable QMutex jobs_mutex;
     mutable QMutex redistribution_cache_mutex;
+    mutable QMutex redistribution_tasks_mutex;
+    QHash<QString, QSharedPointer<RedistributionTask>> redistribution_tasks;
+    QThreadPool redistribution_workers;
     QHash<QString, QSharedPointer<Job>> job_map;
     QThreadPool workers;
 };

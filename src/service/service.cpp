@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -45,6 +46,16 @@ struct AnalysisService::Job
     double breach_excavation_m3 = 0.0;
     float maximum_breach_cut_m = 0.0f;
     std::uint64_t basin_count = 0;
+    std::atomic<bool> cancelled {false};
+};
+
+struct AnalysisService::RedistributionTask
+{
+    QString id;
+    QString analysis_id;
+    QString scenario_id;
+    QString state = QStringLiteral("queued");
+    QString error;
     std::atomic<bool> cancelled {false};
 };
 
@@ -184,7 +195,8 @@ DepressionHierarchy loadHierarchy(const QString &folder, std::uint32_t columns,
         columns, rows);
 }
 
-ElevationGrid loadOriginalElevation(const QString &folder, const ElevationGrid &geometry)
+ElevationGrid loadOriginalElevation(const QString &folder, const ElevationGrid &geometry,
+                                    const std::atomic<bool> *cancel_requested = nullptr)
 {
     const std::uint64_t cells = std::uint64_t(geometry.columns) * geometry.rows;
     QFile file(QDir(folder).filePath(QStringLiteral("elevation.f32")));
@@ -196,6 +208,8 @@ ElevationGrid loadOriginalElevation(const QString &folder, const ElevationGrid &
     std::uint64_t cell = 0;
     while (cell < cells)
     {
+        if (cancel_requested != nullptr && cancel_requested->load())
+            throw std::runtime_error("Runoff redistribution cancelled");
         const qsizetype take = qsizetype(std::min<std::uint64_t>(8192, cells - cell) * 4);
         if (file.read(buffer.data(), take) != take)
             throw std::runtime_error("Truncated source elevation raster");
@@ -436,6 +450,7 @@ AnalysisService::AnalysisService(const ServiceConfig &config)
     : config(config)
 {
     this->workers.setMaxThreadCount(1);
+    this->redistribution_workers.setMaxThreadCount(1);
 }
 
 AnalysisService::~AnalysisService()
@@ -453,6 +468,13 @@ AnalysisService::~AnalysisService()
                 job->cancelled.store(true);
         }
     }
+    {
+        QMutexLocker locker(&this->redistribution_tasks_mutex);
+        for (const QSharedPointer<RedistributionTask> &task :
+             std::as_const(this->redistribution_tasks))
+            task->cancelled.store(true);
+    }
+    this->redistribution_workers.waitForDone();
     this->workers.waitForDone();
 }
 
@@ -1656,7 +1678,8 @@ CachedRedistributionPage loadRedistributionPage(
 void writeRedistributionCache(const QString &path,
                               const RedistributionArchiveIdentity &identity,
                               const RunoffRedistribution &result,
-                              const DepressionHierarchy &hierarchy)
+                              const DepressionHierarchy &hierarchy,
+                              const std::atomic<bool> *cancel_requested)
 {
     if (result.basins.size() != hierarchy.basins.size())
         throw std::runtime_error("Redistribution hierarchy count mismatch");
@@ -1672,6 +1695,9 @@ void writeRedistributionCache(const QString &path,
     records.reserve(65536);
     for (std::size_t index = 0; index < result.basins.size(); ++index)
     {
+        if ((index & 4095U) == 0 && cancel_requested != nullptr &&
+            cancel_requested->load())
+            throw std::runtime_error("Runoff redistribution cancelled");
         RedistributionArchiveRecord row;
         row.state = result.basins[index];
         row.parent_index = hierarchy.basins[index].parent_index;
@@ -1687,6 +1713,8 @@ void writeRedistributionCache(const QString &path,
     }
     if (!records.isEmpty() && file.write(records) != records.size())
         throw std::runtime_error("Cannot write redistribution cache records");
+    if (cancel_requested != nullptr && cancel_requested->load())
+        throw std::runtime_error("Runoff redistribution cancelled");
     if (!file.commit())
         throw std::runtime_error("Cannot commit redistribution cache");
 }
@@ -1697,7 +1725,8 @@ void calculateAndCacheRedistribution(const QString &path,
                                      const QString &job_folder,
                                      const QString &scenario_folder,
                                      const QJsonObject &manifest,
-                                     const ElevationGrid &geometry)
+                                     const ElevationGrid &geometry,
+                                     const std::atomic<bool> *cancel_requested)
 {
     const std::uint64_t cells = std::uint64_t(geometry.columns) * geometry.rows;
     QFile raster(QDir(scenario_folder).filePath(QStringLiteral("runoff.f64")));
@@ -1708,6 +1737,8 @@ void calculateAndCacheRedistribution(const QString &path,
     std::uint64_t cell = 0;
     while (cell < cells)
     {
+        if (cancel_requested != nullptr && cancel_requested->load())
+            throw std::runtime_error("Runoff redistribution cancelled");
         const qsizetype take = qsizetype(std::min<std::uint64_t>(4096, cells - cell) * 8);
         if (raster.read(buffer.data(), take) != take)
             throw std::runtime_error("Incomplete rainfall scenario runoff raster");
@@ -1719,21 +1750,41 @@ void calculateAndCacheRedistribution(const QString &path,
             volume[std::size_t(cell++)] = value;
         }
     }
-    const ElevationGrid source = loadOriginalElevation(job_folder, geometry);
+    if (cancel_requested != nullptr && cancel_requested->load())
+        throw std::runtime_error("Runoff redistribution cancelled");
+    const ElevationGrid source = loadOriginalElevation(job_folder, geometry, cancel_requested);
+    if (cancel_requested != nullptr && cancel_requested->load())
+        throw std::runtime_error("Runoff redistribution cancelled");
     const DepressionHierarchy hierarchy = loadHierarchy(job_folder,
         geometry.columns, geometry.rows);
-    const RunoffRedistribution result = redistributeRunoff(source, hierarchy, volume);
+    const RunoffRedistribution result = redistributeRunoff(source, hierarchy, volume,
+                                                            cancel_requested);
     const double expected = manifest.value(QStringLiteral("effective_runoff_volume_m3")).toDouble();
     if (std::abs(expected - result.generated_runoff_m3) >
         1e-7 * std::max(1.0, std::abs(expected)))
         throw std::runtime_error("Rainfall runoff raster and scenario summary disagree");
-    writeRedistributionCache(path, identity, result, hierarchy);
+    writeRedistributionCache(path, identity, result, hierarchy, cancel_requested);
 }
 }
 
 QJsonObject AnalysisService::rainfallRedistribution(
     const QString &id, const QString &scenario_uuid,
     int offset, int limit, QString *error) const
+{
+    return rainfallRedistributionImpl(id, scenario_uuid, offset, limit, true, nullptr, error);
+}
+
+QJsonObject AnalysisService::rainfallRedistributionReady(
+    const QString &id, const QString &scenario_uuid,
+    int offset, int limit, QString *error) const
+{
+    return rainfallRedistributionImpl(id, scenario_uuid, offset, limit, false, nullptr, error);
+}
+
+QJsonObject AnalysisService::rainfallRedistributionImpl(
+    const QString &id, const QString &scenario_uuid, int offset, int limit,
+    bool allow_calculation, const std::atomic<bool> *cancel_requested,
+    QString *error) const
 {
     if (error != nullptr) error->clear();
     const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
@@ -1757,10 +1808,13 @@ QJsonObject AnalysisService::rainfallRedistribution(
         const RedistributionArchiveIdentity identity = redistributionIdentity(
             id, scenario_uuid, folder, scenario_folder, item->grid.columns, item->grid.rows);
 
-        // Prevent duplicate recalculation or simultaneous publication by
-        // requests handled by the same service instance. No work is queued:
-        // initial calculation remains synchronous (Stage 9 will change this).
-        QMutexLocker locker(&this->redistribution_cache_mutex);
+        // Computations serialize through one process-local mutex, but the
+        // cache-only reader never waits for an active calculation. QSaveFile
+        // publishes atomically, so concurrent readers see a complete file.
+        std::unique_lock<QMutex> locker(this->redistribution_cache_mutex, std::defer_lock);
+        if (allow_calculation) locker.lock();
+        if (cancel_requested != nullptr && cancel_requested->load())
+            throw std::runtime_error("Runoff redistribution cancelled");
         CachedRedistributionPage page;
         bool cache_hit = false;
         const double expected_runoff =
@@ -1783,8 +1837,10 @@ QJsonObject AnalysisService::rainfallRedistribution(
         }
         if (!cache_hit)
         {
+            if (!allow_calculation)
+                throw std::runtime_error("Redistribution result not ready; submit the calculation first");
             calculateAndCacheRedistribution(path, identity, folder, scenario_folder,
-                                             manifest, item->grid);
+                                             manifest, item->grid, cancel_requested);
             page = loadRedistributionPage(path, identity, offset, limit);
         }
         if (std::abs(page.header.summary.generated_runoff_m3 - expected_runoff) >
@@ -1832,5 +1888,178 @@ QJsonObject AnalysisService::rainfallRedistribution(
         if (error != nullptr) *error = QString::fromUtf8(ex.what());
         return {};
     }
+}
+
+namespace
+{
+QString redistributionTaskKey(const QString &analysis_id, const QString &scenario_id)
+{
+    return analysis_id + QLatin1Char('/') + scenario_id;
+}
+
+QJsonObject redistributionTaskJson(const QString &analysis_id, const QString &scenario_id,
+                                   const QString &task_id, const QString &state,
+                                   const QString &message, bool cached)
+{
+    return QJsonObject{
+        {QStringLiteral("id"), task_id.isEmpty() ? QJsonValue(QJsonValue::Null)
+                                               : QJsonValue(task_id)},
+        {QStringLiteral("job_id"), analysis_id},
+        {QStringLiteral("scenario_id"), scenario_id},
+        {QStringLiteral("state"), state},
+        {QStringLiteral("error"), message},
+        {QStringLiteral("cache_ready"), cached}
+    };
+}
+} // namespace
+
+QJsonObject AnalysisService::rainfallRedistributionStatus(
+    const QString &id, const QString &scenario_uuid, QString *error) const
+{
+    if (error != nullptr) error->clear();
+    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
+    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
+    {
+        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
+        return {};
+    }
+    try
+    {
+        const QString folder = jobDirectory(id);
+        const QString scenario_root = QDir(folder).filePath(QStringLiteral("rainfall-scenarios"));
+        const QJsonObject manifest = loadRainfallManifest(scenario_root, scenario_uuid);
+        const QString scenario_folder = QDir(scenario_root).filePath(scenario_uuid);
+        const RedistributionArchiveIdentity identity = redistributionIdentity(
+            id, scenario_uuid, folder, scenario_folder, item->grid.columns, item->grid.rows);
+        bool cache_ready = false;
+        try
+        {
+            const CachedRedistributionPage cached = loadRedistributionPage(
+                QDir(scenario_folder).filePath(QStringLiteral("redistribution-v1.aowbin")),
+                identity, 0, 1);
+            const double expected = manifest.value(QStringLiteral("effective_runoff_volume_m3")).toDouble();
+            cache_ready = std::abs(cached.header.summary.generated_runoff_m3 - expected) <=
+                1e-7 * std::max(1.0, std::abs(expected));
+        }
+        catch (const std::exception &)
+        {
+            // Missing/invalid derived data is reported as not ready.
+        }
+        QString task_id;
+        QString state = QStringLiteral("not_started");
+        QString message;
+        {
+            QMutexLocker locker(&this->redistribution_tasks_mutex);
+            const QSharedPointer<RedistributionTask> task = this->redistribution_tasks.value(
+                redistributionTaskKey(id, scenario_uuid));
+            if (task)
+            {
+                task_id = task->id;
+                state = task->state;
+                message = task->error;
+            }
+        }
+        if (cache_ready)
+        {
+            state = QStringLiteral("completed");
+            message.clear();
+        }
+        else if (state == QStringLiteral("completed"))
+            state = QStringLiteral("not_started"); // cache was invalidated after completion
+        return redistributionTaskJson(id, scenario_uuid, task_id, state, message, cache_ready);
+    }
+    catch (const std::exception &ex)
+    {
+        if (error != nullptr) *error = QString::fromUtf8(ex.what());
+        return {};
+    }
+}
+
+QJsonObject AnalysisService::startRainfallRedistribution(
+    const QString &id, const QString &scenario_uuid, QString *error)
+{
+    const QJsonObject current = rainfallRedistributionStatus(id, scenario_uuid, error);
+    if (current.isEmpty()) return {};
+    if (current.value(QStringLiteral("cache_ready")).toBool()) return current;
+    const QString key = redistributionTaskKey(id, scenario_uuid);
+    QSharedPointer<RedistributionTask> task;
+    {
+        QMutexLocker locker(&this->redistribution_tasks_mutex);
+        const QSharedPointer<RedistributionTask> existing = this->redistribution_tasks.value(key);
+        if (existing && (existing->state == QStringLiteral("queued") ||
+                         existing->state == QStringLiteral("running") ||
+                         existing->state == QStringLiteral("cancel_requested")))
+            return redistributionTaskJson(id, scenario_uuid, existing->id,
+                                          existing->state, existing->error, false);
+        std::size_t pending = 0;
+        for (const QSharedPointer<RedistributionTask> &entry :
+             std::as_const(this->redistribution_tasks))
+            if (entry->state == QStringLiteral("queued") ||
+                entry->state == QStringLiteral("running") ||
+                entry->state == QStringLiteral("cancel_requested"))
+                ++pending;
+        if (pending >= 8)
+        {
+            if (error != nullptr) *error = QStringLiteral("Redistribution queue full (8 active/queued jobs)");
+            return {};
+        }
+        task = QSharedPointer<RedistributionTask>::create();
+        task->id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        task->analysis_id = id;
+        task->scenario_id = scenario_uuid;
+        this->redistribution_tasks.insert(key, task);
+    }
+    this->redistribution_workers.start([this, task]() { runRedistributionTask(task); });
+    return redistributionTaskJson(id, scenario_uuid, task->id, QStringLiteral("queued"),
+                                  QString(), false);
+}
+
+void AnalysisService::runRedistributionTask(const QSharedPointer<RedistributionTask> &task)
+{
+    {
+        QMutexLocker locker(&this->redistribution_tasks_mutex);
+        if (!task->cancelled.load()) task->state = QStringLiteral("running");
+    }
+    QString error;
+    if (!task->cancelled.load())
+        rainfallRedistributionImpl(task->analysis_id, task->scenario_id, 0, 1,
+                                   true, &task->cancelled, &error);
+    {
+        QMutexLocker locker(&this->redistribution_tasks_mutex);
+        if (task->cancelled.load())
+        {
+            task->state = QStringLiteral("canceled");
+            task->error.clear();
+        }
+        else if (!error.isEmpty())
+        {
+            task->state = QStringLiteral("failed");
+            task->error = error;
+        }
+        else
+        {
+            task->state = QStringLiteral("completed");
+            task->error.clear();
+        }
+    }
+}
+
+bool AnalysisService::cancelRainfallRedistribution(
+    const QString &id, const QString &scenario_uuid, QString *error)
+{
+    if (error != nullptr) error->clear();
+    const QString key = redistributionTaskKey(id, scenario_uuid);
+    QMutexLocker locker(&this->redistribution_tasks_mutex);
+    const QSharedPointer<RedistributionTask> task = this->redistribution_tasks.value(key);
+    if (!task || (task->state != QStringLiteral("running") &&
+                  task->state != QStringLiteral("queued") &&
+                  task->state != QStringLiteral("cancel_requested")))
+    {
+        if (error != nullptr) *error = QStringLiteral("No active redistribution task");
+        return false;
+    }
+    task->cancelled.store(true);
+    task->state = QStringLiteral("cancel_requested");
+    return true;
 }
 } // namespace Aowis::Hydrology

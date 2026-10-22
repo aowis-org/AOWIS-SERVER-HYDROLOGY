@@ -79,10 +79,14 @@ and
 All IDs are UUIDs. A terrain job must be `completed` and contain its basin hierarchy. The scenario must already exist (Stage 7).
 
 ```http
+POST /v1/jobs/{job-uuid}/rainfall-scenarios/{scenario-uuid}/redistribution
+GET /v1/jobs/{job-uuid}/rainfall-scenarios/{scenario-uuid}/redistribution/status
 GET /v1/jobs/{job-uuid}/rainfall-scenarios/{scenario-uuid}/redistribution?offset=0&limit=50
+DELETE /v1/jobs/{job-uuid}/rainfall-scenarios/{scenario-uuid}/redistribution
 ```
 
-`offset` defaults to 0 and must be nonnegative. `limit` defaults to 50 and accepts 1–100. Pagination changes only the **basin rows returned**, not the computed global totals. The first successful query computes the redistribution and **atomically caches** its versioned result per scenario. Further pages and requests after server restart reuse the cache without recalculating D8 or reloading the DEM. A corrupt, outdated or incomplete cache is rebuilt from authoritative inputs. `cache_hit` in the response is `false` for calculation/rebuild and `true` for reuse. The initial solve **still runs synchronously** and can be expensive on large DEMs. Cache design, binary format, validation limits and recovery are documented in [REDISTRIBUTION_CACHE.md](REDISTRIBUTION_CACHE.md).
+`offset` defaults to 0 and must be nonnegative. `limit` defaults to 50 and accepts 1–100. Pagination changes only the **basin rows returned**, not the computed global totals. HTTP POST schedules computation in a bounded background queue and **atomically caches** its result per scenario. Poll `GET .../status` until `state=completed` and `cache_ready=true`. HTTP GET results is **cache-only**, returns `409 Conflict` until a valid cache exists, and never recomputes a missing or invalid cache. Re-submit POST to repair a stale/corrupt derived cache. Subsequent pages and requests after restart reuse the cache without recalculating D8 or reloading the DEM. HTTP result `cache_hit` is therefore true; for legacy synchronous in-process calls it is false when a new calculation ran. Cache design, binary format, validation limits and recovery are documented in [REDISTRIBUTION_CACHE.md](REDISTRIBUTION_CACHE.md) and
+[ASYNCHRONOUS_REDISTRIBUTION.md](ASYNCHRONOUS_REDISTRIBUTION.md).
 
 Example response values below illustrate the **schema and accounting**, not a specific real location:
 
@@ -183,4 +187,4 @@ Automated tests (`aowis-hydrology-redistribution`) cover zero/partial/full pit s
 ./compile_linux_tests.sh --both
 ```
 
-Versioned, paginated scenario caching is implemented (see [REDISTRIBUTION_CACHE.md](REDISTRIBUTION_CACHE.md)). Important remaining work: add an asynchronous redistribution job for large datasets, reliable water-level/depth maps and polygon windows, improve spill routing beyond the rectangular DEM domain, add robust cache content fingerprints and multi-process coordination, and benchmark/compare real DEMs with external hydrology software.
+Versioned, paginated scenario caching is implemented (see [REDISTRIBUTION_CACHE.md](REDISTRIBUTION_CACHE.md)). Background execution with cooperative cancellation is implemented, but progress percentage/ETA and durable task histories are not. Important remaining work: reliable water-level/depth maps and polygon windows, improve spill routing beyond the rectangular DEM domain, add robust cache content fingerprints and multi-process coordination, and benchmark/compare real DEMs with external hydrology software.
