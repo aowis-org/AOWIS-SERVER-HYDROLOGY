@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "benchmark": "synthetic_hydrology_core",
+  "columns": 1024,
+  "rows": 1024,
+  "cells": 1048576,
+  "cell_size_m": 30,
+  "crs": "EPSG:32632",
+  "terrain": "pitted",
+  "seed": 17,
+  "elevation_fingerprint_fnv64": "28c391d17bdd1d86",
+  "rain_mm": 35,
+  "runoff_fraction": 0.65,
+  "conditioned_cells": 372381,
+  "basin_count": 179581,
+  "generated_runoff_m3": 21486146.72,
+  "retained_m3": 21329264.11,
+  "direct_boundary_outflow_m3": 73090.63467,
+  "basin_boundary_outflow_m3": 83791.96792,
+  "total_boundary_outflow_m3": 156882.6026,
+  "mass_balance_error_m3": -2.508336911e-05,
+  "measured_stages_total_ms": 2573.298725,
+  "peak_process_rss_bytes": 120119296,
+  "stages": [
+    {"name": "synthetic_terrain", "wall_ms": 28.015321, "process_rss_bytes": 8994816},
+    {"name": "d8_conditioning", "wall_ms": 532.536182, "process_rss_bytes": 58847232},
+    {"name": "depression_hierarchy", "wall_ms": 1583.027572, "process_rss_bytes": 109670400},
+    {"name": "uniform_runoff_raster", "wall_ms": 1.237918, "process_rss_bytes": 109670400},
+    {"name": "static_redistribution", "wall_ms": 428.481732, "process_rss_bytes": 120119296}
+  ]
+}

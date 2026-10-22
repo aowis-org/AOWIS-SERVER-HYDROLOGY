@@ -92,6 +92,19 @@ cmake --build build-core --parallel
 ctest --test-dir build-core --output-on-failure -L hydrology
 ```
 
+### Reproducible performance benchmarks
+
+A separate, opt-in Qt-independent `aowis-hydrology-benchmark` executable
+runs actual D8 conditioning, original-DEM depression hierarchy construction,
+and static runoff redistribution on seeded synthetic 30 m terrain. It outputs
+per-stage timings, basin counts, Linux peak process memory, a DEM fingerprint,
+and validated water-volume balance as JSON. This **does not benchmark Map's
+DEM delivery, the persistent server, or time-dependent hydraulic routing**, and
+synthetic terrain is not reference hydrology data. Benchmarks are deliberately
+disabled in normal builds and regression suites. Full build instructions,
+workload profiles, JSON fields, and real-DEM validation methodology are in
+[docs/BENCHMARKING.md](docs/BENCHMARKING.md).
+
 ### Terrain input and ownership
 
 For a normal HTTP deployment, configure Hydrology to use the **Map** service:

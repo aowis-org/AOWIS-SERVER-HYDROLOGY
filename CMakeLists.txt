@@ -74,6 +74,24 @@ if(AOWIS_HYDROLOGY_WITH_GDAL)
     target_link_libraries(aowis-hydrology-raster PUBLIC AOWIS::Hydrology GDAL::GDAL)
 endif()
 
+# Benchmarks are deliberately opt-in: no synthetic million-cell workload is
+# included in ordinary service builds or the default regression suite.
+option(AOWIS_HYDROLOGY_BUILD_BENCHMARKS "Build reproducible synthetic Hydrology benchmarks" OFF)
+if(AOWIS_HYDROLOGY_BUILD_BENCHMARKS)
+    add_executable(aowis-hydrology-benchmark tools/benchmark_hydrology.cpp)
+    target_compile_features(aowis-hydrology-benchmark PRIVATE cxx_std_20)
+    target_link_libraries(aowis-hydrology-benchmark PRIVATE AOWIS::Hydrology)
+    if(BUILD_TESTING)
+        add_test(NAME aowis-hydrology-benchmark-smoke COMMAND aowis-hydrology-benchmark
+            --columns 32 --rows 24 --seed 17 --terrain pitted)
+        set_tests_properties(aowis-hydrology-benchmark-smoke PROPERTIES LABELS "hydrology;aowis;benchmark-smoke")
+        add_test(NAME aowis-hydrology-benchmark-input-limits COMMAND aowis-hydrology-benchmark
+            --columns 5000 --rows 5000)
+        set_tests_properties(aowis-hydrology-benchmark-input-limits PROPERTIES
+            LABELS "hydrology;aowis;benchmark-smoke" WILL_FAIL TRUE)
+    endif()
+endif()
+
 option(AOWIS_HYDROLOGY_BUILD_SERVER "Build the Qt REST hydrology server" ON)
 option(AOWIS_HYDROLOGY_BUILD_SERVICE "Build the reusable Qt job service (no HTTP server dependency)" ${AOWIS_HYDROLOGY_BUILD_SERVER})
 option(AOWIS_HYDROLOGY_USE_LOCAL_MAP "Use the AOWIS Map C++ library for embedded terrain access" OFF)
