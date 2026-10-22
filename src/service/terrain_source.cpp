@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -78,8 +79,36 @@ QByteArray fetchRemoteGrid(QNetworkAccessManager &manager, const SourceConfig &s
 }
 
 ElevationGrid readTerrain(const SourceConfig &source, const ElevationGrid &geometry,
-                          const QString &dataset, const std::atomic<bool> &cancel_requested)
+                          const QString &dataset, const std::atomic<bool> &cancel_requested,
+                          TerrainFetchMetrics *metrics)
 {
+    using Clock = std::chrono::steady_clock;
+    if (metrics != nullptr)
+        *metrics = TerrainFetchMetrics{};
+    const auto elapsedMs = [](const Clock::time_point &start)
+    {
+        return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+    };
+    const auto recordRequest = [metrics](const double duration_ms, const std::uint64_t response_bytes,
+                                          const QString &transport)
+    {
+        if (metrics == nullptr) return;
+        if (metrics->patch_count == 0)
+        {
+            metrics->transport = transport;
+            metrics->first_request_ms = duration_ms;
+            metrics->fastest_request_ms = duration_ms;
+            metrics->slowest_request_ms = duration_ms;
+        }
+        else
+        {
+            metrics->fastest_request_ms = std::min(metrics->fastest_request_ms, duration_ms);
+            metrics->slowest_request_ms = std::max(metrics->slowest_request_ms, duration_ms);
+        }
+        ++metrics->patch_count;
+        metrics->response_bytes += response_bytes;
+        metrics->map_request_ms += duration_ms;
+    };
     if (geometry.geometry.horizontal_crs != HorizontalCrs::Wgs84Geographic)
         throw std::invalid_argument("Map terrain patch interface currently requires EPSG:4326");
     if (source.patch_size < 1 || source.patch_size > 512)
@@ -119,11 +148,16 @@ ElevationGrid readTerrain(const SourceConfig &source, const ElevationGrid &geome
                 request.bounds = {west, south, east, north};
                 request.columns = patch_columns;
                 request.rows = patch_rows;
+                const Clock::time_point request_started = Clock::now();
                 const Aowis::Map::TerrainAnalysisGridResult result =
                     source.local_map->analysisGrid(request);
                 if (result.status != Aowis::Map::TerrainProviderFetchStatus::Ready ||
                     result.elevations_m.size() != patch_columns * patch_rows)
                     throw std::runtime_error(result.error_message.toStdString());
+                recordRequest(elapsedMs(request_started),
+                    std::uint64_t(patch_columns) * std::uint64_t(patch_rows) * sizeof(float),
+                    QStringLiteral("map_in_process"));
+                const Clock::time_point copy_started = Clock::now();
                 for (int local_row = 0; local_row < patch_rows; ++local_row)
                 {
                     const std::size_t start = std::size_t(row + local_row) * geometry.columns + column;
@@ -131,11 +165,17 @@ ElevationGrid readTerrain(const SourceConfig &source, const ElevationGrid &geome
                         grid.elevations_m[start + std::size_t(local_col)] =
                             result.elevations_m[local_row * patch_columns + local_col];
                 }
+                if (metrics != nullptr)
+                    metrics->raster_copy_ms += elapsedMs(copy_started);
                 continue;
             }
 #endif
+            const Clock::time_point request_started = Clock::now();
             const QByteArray bytes = fetchRemoteGrid(
                 manager, source, dataset, west, south, east, north, patch_columns, patch_rows);
+            recordRequest(elapsedMs(request_started), std::uint64_t(bytes.size()),
+                QStringLiteral("map_http"));
+            const Clock::time_point copy_started = Clock::now();
             for (int local_row = 0; local_row < patch_rows; ++local_row)
             {
                 const std::size_t target = std::size_t(row + local_row) * geometry.columns + column;
@@ -149,6 +189,8 @@ ElevationGrid readTerrain(const SourceConfig &source, const ElevationGrid &geome
                     grid.elevations_m[target + std::size_t(local_col)] = elevation;
                 }
             }
+            if (metrics != nullptr)
+                metrics->raster_copy_ms += elapsedMs(copy_started);
         }
     }
     return grid;

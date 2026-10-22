@@ -186,6 +186,8 @@ int main(int argc, char **argv)
         assert(bad_finished);
         const QJsonObject completed = service.job(successful_id);
         const QJsonObject timings = completed.value(QStringLiteral("stage_timings_ms")).toObject();
+        // Custom terrain_reader callbacks have no Map patch timings to report.
+        assert(!completed.contains(QStringLiteral("terrain_fetch_details")));
         const QStringList stage_names{
             QStringLiteral("terrain_fetch"), QStringLiteral("terrain_validation"),
             QStringLiteral("d8_analysis"), QStringLiteral("raster_persistence"),
@@ -599,10 +601,15 @@ int main(int argc, char **argv)
         assert(error.isEmpty());
         const QString task_id = started.value(QStringLiteral("id")).toString();
         assert(!QUuid(QStringLiteral("{") + task_id + QStringLiteral("}")).isNull());
-        const QJsonObject duplicate = service.startRainfallRedistribution(
-            basin_job_id, basin_scenario_id, &error);
-        assert(error.isEmpty());
-        assert(duplicate.value(QStringLiteral("id")).toString() == task_id);
+        // Repeated submissions are idempotent whether the task is still
+        // queued, running, or has just published its cache.
+        for (int attempt = 0; attempt < 32; ++attempt)
+        {
+            const QJsonObject duplicate = service.startRainfallRedistribution(
+                basin_job_id, basin_scenario_id, &error);
+            assert(error.isEmpty());
+            assert(duplicate.value(QStringLiteral("id")).toString() == task_id);
+        }
         QElapsedTimer redistribution_timer;
         redistribution_timer.start();
         bool async_complete = false;
@@ -620,6 +627,13 @@ int main(int argc, char **argv)
             QThread::msleep(5);
         }
         assert(async_complete);
+        // Deterministic completed-task path: the committed archive is reused
+        // together with its original task identity.
+        const QJsonObject finished_redistribution = service.startRainfallRedistribution(
+            basin_job_id, basin_scenario_id, &error);
+        assert(error.isEmpty() && finished_redistribution.value(
+            QStringLiteral("cache_ready")).toBool());
+        assert(finished_redistribution.value(QStringLiteral("id")).toString() == task_id);
         const QJsonObject async_balance = service.rainfallRedistributionReady(
             basin_job_id, basin_scenario_id, 0, 1, &error);
         assert(error.isEmpty());
@@ -640,10 +654,15 @@ int main(int argc, char **argv)
         const QJsonObject depth_task = service.startStaticInundation(
             basin_job_id, basin_scenario_id, &error);
         assert(error.isEmpty() && !depth_task.value(QStringLiteral("id")).toString().isEmpty());
-        const QJsonObject depth_duplicate = service.startStaticInundation(
-            basin_job_id, basin_scenario_id, &error);
-        assert(error.isEmpty() && depth_duplicate.value(QStringLiteral("id")) ==
-            depth_task.value(QStringLiteral("id")));
+        // The same UUID must survive the worker completing between the
+        // initial cache probe and the task lookup in a duplicate POST.
+        for (int attempt = 0; attempt < 32; ++attempt)
+        {
+            const QJsonObject depth_duplicate = service.startStaticInundation(
+                basin_job_id, basin_scenario_id, &error);
+            assert(error.isEmpty() && depth_duplicate.value(QStringLiteral("id")) ==
+                depth_task.value(QStringLiteral("id")));
+        }
         QElapsedTimer depth_timer;
         depth_timer.start();
         bool depth_complete = false;
@@ -667,6 +686,11 @@ int main(int argc, char **argv)
             QThread::msleep(5);
         }
         assert(depth_complete);
+        // A completed, valid inundation cache keeps the original UUID.
+        const QJsonObject completed_depth = service.startStaticInundation(
+            basin_job_id, basin_scenario_id, &error);
+        assert(error.isEmpty() && completed_depth.value(QStringLiteral("cache_ready")).toBool());
+        assert(completed_depth.value(QStringLiteral("id")) == depth_task.value(QStringLiteral("id")));
         const QByteArray depth_cell = service.staticInundationDepthWindow(
             basin_job_id, basin_scenario_id, middle_x, middle_y, 1, 1, &error);
         assert(error.isEmpty() && depth_cell.size() == 4);
@@ -698,6 +722,7 @@ int main(int argc, char **argv)
         const QJsonObject refresh = service.startStaticInundation(
             basin_job_id, basin_scenario_id, &error);
         assert(error.isEmpty() && !refresh.value(QStringLiteral("id")).toString().isEmpty());
+        assert(refresh.value(QStringLiteral("id")) != depth_task.value(QStringLiteral("id")));
         depth_timer.restart();
         depth_complete = false;
         while (depth_timer.elapsed() < 10000)

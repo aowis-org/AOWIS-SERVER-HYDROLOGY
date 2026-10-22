@@ -291,6 +291,24 @@ def run(args):
             math.isfinite(value) and value >= 0 for value in stage_timings.values())):
         raise BenchmarkError("Hydrology returned invalid server stage timings")
     report["server_stage_timings_ms"] = stage_timings
+    details = metadata.get("terrain_fetch_details")
+    if details is not None:
+        numeric_fields = ("patch_count", "response_bytes", "map_request_ms", "raster_copy_ms",
+                          "first_request_ms", "fastest_request_ms", "slowest_request_ms")
+        if (not isinstance(details, dict) or
+            details.get("transport") not in ("map_http", "map_in_process") or
+            any(not isinstance(details.get(field), (int, float)) or
+                isinstance(details.get(field), bool) or
+                not math.isfinite(details[field]) or details[field] < 0
+                for field in numeric_fields) or
+            not float(details["patch_count"]).is_integer() or
+            not float(details["response_bytes"]).is_integer() or
+            details["patch_count"] < 1 or
+            details["fastest_request_ms"] > details["slowest_request_ms"] or
+            details["first_request_ms"] > details["slowest_request_ms"] or
+            details["first_request_ms"] < details["fastest_request_ms"]):
+            raise BenchmarkError("Hydrology returned invalid terrain fetch details")
+    report["server_terrain_fetch_details"] = details
     report["source_dataset"] = metadata.get("dataset")
     report["vertical_datum"] = metadata.get("vertical_datum")
 

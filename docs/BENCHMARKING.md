@@ -200,6 +200,133 @@ For a robust estimate, repeat several new jobs after accounting for Map's
 source cache and OS load. Client-side `map_sample_requests` is a separate
 benchmark of Map's sampling endpoint, not Hydrology's connection reuse.
 
+## Per-job Map patch diagnostics
+
+The live 352 × 556 GLO-30 comparison following Qt HTTP session reuse
+produced `terrain_fetch = 288.34 ms` and `total_worker = 559.58 ms`, compared
+with `225.26 ms` and `530.12 ms` respectively in the earlier run. All 18
+Hydrology regression tests passed in Debug and Release and the DEM comparison
+remained byte-identical. **Connection reuse has therefore not demonstrated a
+speedup on this host.** One unpaired timing per build is insufficient to
+attribute the difference to Qt or Map; Map tile processing and machine load
+have not been held constant. Retain connection reuse for its predictable
+per-job connection lifetime, not as a proven performance optimization.
+
+To distinguish Map request cost from Hydrology raster assembly, new terrain
+jobs also publish `terrain_fetch_details` in `GET /v1/jobs/{id}` and their
+persisted `job.json`. The Python live benchmark copies this object verbatim
+to `server_terrain_fetch_details`. It is an additive metadata field, absent
+for older jobs and for a caller-supplied `ServiceConfig::terrain_reader`.
+
+Illustrative shape (the numbers below are *not* field measurements):
+
+```json
+"terrain_fetch_details": {
+  "transport": "map_http",
+  "patch_count": 6,
+  "response_bytes": 782848,
+  "map_request_ms": 210.0,
+  "raster_copy_ms": 2.0,
+  "first_request_ms": 70.0,
+  "fastest_request_ms": 20.0,
+  "slowest_request_ms": 70.0
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `transport` | `map_http` for REST, `map_in_process` for a borrowed Map object |
+| `patch_count` | Number of successful Map analysis-grid patches assembled |
+| `response_bytes` | Total raw float32 sample bytes (excluding HTTP headers); identical for the two modes on equal grids |
+| `map_request_ms` | Sum of per-patch synchronous Map call wall times, including server work, transport, Qt reply decoding and payload validation on HTTP; **not** network-only latency |
+| `raster_copy_ms` | Time spent decoding/copying the returned float values into the full DEM |
+| `first_request_ms` | First successful Map patch call duration |
+| `fastest_request_ms`, `slowest_request_ms` | Extremal per-patch Map call durations, not percentiles |
+
+`map_request_ms + raster_copy_ms` is bounded by (and normally slightly less
+than) `stage_timings_ms.terrain_fetch`: the latter also contains setup,
+request geometry and other per-job overhead. This is **not** a decomposition
+of Map's internal processing time versus TCP latency: that would require
+additional Map-side instrumentation. The diagnostics use steady-clock wall
+time, are local to each worker, and have constant memory overhead regardless
+of number of patches. They do not retain coordinates, full payloads or
+per-patch logs, and do not alter grid values or requests. Both HTTP and the
+standalone in-process Map route report the same fields.
+
+Compare repeated *new* jobs with the same bounds/resolution, identical Map
+cache policy, and no unrelated load. Because `terrain_fetch_details` and
+`stage_timings_ms` are persisted, they can also be retrieved by
+`--existing-job` after restarting Hydrology. Measure multiple independent
+runs and report medians and spread, rather than comparing individual jobs.
+
+### Repeated new-job terrain acquisition measurements
+
+`tools/benchmark_map_series.py` automates this exact methodology using only
+Python 3's standard library. Unlike `benchmark_map_http.py --repeats 5`
+(which times **five cached result queries from one analysis job**),
+`--runs 5` creates **five independent Hydrology analysis jobs** and gathers
+five server-side terrain-fetch and worker timing observations. It retains the
+full per-job JSON reports, job IDs, source hashes and water-analysis counts.
+The runner neither removes persisted jobs nor restarts Map/Hydrology.
+
+Run this **after** compiling and restarting the instrumented Hydrology server
+and ensuring both ports 8122 (Map) and 8123 (Hydrology) are available:
+
+```bash
+./tools/benchmark_map_series.py \
+  --hydrology-url http://127.0.0.1:8123 \
+  --map-url http://127.0.0.1:8122 \
+  --west 8.600 --south 50.650 \
+  --east 8.750 --north 50.800 \
+  --resolution-m 30 --source-patch-size 256 \
+  --poll-seconds 0.05 --runs 5 --repeats 1 \
+  > benchmark-map-series.json
+
+# Compact summary. This extracts server-side worker measurements, not a
+# replay of the Map endpoint from the benchmark's parity check.
+jq '{
+  jobs: .measured_jobs, patches: .patch_count_per_job,
+  fetch_ms: .timing_distributions_ms.terrain_fetch,
+  map_calls_ms: .timing_distributions_ms.map_request_ms,
+  copy_ms: .timing_distributions_ms.raster_copy_ms,
+  residual_ms: .timing_distributions_ms.fetch_unattributed_ms,
+  map_share_pct: .share_distributions_pct.request_of_fetch_pct,
+  worker_ms: .timing_distributions_ms.total_worker
+}' benchmark-map-series.json
+```
+
+The output includes `timing_distributions_ms`,
+`share_distributions_pct`, and a `jobs` array containing each original
+report. Summaries provide each ordered sample list, min, median, mean and
+nearest-rank p90 (descriptive only: five jobs are not enough for a reliable
+p90 estimate). `fetch_unattributed_ms` is the measured `terrain_fetch` minus
+Map-call and raster-copy times and can include Qt event-loop setup, patch
+geometry and other worker overhead. **It is not TCP latency.** Per-run
+percentages are summarized from individual run ratios, not ratios of
+rounded median timings.
+
+Run identity is enforced: the full-raster dimensions, dataset, basin count,
+conditioned-cell count, and queried elevation-window SHA-256 must agree
+across measured jobs. Reusing a job ID, corrupt server timings, incompatible
+patch metrics, and Map/Hydrology parity failures (when `--map-url` is enabled) abort the series rather than
+quietly producing misleading averages. The tool needs the server's
+`stage_timings_ms` and `terrain_fetch_details`; older jobs or an old server
+are not sufficient. `--source-patch-size` must match `terrain/patch_size`.
+Preflight `--max-cells` applies to **each** job; `--runs` is bounded to
+2–20 and optional `--warmup-runs` to 0–5. **Every warmup creates another
+persisted analysis** but its data are not included in the distribution.
+The default is no warmup. Use `--inter-run-seconds 0.5` to separate runs
+when desired (maximum 30 s). If the series fails, previously created jobs
+remain available; the error names the failed run. There is no claim that
+these runs measure cold Map data: source-tile and OS caches can already be
+warm, even on the first job.
+
+Interpretation: if `map_request_ms` takes nearly all of `terrain_fetch`,
+further Hydrology raster-copy microoptimizations cannot materially improve
+acquisition time. To distinguish Map's DEM sampling CPU from HTTP delivery,
+we must instrument **AOWIS-SERVER-MAP** separately; the present service
+measurements cannot distinguish those two costs.
+
 ## Verification and reference comparisons
 
 The benchmark ensures **internal conservation**, not physical correctness.

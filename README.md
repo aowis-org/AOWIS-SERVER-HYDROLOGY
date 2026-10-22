@@ -104,6 +104,12 @@ synthetic terrain is not reference hydrology data. Benchmarks are deliberately
 disabled in normal builds and regression suites. Full build instructions,
 workload profiles, JSON fields, and real-DEM validation methodology are in
 [docs/BENCHMARKING.md](docs/BENCHMARKING.md). A separate, standard-library-only
+`tools/benchmark_map_series.py` submits a bounded series of fresh Map-sourced
+Hydrology jobs and compares server-side Map-call, raster-copy and worker-stage
+timing distributions, while verifying DEM hashes and basin-result identity.
+Use it after starting the instrumented server; the single-job
+`benchmark_map_http.py --repeats` option only repeats saved-result reads.
+
 `tools/benchmark_map_http.py` benchmarks a live Map → Hydrology terrain job,
 repeated bounded raster and basin queries, DEM window parity between Map and
 Hydrology, and persisted-job reads after restart. It creates no local DEM
@@ -420,5 +426,10 @@ travel time or discharge.
 Completed terrain jobs expose persisted `stage_timings_ms` in their job
 metadata: Map/terrain acquisition, validation, D8 computation, raster writes,
 basin hierarchy, basin-archive writes, and total worker time. The opt-in live
-benchmark includes these values in `server_stage_timings_ms`; see
-[`docs/BENCHMARKING.md`](docs/BENCHMARKING.md) for units and interpretation.
+benchmark includes these values in `server_stage_timings_ms`. Map-sourced jobs
+also retain bounded `terrain_fetch_details` (number/bytes of source patches,
+Map call wall time, DEM copy time and first/fastest/slowest patch timings);
+the client exposes them as `server_terrain_fetch_details`. A custom injected
+terrain reader does not invent Map diagnostics. See
+[`docs/BENCHMARKING.md`](docs/BENCHMARKING.md) for units, limitations and
+repeatable real-terrain measurements.

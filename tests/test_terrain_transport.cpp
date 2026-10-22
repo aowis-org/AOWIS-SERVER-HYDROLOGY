@@ -110,8 +110,17 @@ int main(int argc, char **argv)
     source.patch_size = 3;
     source.request_timeout_ms = 5000;
     const std::atomic<bool> running{false};
+    TerrainFetchMetrics metrics;
     const ElevationGrid loaded = readTerrain(source, geometry,
-        QStringLiteral("copernicus-glo30"), running);
+        QStringLiteral("copernicus-glo30"), running, &metrics);
+    assert(metrics.transport == QStringLiteral("map_http"));
+    assert(metrics.patch_count == 6);
+    assert(metrics.response_bytes == 7ULL * 5ULL * sizeof(float));
+    assert(std::isfinite(metrics.map_request_ms) && metrics.map_request_ms >= 0.0);
+    assert(std::isfinite(metrics.raster_copy_ms) && metrics.raster_copy_ms >= 0.0);
+    assert(metrics.fastest_request_ms <= metrics.first_request_ms);
+    assert(metrics.first_request_ms <= metrics.slowest_request_ms);
+    assert(metrics.slowest_request_ms <= metrics.map_request_ms + 0.001);
     assert(requests == 6); // 7x5 cells acquired in 3x3 source patches.
     // A persistent HTTP/1.1 server should see one connection per terrain job,
     // not a new TCP connection for each patch.

@@ -59,7 +59,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             "rows": 4, "basin_count": 1, "conditioned_cells": 2, "dataset": "copernicus-glo30",
                             "vertical_datum": "EGM2008", "stage_timings_ms": {
                                 "terrain_fetch": 3.0, "depression_hierarchy": 5.0,
-                                "total_worker": 12.0}, "west": 8.0, "north": 50.0,
+                                "total_worker": 12.0}, "terrain_fetch_details": {
+                                    "transport": "map_http", "patch_count": 1, "response_bytes": 64,
+                                    "map_request_ms": 2.2, "raster_copy_ms": 0.1,
+                                    "first_request_ms": 2.2, "fastest_request_ms": 2.2,
+                                    "slowest_request_ms": 2.2}, "west": 8.0, "north": 50.0,
                             "step_lon_deg": 0.0004, "step_lat_deg": 0.0004})
         elif path.endswith("/raster/elevation"):
             from urllib.parse import parse_qs, urlsplit
@@ -122,10 +126,25 @@ class LiveBenchmarkTests(unittest.TestCase):
             "terrain_fetch": 3.0, "depression_hierarchy": 5.0,
             "total_worker": 12.0})
         self.assertTrue(result["map_hydrology_parity"]["exact_bytes_equal"])
+        self.assertEqual(result["server_terrain_fetch_details"]["patch_count"], 1)
+        self.assertEqual(result["server_terrain_fetch_details"]["map_request_ms"], 2.2)
         self.assertEqual(result["elevation_window"]["count"], 2)
         self.assertEqual(Handler.state["post_count"], 1)
         self.assertEqual(Handler.state["map_key"], "secret-example")
         self.assertNotIn("secret-example", json.dumps(result))
+
+    def test_invalid_map_fetch_diagnostics_rejected(self):
+        original = benchmark.http_json
+
+        def invalid_details(base, path, timeout, **kwargs):
+            payload, duration = original(base, path, timeout, **kwargs)
+            if path == "/v1/jobs/00000000-0000-4000-8000-000000000001":
+                payload["terrain_fetch_details"]["patch_count"] = -1
+            return payload, duration
+
+        with mock.patch.object(benchmark, "http_json", side_effect=invalid_details):
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "invalid terrain fetch details"):
+                benchmark.run(self.args())
 
     def test_existing_job_never_posts(self):
         result = benchmark.run(self.args("--existing-job", "00000000-0000-4000-8000-000000000001"))

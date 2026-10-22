@@ -136,7 +136,7 @@ Valid derived outputs survive a service restart. Transient worker UUIDs and queu
 ### Resource, concurrency, and cancellation policy
 
 - The reconstruction uses the existing single-worker derived-analysis thread pool, shared with redistribution. Only one derived task executes at a time, avoiding simultaneous large terrain allocations.
-- At most **eight inundation tasks** may be running/queued in one service instance. Duplicate POSTs for the same scenario reuse its existing task.
+- At most **eight inundation tasks** may be running/queued in one service instance. Duplicate POSTs for the same scenario reuse the **same task UUID** while the work is queued, running, or has just completed with a valid cache. The submission path rechecks a completed task's committed cache under the task-table lock, avoiding a race between its initial cache lookup and worker completion. If the cache is missing, stale, or invalidated after completion, a new POST creates a new UUID and rebuilds it.
 - The raster reconstruction uses the server's `maximum_cells` limit and an additional **100,000-row** limit for per-row checksum metadata. It remains an in-memory algorithm, not an out-of-core solver.
 - Cancellation is cooperative during data loading, basin reconstruction and file writing. It is not guaranteed to stop instantly. A cancellation request does not delete an already completed immutable cache.
 - Derived cache creation reads all required original DEM elevations and the basin hierarchy. Subsequent window GETs read only requested raster rows plus their metadata.

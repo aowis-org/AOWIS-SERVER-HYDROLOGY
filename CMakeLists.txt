@@ -96,6 +96,11 @@ if(AOWIS_HYDROLOGY_BUILD_BENCHMARKS)
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_benchmark_map_http.py")
             set_tests_properties(aowis-hydrology-benchmark-map-http-mock PROPERTIES
                 LABELS "hydrology;aowis;benchmark-smoke")
+            add_test(NAME aowis-hydrology-benchmark-map-series-mock
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_benchmark_map_series.py")
+            set_tests_properties(aowis-hydrology-benchmark-map-series-mock PROPERTIES
+                LABELS "hydrology;aowis;benchmark-smoke")
         endif()
     endif()
 endif()

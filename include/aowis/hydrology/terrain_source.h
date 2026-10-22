@@ -6,6 +6,7 @@
 #include <QString>
 #include <QUrl>
 #include <atomic>
+#include <cstdint>
 
 namespace Aowis::Map { class TerrainData; }
 
@@ -25,10 +26,28 @@ struct SourceConfig
 #endif
 };
 
+// Optional, fixed-size per-terrain-job diagnostics. Timings are monotonic wall
+// times; map_request_ms includes Map computation, network transport and reply
+// handling, not just TCP overhead. raster_copy_ms covers placing/decompressing
+// float samples into the analysis raster. There is no unbounded per-patch log.
+struct TerrainFetchMetrics
+{
+    QString transport; // "map_http" or "map_in_process"
+    std::uint64_t patch_count = 0;
+    std::uint64_t response_bytes = 0;
+    double map_request_ms = 0.0;
+    double raster_copy_ms = 0.0;
+    double first_request_ms = 0.0;
+    double fastest_request_ms = 0.0;
+    double slowest_request_ms = 0.0;
+};
+
 // Uses Map's bounded source-precision raster contract for either transport.
 // No direct Copernicus requests and no second DEM provider implementation.
+// The optional metrics are local to this invocation; they are not thread-shared.
 ElevationGrid readTerrain(const SourceConfig &source, const ElevationGrid &geometry,
-                          const QString &dataset, const std::atomic<bool> &cancel_requested);
+                          const QString &dataset, const std::atomic<bool> &cancel_requested,
+                          TerrainFetchMetrics *metrics = nullptr);
 
 }
 #endif

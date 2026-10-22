@@ -156,7 +156,7 @@ any borrowed Map instance must outlive `AnalysisService`.
   This prevents unbounded simultaneous DEM/runoff/hierarchy loads.
 - At most **eight** background redistribution tasks may be active or queued
   per service instance. Additional requests receive a queue-full error.
-- Requests for the same scenario are idempotent while queued or running.
+- Requests for the same scenario are idempotent while queued, running, or after successful completion with a valid derived cache. A completed result is revalidated under the task-table lock before allocating another UUID, closing the completion window between the initial status check and the duplicate-task lookup. A missing, damaged, or stale cache is not reused; submitting again creates a new task.
 - Concurrent caches are published atomically using Qt `QSaveFile`; clients
   never see a partially committed binary file.
 - The existing process-local cache mutex serializes writers, including

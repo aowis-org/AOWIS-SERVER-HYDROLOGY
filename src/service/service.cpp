@@ -49,6 +49,7 @@ struct AnalysisService::Job
     float maximum_breach_cut_m = 0.0f;
     std::uint64_t basin_count = 0;
     QJsonObject stage_timings_ms;
+    QJsonObject terrain_fetch_details;
     std::atomic<bool> cancelled {false};
 };
 
@@ -561,6 +562,8 @@ QJsonObject AnalysisService::jobJson(const QSharedPointer<Job> &job) const
     result.insert(QStringLiteral("maximum_potential_fill_m"), double(job->maximum_potential_fill_m));
     result.insert(QStringLiteral("basin_count"), double(job->basin_count));
     result.insert(QStringLiteral("stage_timings_ms"), job->stage_timings_ms);
+    if (!job->terrain_fetch_details.isEmpty())
+        result.insert(QStringLiteral("terrain_fetch_details"), job->terrain_fetch_details);
     return result;
 }
 
@@ -618,6 +621,7 @@ void AnalysisService::restoreJobs()
         job->maximum_potential_fill_m = float(saved.value(QStringLiteral("maximum_potential_fill_m")).toDouble());
         job->basin_count = std::uint64_t(saved.value(QStringLiteral("basin_count")).toDouble());
         job->stage_timings_ms = saved.value(QStringLiteral("stage_timings_ms")).toObject();
+        job->terrain_fetch_details = saved.value(QStringLiteral("terrain_fetch_details")).toObject();
         bool missing_basin_archive = false;
         if (job->state == QStringLiteral("completed") &&
             !QFileInfo::exists(QDir(jobDirectory(id)).filePath(QStringLiteral("basins.aowbin"))))
@@ -670,10 +674,27 @@ void AnalysisService::runJob(const QSharedPointer<Job> &job)
         }
         writeManifest(job);
         const Clock::time_point fetch_started = Clock::now();
+        TerrainFetchMetrics fetch_metrics;
         ElevationGrid source = this->config.terrain_reader
             ? this->config.terrain_reader(job->grid, job->dataset, job->cancelled)
-            : readTerrain(this->config.source, job->grid, job->dataset, job->cancelled);
+            : readTerrain(this->config.source, job->grid, job->dataset,
+                          job->cancelled, &fetch_metrics);
         record_stage(QStringLiteral("terrain_fetch"), fetch_started);
+        if (!this->config.terrain_reader && fetch_metrics.patch_count > 0)
+        {
+            const QJsonObject details{
+                {QStringLiteral("transport"), fetch_metrics.transport},
+                {QStringLiteral("patch_count"), double(fetch_metrics.patch_count)},
+                {QStringLiteral("response_bytes"), double(fetch_metrics.response_bytes)},
+                {QStringLiteral("map_request_ms"), fetch_metrics.map_request_ms},
+                {QStringLiteral("raster_copy_ms"), fetch_metrics.raster_copy_ms},
+                {QStringLiteral("first_request_ms"), fetch_metrics.first_request_ms},
+                {QStringLiteral("fastest_request_ms"), fetch_metrics.fastest_request_ms},
+                {QStringLiteral("slowest_request_ms"), fetch_metrics.slowest_request_ms}
+            };
+            QMutexLocker locker(&this->jobs_mutex);
+            job->terrain_fetch_details = details;
+        }
         const Clock::time_point validation_started = Clock::now();
         if (source.columns != job->grid.columns || source.rows != job->grid.rows ||
             source.geometry.origin_x != job->grid.geometry.origin_x ||
@@ -2043,6 +2064,39 @@ QJsonObject AnalysisService::startRainfallRedistribution(
                          existing->state == QStringLiteral("cancel_requested")))
             return redistributionTaskJson(id, scenario_uuid, existing->id,
                                           existing->state, existing->error, false);
+        if (existing && existing->state == QStringLiteral("completed"))
+        {
+            // The cache might have been published after the initial status
+            // check, but before this lock was acquired. A completed worker
+            // has already committed its result. Revalidate that result before
+            // replacing its UUID; invalidated caches must still regenerate.
+            try
+            {
+                const QSharedPointer<Job> job_item = findJob(id);
+                const QString folder = jobDirectory(id);
+                const QString scenario_root = QDir(folder).filePath(
+                    QStringLiteral("rainfall-scenarios"));
+                const QJsonObject rainfall = loadRainfallManifest(
+                    scenario_root, scenario_uuid);
+                const QString scenario_folder = QDir(scenario_root).filePath(scenario_uuid);
+                const RedistributionArchiveIdentity identity = redistributionIdentity(
+                    id, scenario_uuid, folder, scenario_folder,
+                    job_item->grid.columns, job_item->grid.rows);
+                const CachedRedistributionPage cached = loadRedistributionPage(
+                    QDir(scenario_folder).filePath(QStringLiteral("redistribution-v1.aowbin")),
+                    identity, 0, 1);
+                const double expected = rainfall.value(
+                    QStringLiteral("effective_runoff_volume_m3")).toDouble();
+                if (std::abs(cached.header.summary.generated_runoff_m3 - expected) <=
+                    1e-7 * std::max(1.0, std::abs(expected)))
+                    return redistributionTaskJson(id, scenario_uuid, existing->id,
+                        QStringLiteral("completed"), QString(), true);
+            }
+            catch (const std::exception &)
+            {
+                // A stale or damaged result is not reusable.
+            }
+        }
         std::size_t pending = 0;
         for (const QSharedPointer<RedistributionTask> &entry :
              std::as_const(this->redistribution_tasks))
@@ -2424,6 +2478,29 @@ QJsonObject AnalysisService::startStaticInundation(
                          existing->state == QStringLiteral("cancel_requested")))
             return inundationTaskJson(id, scenario_uuid, existing->id, existing->state,
                                       existing->error, {});
+        if (existing && existing->state == QStringLiteral("completed"))
+        {
+            // The cache can be committed between the initial status lookup
+            // and the task-table lookup. Keep the successful worker's UUID if
+            // its result is still valid, even for a very fast reconstruction.
+            try
+            {
+                const QSharedPointer<Job> job_item = findJob(id);
+                const QString folder = jobDirectory(id);
+                const QString scenario_folder = QDir(folder).filePath(
+                    QStringLiteral("rainfall-scenarios/") + scenario_uuid);
+                const QString fingerprint = inundationFingerprint(id, scenario_uuid,
+                    folder, scenario_folder, job_item->grid.columns, job_item->grid.rows);
+                const QJsonObject manifest = cachedInundationManifest(scenario_folder,
+                    fingerprint, job_item->grid.columns, job_item->grid.rows);
+                return inundationTaskJson(id, scenario_uuid, existing->id,
+                    QStringLiteral("completed"), QString(), manifest);
+            }
+            catch (const std::exception &)
+            {
+                // A missing, stale or damaged result must be regenerated.
+            }
+        }
         std::size_t pending = 0;
         for (const QSharedPointer<InundationTask> &entry : std::as_const(this->inundation_tasks))
             if (entry->state == QStringLiteral("queued") ||
