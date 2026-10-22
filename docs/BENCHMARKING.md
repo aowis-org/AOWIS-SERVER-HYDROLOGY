@@ -1,8 +1,10 @@
-# Reproducible Hydrology core benchmarking
+# Hydrology benchmarking: synthetic core and live Map integration
 
 ## Purpose and limits
 
-This guide provides a **repeatable performance harness**, not a claim that
+This guide provides two independent, repeatable benchmark workflows: a seeded
+**synthetic C++ core benchmark** and a **live Map → Hydrology HTTP benchmark**.
+Neither is a claim that
 synthetic elevations reproduce Copernicus GLO-30, nor a validation of predicted
 flooding. The opt-in `aowis-hydrology-benchmark` runs actual core algorithms in
 one process and reports timing, memory, algorithmic counts, and conservation
@@ -19,7 +21,7 @@ The measured workflow is:
 6. Call `redistributeRunoff()` using the original DEM, without reusing the
    conditioned D8 elevations, then **verify mass conservation**.
 
-All stages call production C++ core code. Neither Map network acquisition,
+The synthetic stages call production C++ core code. Neither Map network acquisition,
 GeoTIFF decoding, Stage 7 polygon clipping, SQLite/PostgreSQL, asynchronous
 Qt services, HTTP, persistent caches, nor the coupled transient reservoir
 solver is included. Measure those independently, using representative inputs.
@@ -49,8 +51,10 @@ or supplied with `AOWIS_HYDROLOGY_GEOGRAPHICLIB_SOURCE`. Qt and GDAL are not
 required for this benchmark-only build. The ordinary `compile_linux_tests.sh
 --both` workflow is unchanged: **benchmarks are disabled by default**. When
 enabled with CTest, two small regression checks exercise the report generator
-and rejection of inputs exceeding the cell budget; no million-cell test is
-added to CI by default.
+and rejection of inputs exceeding the cell budget. If Python 3 is installed,
+an additional offline HTTP-protocol fixture verifies the live benchmark
+client without requiring either server. No million-cell or live-network test
+is added to CI by default.
 
 ## Workloads
 
@@ -165,3 +169,156 @@ not just successful runs, before using the outputs for engineering decisions.
   runtime, but omit other services and server-process caches.
 - The FNV elevation fingerprint verifies deterministic *input identity* in
   reports, not the integrity of externally delivered DEM files.
+
+
+## Live Map → Hydrology HTTP benchmark
+
+`tools/benchmark_map_http.py` is a separate **Python 3 standard-library-only**
+client. It uses the *actual running* Hydrology service and optionally Map's
+analysis-grade DEM endpoint. It never generates synthetic input and never
+creates its own Copernicus cache or accesses Map's private file paths.
+
+**Prerequisites:** Start Map (normally port 8122), then start Hydrology
+(normally port 8123) with `terrain/mode=rest` and the correct `terrain/map_url`.
+Map must have permission to fetch or already have source DEM data covering the
+requested bounds. Choose a small WGS84 area first. Commands below use an
+**illustrative** coordinate window—replace it with a known supported area.
+
+```bash
+# Keep live tests small initially (the client defaults to 250,000 cells max).
+./tools/benchmark_map_http.py \
+  --hydrology-url http://127.0.0.1:8123 \
+  --map-url http://127.0.0.1:8122 \
+  --west 8.700 --south 50.700 --east 8.720 --north 50.720 \
+  --resolution-m 30 --repeats 5 \
+  --source-patch-size 256 \
+  > benchmark-map-http.json
+
+# Use the saved job ID from the report to measure retrieval after restart,
+# without submitting another analysis job or downloading the DEM again.
+./tools/benchmark_map_http.py \
+  --existing-job <job-uuid-from-json> \
+  --map-url http://127.0.0.1:8122 \
+  > benchmark-persisted-query.json
+
+# Optional: measure logical on-disk output lengths on the Hydrology host.
+./tools/benchmark_map_http.py \
+  --existing-job <job-uuid-from-json> \
+  --analysis-directory /path/to/hydrology/analyses \
+  > benchmark-persisted-disk.json
+```
+
+For a Map installation using read-key authentication, supply
+`--map-read-api-key` on the command line; it is sent **only to Map**, not to
+Hydrology, and is excluded from reports. Shell process arguments and shell
+history can still expose keys, so use appropriately protected test machines.
+To benchmark only Hydrology queries without a direct Map comparison, supply
+`--map-url ''`.
+
+### Measured operations
+
+1. `GET /status` validates the Hydrology endpoint.
+2. In new-job mode, the client estimates the raster size using the **same**
+   WGS84/resolution formula as the service, refuses a workload larger than
+   `--max-cells` **before POST**, submits `POST /v1/jobs`, and polls its job
+   until completed, failed, canceled, or timed out. Its `job_wait_s` includes
+   terrain acquisition, D8, basin hierarchy and persistence, but it does **not**
+   separately time those internal operations.
+3. Reads the same bounded `GET /v1/jobs/{id}/raster/elevation` float32 window
+   repeatedly, records all HTTP wall times and confirms byte-identical
+   responses (content type and length must also match).
+4. Reads the first bounded `/basins` JSON page repeatedly; records wall times
+   and ensures content stability.
+5. Optionally **reconstructs the original Map acquisition patches** used by
+   Hydrology (`terrain/patch_size`, default 256), requests those same source
+   windows from `/terrain/v1/analysis/grid`, and crops the returned float32
+   samples to the saved Hydrology raster window. It does **not** independently
+   resample the smaller comparison window: because Map selects source pixels
+   using `floor()`, an insignificant floating-point change in a cell-centre
+   coordinate can select an adjacent 1-arcsecond DEM pixel. It checks the
+   resulting data against Hydrology's persisted original DEM, failing if any
+   cell differs by more than `--elevation-tolerance-m` (default 0.0001 m),
+   or if either response contains NaN/Inf. Reports SHA-256s, exact byte
+   equality, the full Map bytes transferred, and number of source requests.
+   **Set `--source-patch-size` to the patch size used by Hydrology when that
+   job originally fetched its elevations**, including for existing jobs.
+   This may transfer more Map data than the small Hydrology comparison window.
+6. Optionally counts file lengths beneath an explicitly supplied local
+   Hydrology analysis-output directory. This does not report allocated disk
+   blocks or account for caches outside that job.
+
+If parity fails, stderr now includes the analysis job UUID, maximum difference,
+first differing cell coordinates, and the corresponding Map/Hydrology values.
+Do not raise the elevation tolerance to make native-pixel mismatches pass.
+First check `--source-patch-size`, server terrain source configuration, and
+whether Map source data changed since the job was created. A persistent
+mismatch with identical acquisition geometry is a meaningful discrepancy.
+
+The script never deletes completed analyses, alters cache settings, performs
+concurrent load, or starts or stops servers. The data set and conditioning
+policy are included in the JSON report. The *existing-job* mode never posts
+anything; use it after an actual server restart to test job and raster
+persistence, because re-querying during the same process lifetime does not
+prove restart recovery.
+
+**Important performance distinctions:** The measured full-job wall time
+includes Map network/download and disk writes; synthetic C++ core time does
+not. A first request can hit an already-populated Map cache. The Map sample
+is intentionally taken **after** the job, so it measures a warm or previously
+fetched region and cannot be called a cold-download benchmark. Polling
+observes state transitions with sampling delay; it does not give exact
+per-stage server CPU times. Client-side HTTP latency is not server-side
+algorithm time. `--analysis-directory` measures **logical bytes**, not
+physical block usage or process RSS. Run repeated jobs with explicitly
+controlled Map cache states before drawing cold-versus-warm conclusions.
+
+### Live client options and resource control
+
+| Option | Default | Notes |
+| --- | --- | --- |
+| `--west/south/east/north` | required for new job | Valid WGS84 bounds; no automatic bounding box |
+| `--resolution-m` | 30 | Same 30–5000 m limit as Hydrology |
+| `--max-cells` | 250,000 | Explicit safety budget; raise deliberately for district/city/metropolitan experiments |
+| `--window` | 64 | Hydrology elevation comparison window width/height, maximum 512 |
+| `--source-patch-size` | 256 | Must match Hydrology `terrain/patch_size` at terrain acquisition, maximum 512; determines independent Map source-request geometry |
+| `--basin-limit` | 25 | Bounded result page, maximum 100 |
+| `--repeats` | 5 | Sequential HTTP samples, 1–100 |
+| `--poll-seconds` | 0.25 | Polling interval, maximum 60 seconds |
+| `--job-timeout` | 600 s | Client timeout; exceeding it does not cancel the server job |
+| `--request-timeout` | 180 s | Per-HTTP-call timeout |
+| `--existing-job` | unset | Queries UUID-addressed completed analysis, no new POST |
+| `--map-url` | 127.0.0.1:8122 | Empty string disables independent DEM parity |
+| `--elevation-tolerance-m` | 0.0001 | Absolute comparison tolerance, not DEM uncertainty |
+| `--analysis-directory` | unset | Optional local analysis-output root; read-only |
+
+The script exits nonzero with a human-readable error on HTTP failure,
+incomplete source coverage, failed job, inconsistent raster samples, missing
+persisted data, or elevation mismatch. On success it prints exactly one JSON
+report to standard output. Redirect this to a file along with the synthetic
+benchmark reports and system metadata. It does **not** claim Map results
+are scientifically independent reference elevations: both Map and Hydrology
+are reading the same source through different interfaces. This comparison
+checks *data transport and raster alignment*, not hydrological correctness.
+
+To exercise only the live-client protocol against a local synthetic HTTP
+fixture (without Map/Qt servers):
+
+```bash
+python3 -m unittest discover -s tests -p test_benchmark_map_http.py -v
+```
+
+When `AOWIS_HYDROLOGY_BUILD_BENCHMARKS=ON` and Python 3 is available, the
+same offline protocol test is registered under the `benchmark-smoke` CTest
+label.
+
+### Interpreting a synthetic pitted-terrain baseline
+
+A high synthetic `basin_count` means the test created many tiny local
+minima/merges. In this workload, depression-hierarchy construction often
+dominates CPU time; benchmark it separately before attempting an algorithmic
+optimization. Do not extrapolate its basin density to real GLO-30 terrain.
+Compare RSS at individual stages, not just the total, and record whether the
+run released its transient D8 result before building the hierarchy. When
+comparing a live HTTP job with the synthetic benchmark, account for additional
+resident source buffers, Qt allocations, Map cache, persistent files and
+potential concurrent requests.

@@ -103,7 +103,13 @@ DEM delivery, the persistent server, or time-dependent hydraulic routing**, and
 synthetic terrain is not reference hydrology data. Benchmarks are deliberately
 disabled in normal builds and regression suites. Full build instructions,
 workload profiles, JSON fields, and real-DEM validation methodology are in
-[docs/BENCHMARKING.md](docs/BENCHMARKING.md).
+[docs/BENCHMARKING.md](docs/BENCHMARKING.md). A separate, standard-library-only
+`tools/benchmark_map_http.py` benchmarks a live Map → Hydrology terrain job,
+repeated bounded raster and basin queries, DEM window parity between Map and
+Hydrology, and persisted-job reads after restart. It creates no local DEM
+backend, accepts explicit WGS84 bounds with a default 250,000-cell limit, and
+keeps live measurements separate from synthetic timings. See the same guide
+for command examples and measurement limitations.
 
 ### Terrain input and ownership
 

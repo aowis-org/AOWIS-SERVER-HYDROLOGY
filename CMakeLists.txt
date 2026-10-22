@@ -89,6 +89,14 @@ if(AOWIS_HYDROLOGY_BUILD_BENCHMARKS)
             --columns 5000 --rows 5000)
         set_tests_properties(aowis-hydrology-benchmark-input-limits PROPERTIES
             LABELS "hydrology;aowis;benchmark-smoke" WILL_FAIL TRUE)
+        find_package(Python3 QUIET COMPONENTS Interpreter)
+        if(Python3_Interpreter_FOUND)
+            add_test(NAME aowis-hydrology-benchmark-map-http-mock
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_benchmark_map_http.py")
+            set_tests_properties(aowis-hydrology-benchmark-map-http-mock PROPERTIES
+                LABELS "hydrology;aowis;benchmark-smoke")
+        endif()
     endif()
 endif()
 

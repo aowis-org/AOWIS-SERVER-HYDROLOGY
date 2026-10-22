@@ -1,0 +1,121 @@
+{
+  "analysis_files": null,
+  "basin_count": 2623,
+  "basin_page": {
+    "all_ms": [
+      1.905,
+      2.072,
+      1.74,
+      1.535,
+      1.376
+    ],
+    "count": 5,
+    "first_ms": 1.905,
+    "limit": 25,
+    "maximum_ms": 2.072,
+    "median_ms": 1.74,
+    "minimum_ms": 1.376,
+    "response_bytes": 12837
+  },
+  "benchmark": "live_map_hydrology_http",
+  "cells": 87185,
+  "conditioned_cells": 8887,
+  "elevation_window": {
+    "all_ms": [
+      0.672,
+      0.402,
+      0.406,
+      0.442,
+      0.43
+    ],
+    "bytes": 16384,
+    "count": 5,
+    "first_ms": 0.672,
+    "maximum_ms": 0.672,
+    "median_ms": 0.43,
+    "minimum_ms": 0.402,
+    "sha256": "a385ac127433a5ef0fc2f3edb5272094852dc814cddf1dd2119c18879b0f6b55"
+  },
+  "estimated_columns": 235,
+  "estimated_rows": 371,
+  "hydrology_status_ms": 44.725,
+  "hydrology_url": "http://127.0.0.1:8123",
+  "job_id": "96c76725-912f-4056-98db-0314f93f9540",
+  "job_wait_s": 0.458,
+  "map_hydrology_parity": {
+    "cells_outside_tolerance": 0,
+    "comparison": "Map sampled using Hydrology's original terrain patch layout, cropped to the saved raster window",
+    "exact_bytes_equal": true,
+    "hydrology_sha256": "a385ac127433a5ef0fc2f3edb5272094852dc814cddf1dd2119c18879b0f6b55",
+    "map_requests_per_repeat": 1,
+    "map_response_bytes": 16384,
+    "map_sample_requests": {
+      "all_ms": [
+        50.789,
+        47.016,
+        47.284,
+        46.606,
+        46.122
+      ],
+      "count": 5,
+      "first_ms": 50.789,
+      "maximum_ms": 50.789,
+      "median_ms": 47.016,
+      "minimum_ms": 46.122
+    },
+    "map_sha256": "a385ac127433a5ef0fc2f3edb5272094852dc814cddf1dd2119c18879b0f6b55",
+    "map_transferred_bytes_per_repeat": 240640,
+    "max_absolute_difference_m": 0.0,
+    "mismatch_examples": [],
+    "source_patch_size": 256,
+    "tolerance_m": 0.0001
+  },
+  "map_url": "http://127.0.0.1:8122",
+  "mode": "new_job",
+  "notes": [
+    "Completion wall time includes Map terrain acquisition, analysis, hierarchy, and persistence; stages are not individually instrumented.",
+    "Queries are sequential client-measured requests. OS caches and Map cache may already be warm.",
+    "Map sample is requested after the Hydrology job; it does not measure a cold Map download.",
+    "Synthetic core benchmark and real HTTP benchmark are not directly comparable.",
+    "Analysis directory byte count is optional, not server memory usage or disk blocks."
+  ],
+  "poll_interval_s": 0.05,
+  "raster_columns": 235,
+  "raster_rows": 371,
+  "raster_window": {
+    "height": 64,
+    "width": 64,
+    "x": 85,
+    "y": 153
+  },
+  "request_resolution_m": 30.0,
+  "request_timeout_s": 180.0,
+  "schema_version": 1,
+  "source_dataset": "copernicus-glo30",
+  "status_poll_requests": 9,
+  "status_transition_observations": [
+    {
+      "observed_elapsed_s": 0.0,
+      "state": "queued"
+    },
+    {
+      "observed_elapsed_s": 0.051,
+      "state": "fetching-terrain"
+    },
+    {
+      "observed_elapsed_s": 0.102,
+      "state": "analyzing"
+    },
+    {
+      "observed_elapsed_s": 0.153,
+      "state": "analyzing-basins"
+    },
+    {
+      "observed_elapsed_s": 0.458,
+      "state": "completed"
+    }
+  ],
+  "submit_request_ms": 12.806,
+  "timing_clock": "time.perf_counter, client wall time",
+  "vertical_datum": "EGM2008"
+}
