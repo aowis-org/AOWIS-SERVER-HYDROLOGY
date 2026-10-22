@@ -1,5 +1,6 @@
 #include <aowis/hydrology/service.h>
 #include <aowis/hydrology/depression_archive.h>
+#include <aowis/hydrology/redistribution.h>
 #include <aowis/hydrology/spatial_queries.h>
 
 #include <QDir>
@@ -1537,6 +1538,102 @@ QByteArray AnalysisService::rainfallRunoffWindow(
         if (QFileInfo(path).size() != qint64(std::uint64_t(item->grid.columns) * item->grid.rows * 8))
             throw std::runtime_error("Incomplete rainfall scenario runoff raster");
         return readRectangle(path, item->grid.columns, x, y, width, height, 8);
+    }
+    catch (const std::exception &ex)
+    {
+        if (error != nullptr) *error = QString::fromUtf8(ex.what());
+        return {};
+    }
+}
+} // namespace Aowis::Hydrology
+
+namespace Aowis::Hydrology
+{
+QJsonObject AnalysisService::rainfallRedistribution(
+    const QString &id, const QString &scenario_uuid,
+    int offset, int limit, QString *error) const
+{
+    if (error != nullptr) error->clear();
+    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
+    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
+    {
+        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
+        return {};
+    }
+    if (offset < 0 || limit < 1 || limit > 100)
+    {
+        if (error != nullptr) *error = QStringLiteral("Invalid redistribution pagination (limit 1..100)");
+        return {};
+    }
+    try
+    {
+        const QString folder = jobDirectory(id);
+        const QString scenario_folder = QDir(folder).filePath(QStringLiteral("rainfall-scenarios"));
+        const QJsonObject manifest = loadRainfallManifest(scenario_folder, scenario_uuid);
+        const std::uint64_t cells = std::uint64_t(item->grid.columns) * item->grid.rows;
+        const QString raster_path = QDir(scenario_folder).filePath(
+            scenario_uuid + QStringLiteral("/runoff.f64"));
+        QFile raster(raster_path);
+        if (!raster.open(QIODevice::ReadOnly) || raster.size() != qint64(cells * 8))
+            throw std::runtime_error("Missing or truncated rainfall scenario runoff raster");
+        std::vector<double> volume(std::size_t(cells), 0.0);
+        QByteArray buffer(32768, '\0');
+        std::uint64_t cell = 0;
+        while (cell < cells)
+        {
+            const qsizetype take = qsizetype(std::min<std::uint64_t>(4096, cells - cell) * 8);
+            if (raster.read(buffer.data(), take) != take)
+                throw std::runtime_error("Incomplete rainfall scenario runoff raster");
+            for (qsizetype i = 0; i < take; i += 8)
+            {
+                const quint64 bits = qFromLittleEndian<quint64>(buffer.constData() + i);
+                double value = 0.0;
+                std::memcpy(&value, &bits, sizeof(value));
+                volume[std::size_t(cell++)] = value;
+            }
+        }
+        const ElevationGrid source = loadOriginalElevation(folder, item->grid);
+        const DepressionHierarchy hierarchy = loadHierarchy(folder,
+            item->grid.columns, item->grid.rows);
+        const RunoffRedistribution balance = redistributeRunoff(source, hierarchy, volume);
+        const double expected = manifest.value(QStringLiteral("effective_runoff_volume_m3")).toDouble();
+        if (std::abs(expected - balance.generated_runoff_m3) >
+            1e-7 * std::max(1.0, std::abs(expected)))
+            throw std::runtime_error("Rainfall runoff raster and scenario summary disagree");
+        QJsonArray paginated;
+        for (std::uint64_t index = std::uint64_t(offset);
+             index < balance.basins.size() && paginated.size() < limit; ++index)
+        {
+            const BasinRedistributionState &state = balance.basins[std::size_t(index)];
+            const DepressionBasin &basin = hierarchy.basins[std::size_t(index)];
+            paginated.append(QJsonObject{
+                {QStringLiteral("basin_id"), basinUuid(id, state.basin_index)},
+                {QStringLiteral("parent_id"), basin.parent_index >= 0
+                    ? QJsonValue(basinUuid(id, std::uint64_t(basin.parent_index)))
+                    : QJsonValue(QJsonValue::Null)},
+                {QStringLiteral("direct_inflow_m3"), state.direct_inflow_m3},
+                {QStringLiteral("stored_in_subtree_m3"), state.stored_in_subtree_m3},
+                {QStringLiteral("overflow_m3"), state.overflow_m3},
+                {QStringLiteral("at_spill"), state.at_spill}
+            });
+        }
+        return QJsonObject{
+            {QStringLiteral("model"), QStringLiteral("static_fill_spill_merge_volume_v1")},
+            {QStringLiteral("job_id"), id},
+            {QStringLiteral("scenario_id"), scenario_uuid},
+            {QStringLiteral("generated_runoff_m3"), balance.generated_runoff_m3},
+            {QStringLiteral("basin_storage_m3"), balance.basin_storage_m3},
+            {QStringLiteral("direct_boundary_outflow_m3"), balance.direct_boundary_outflow_m3},
+            {QStringLiteral("basin_boundary_outflow_m3"), balance.basin_boundary_outflow_m3},
+            {QStringLiteral("total_boundary_outflow_m3"), balance.total_boundary_outflow_m3},
+            {QStringLiteral("mass_balance_error_m3"), balance.mass_balance_error_m3},
+            {QStringLiteral("domain_boundary_is_artificial"), true},
+            {QStringLiteral("total_basins"), double(balance.basins.size())},
+            {QStringLiteral("offset"), offset},
+            {QStringLiteral("limit"), limit},
+            {QStringLiteral("has_more"), std::uint64_t(offset) + std::uint64_t(paginated.size()) < balance.basins.size()},
+            {QStringLiteral("basins"), paginated}
+        };
     }
     catch (const std::exception &ex)
     {

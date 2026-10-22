@@ -57,10 +57,12 @@ input geometry/parameters, the covered area and wet-cell count, and:
 - `touches_domain_boundary`: selected polygon intersects or reaches the DEM
   edge, or extends beyond the analysis window; results may be incomplete.
 
-**The output does not simulate ponding, pipe drainage, travel time, velocity,
-peak discharge, infiltration timing, or basin overflows.** Stage 8 will route
-the saved cellwise volumes through the existing flow graph and depression
-hierarchy. The sum of the saved runoff cells is the generated runoff volume.
+**The rainfall-scenario output itself does not simulate ponding, pipe drainage,
+travel time, velocity, peak discharge or infiltration timing.** Stage 8 adds a
+separate on-demand static volume redistribution query using the saved runoff
+raster and original-DEM basin hierarchy. See
+[RUNOFF_REDISTRIBUTION.md](RUNOFF_REDISTRIBUTION.md). The sum of the saved
+runoff cells is the generated runoff volume.
 
 ## Geometric coverage and accuracy
 
@@ -112,7 +114,10 @@ have an additional geometric edge budget.
 
 ## Future model integration
 
-Stage 8 will start from the saved `runoff.f64` raster and use the existing
-D8 graph plus source-DEM depression hierarchy to determine retained volumes,
-spill transfers and out-of-domain discharge, with explicit mass-balance
-accounting. No SWMM execution or precipitation climatology is in this stage.
+Stage 8's initial static solver is implemented. It starts from the saved
+`runoff.f64` raster and uses **original DEM** dry-D8 paths plus the source-DEM
+depression hierarchy to determine retained volumes, spill transfers and
+out-of-domain discharge. It does **not** infer timing or a flood-depth map.
+Read the [redistribution guide](RUNOFF_REDISTRIBUTION.md) for the endpoint,
+accounting formula and limitations. No SWMM execution or precipitation
+climatology is included.

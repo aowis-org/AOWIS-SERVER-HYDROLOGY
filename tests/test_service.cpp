@@ -150,6 +150,20 @@ int main(int argc, char **argv)
         const QByteArray runoff_window = service.rainfallRunoffWindow(
             successful_id, rainfall_scenario_id, 1, 1, 1, 1, &error);
         assert(error.isEmpty() && runoff_window.size() == 8);
+        const QJsonObject redistributed = service.rainfallRedistribution(
+            successful_id, rainfall_scenario_id, 0, 20, &error);
+        assert(error.isEmpty());
+        assert(redistributed.value(QStringLiteral("model")) ==
+            QStringLiteral("static_fill_spill_merge_volume_v1"));
+        assert(redistributed.value(QStringLiteral("generated_runoff_m3")).toDouble() > 0);
+        assert(std::abs(redistributed.value(QStringLiteral("generated_runoff_m3")).toDouble() -
+            redistributed.value(QStringLiteral("basin_storage_m3")).toDouble() -
+            redistributed.value(QStringLiteral("total_boundary_outflow_m3")).toDouble()) < 1.e-6);
+        assert(redistributed.value(QStringLiteral("total_basins")).toDouble() == 0);
+        assert(service.rainfallRedistribution(successful_id, rainfall_scenario_id,
+            -1, 20, &error).isEmpty());
+        assert(error.startsWith(QStringLiteral("Invalid")));
+
         assert(service.createRainfallScenario(successful_id,
             QJsonObject{{QStringLiteral("geometry"), polygon_geometry}}, &error).isEmpty());
         assert(error.startsWith(QStringLiteral("Invalid")));
@@ -216,6 +230,11 @@ int main(int argc, char **argv)
         assert(restored.rainfallRunoffWindow(successful_id, rainfall_scenario_id,
             1, 1, 1, 1, &error).size() == 8);
         assert(error.isEmpty());
+        const QJsonObject restored_balance = restored.rainfallRedistribution(
+            successful_id, rainfall_scenario_id, 0, 100, &error);
+        assert(error.isEmpty());
+        assert(restored_balance.value(QStringLiteral("generated_runoff_m3")).toDouble() > 0);
+
         const QJsonObject persisted_watershed = restored.watershedBoundary(
             successful_id, 1, 1, &error);
         assert(error.isEmpty() && !persisted_watershed.isEmpty());
@@ -255,6 +274,39 @@ int main(int argc, char **argv)
         assert(single.value(QStringLiteral("minimum_elevation_m")).toDouble() == 10.0);
         assert(single.value(QStringLiteral("spill_elevation_m")).toDouble() == 15.0);
         assert(single.value(QStringLiteral("capacity_at_spill_m3")).toDouble() > 0.0);
+        const QJsonObject meta = service.job(basin_job_id);
+        const int middle_x = meta.value(QStringLiteral("columns")).toInt() / 2;
+        const int middle_y = meta.value(QStringLiteral("rows")).toInt() / 2;
+        const double gx = meta.value(QStringLiteral("west")).toDouble();
+        const double gy = meta.value(QStringLiteral("north")).toDouble();
+        const double dx = meta.value(QStringLiteral("step_lon_deg")).toDouble();
+        const double dy = meta.value(QStringLiteral("step_lat_deg")).toDouble();
+        const double rx0 = gx + middle_x * dx;
+        const double rx1 = rx0 + dx;
+        const double ry1 = gy - middle_y * dy;
+        const double ry0 = ry1 - dy;
+        const QJsonObject centered_polygon{
+            {QStringLiteral("type"), QStringLiteral("Polygon")},
+            {QStringLiteral("coordinates"), QJsonArray{QJsonArray{
+                QJsonArray{rx0, ry0}, QJsonArray{rx1, ry0},
+                QJsonArray{rx1, ry1}, QJsonArray{rx0, ry1}, QJsonArray{rx0, ry0}}}}
+        };
+        const QJsonObject centered_rain{
+            {QStringLiteral("geometry"), centered_polygon},
+            {QStringLiteral("depth_mm"), 5.0},
+            {QStringLiteral("duration_seconds"), 600.0},
+            {QStringLiteral("effective_runoff_fraction"), 1.0}
+        };
+        const QJsonObject centered = service.createRainfallScenario(
+            basin_job_id, centered_rain, &error);
+        assert(error.isEmpty() && !centered.isEmpty());
+        const QJsonObject basin_balance = service.rainfallRedistribution(
+            basin_job_id, centered.value(QStringLiteral("id")).toString(), 0, 1, &error);
+        assert(error.isEmpty() && basin_balance.value(QStringLiteral("total_basins")).toInt() == 1);
+        assert(basin_balance.value(QStringLiteral("basin_storage_m3")).toDouble() > 0);
+        assert(basin_balance.value(QStringLiteral("basins")).toArray().first().toObject()
+            .value(QStringLiteral("basin_id")).toString() == basin_id);
+
         assert(service.basins(basin_job_id, 1, 1, &error)
                .value(QStringLiteral("basins")).toArray().isEmpty());
         assert(service.basins(basin_job_id, 0, 0, &error).isEmpty());

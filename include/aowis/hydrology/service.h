@@ -111,6 +111,10 @@ public:
     QByteArray rainfallRunoffWindow(const QString &id, const QString &scenario_uuid,
                                     int x, int y, int width, int height,
                                     QString *error) const;
+    // Static volume-balance preview of a saved scenario, recomputed on each
+    // request. basin totals are nested; sum only root basins for total storage.
+    QJsonObject rainfallRedistribution(const QString &id, const QString &scenario_uuid,
+                                       int offset, int limit, QString *error) const;
 
     static QByteArray layerMime(const QString &layer);
 

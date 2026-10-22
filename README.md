@@ -13,6 +13,7 @@ The first implementation provides:
 - **Physical depression-fill diagnostics** including per-cell potential fill depth and area-weighted total potential fill volume; the original DEM remains unchanged. See [DEM conditioning](docs/CONDITIONING.md).
 - **Depression hierarchy and basin storage (core/service/REST):** 8-connected raster-minimum and saddle topology, nested parent/child basins, physical spill capacities and bounded water-level/volume queries derived from the original terrain. See [Depression hierarchy](docs/DEPRESSION_HIERARCHY.md). Basin artifacts now persist with analysis jobs, with UUID-addressed queries and sampled curves.
 - **Rainfall scenarios (core/service/REST):** independent UUID-addressed scenarios reusing a completed terrain analysis, WGS84 GeoJSON polygons/multipolygons, exact planar clipped-cell coverage and polygon union including holes, explicit total rainfall depth/duration/runoff fraction, mass-balanced gross/effective volumes, persistent row-major runoff rasters, and scenario retrieval after restart. See [Rainfall scenarios](docs/RAINFALL_SCENARIOS.md).
+- **Static Fill–Spill–Merge-style runoff redistribution (core/service/REST):** original-DEM dry D8 routing, closed-basin storage, sibling/parent spill transfers, domain outflow and explicit mass balance, queried for saved rainfall scenarios. This is a volume-only screening approximation. See [Runoff redistribution](docs/RUNOFF_REDISTRIBUTION.md).
 - **Catchment delineation** upstream of a chosen terrain cell.
 - **Downstream tracing and D8 channel-network extraction:** reusable flow-graph queries, length/slope metrics, tributary junctions and Strahler stream order. Includes **watershed GeoJSON polygons**, geographically selected downstream-affected channels and bounded window extraction. See [Drainage networks](docs/DRAINAGE_NETWORKS.md).
 - Optional **constrained local breaching** of short DEM obstructions, with explicit excavation and path limits, physical cut-depth diagnostics and separate unmodified DEM elevations. Disabled by default.
@@ -20,7 +21,7 @@ The first implementation provides:
 - A thin **Qt 6 REST adapter** (`aowis-server-hydrology`) exposing that service's operations over HTTP, with no separate job/analysis implementation.
 - Acquisition of source-precision floating-point elevation windows through **AOWIS-SERVER-MAP**, via HTTP in a distributed deployment and the existing Map C++ `TerrainData` instance when embedded. The Qt-independent, read-only `AOWIS::HydrologyRaster` GeoTIFF reader remains available separately for development fixtures and controlled reference comparisons; it is not a production server terrain provider.
 
-The job service has a reusable in-process interface for the same operations served over HTTP. Geographic polygons can select drainage source cells and define **volume-based rainfall scenarios**, but Fill–Spill–Merge redistribution, SWMM execution and full standalone GUI/Map wiring are **not yet implemented**. These are separate roadmap stages.
+The job service has a reusable in-process interface for the same operations served over HTTP. Rainfall scenarios and the initial static redistribution model are implemented. Time-dependent SWMM simulation, detailed flood-depth maps and complete standalone GUI wiring remain separate roadmap work.
 
 ### Interpretation and limitations
 
@@ -217,9 +218,38 @@ The JSON POST accepts a WGS84 GeoJSON `geometry` (Polygon or MultiPolygon),
 `depth_mm`, `duration_seconds`, `effective_runoff_fraction`, and an optional
 `name`. It reports total rainfall volume, effective runoff volume and the
 unrouted per-cell runoff raster. The `/runoff` endpoint returns raw little-
-endian float64 **m³ per DEM cell**. The storage/overflow model is still
-pending: runoff volumes do **not** currently represent flooded areas or
-water heights. See [docs/RAINFALL_SCENARIOS.md](docs/RAINFALL_SCENARIOS.md).
+endian float64 **m³ per DEM cell**. Static storage and out-of-domain overflow **are available through the separate
+redistribution endpoint**, but runoff rasters still do **not** represent flooded
+areas or water heights. See [docs/RAINFALL_SCENARIOS.md](docs/RAINFALL_SCENARIOS.md).
+
+## Rainfall redistribution and basin overflow (Stage 8)
+
+A saved rainfall scenario can now be evaluated against the **original DEM's**
+closed depressions and their saddles. The model routes each cell's effective
+runoff along unfilled D8 drainage, retains volumes in topographic basins,
+allows water to pass between merged depressions after a spill threshold, and
+reports how much water leaves the analysis domain.
+
+```http
+GET /v1/jobs/{analysis-uuid}/rainfall-scenarios/{scenario-uuid}/redistribution?offset=0&limit=50
+```
+
+The JSON response contains `generated_runoff_m3`, `basin_storage_m3`,
+`direct_boundary_outflow_m3`, `basin_boundary_outflow_m3`,
+`total_boundary_outflow_m3`, and `mass_balance_error_m3`, plus paginated
+UUID-addressed basin states. **Only root basin storage is included in the
+summary:** internal basin results include their children and must not be
+summed together. This is a **static volume-only screening model**. It does
+not compute flood timing, velocity, detailed inundation extent or depth,
+urban drainage, or discharge outside the analyzed DEM. The computation is
+currently synchronous and recomputed per request; results are not separately
+cached. Incomplete DEM coverage is rejected.
+
+Read **[Runoff redistribution and basin overflow](docs/RUNOFF_REDISTRIBUTION.md)**
+for the physical assumptions, water-balance equations, worked example,
+query lifecycle, C++ usage and known accuracy limits. For its runoff input
+see [Rainfall scenarios](docs/RAINFALL_SCENARIOS.md), and for physical basin
+capacities see [Depression hierarchy](docs/DEPRESSION_HIERARCHY.md).
 
 ## REST API
 
@@ -291,7 +321,7 @@ The script is **`tools/zip_hydrology.sh`**, not `zip_hydrology.zip`. The `.zip` 
 Apply Hydrology-only patches using their exact filenames:
 
 ```bash
-./tools/apply_patch.sh ~/Downloads/aowis-server-hydrology-stage5-drainage-queries.zip
+./tools/apply_patch.sh ~/Downloads/aowis-server-hydrology-stage8-redistribution.zip
 ./tools/zip_hydrology.sh
 ./compile_linux_tests.sh --both
 ```
@@ -308,8 +338,8 @@ tracked as a Git submodule; when cloning this repository run
 The implementation stages and outstanding work are documented in
 [docs/ROADMAP.md](docs/ROADMAP.md). Watershed polygon boundaries, polygon-to-downstream-network selection and
 bounded network windows are implemented. Next are spatial indexes, production
-regional DEM comparisons, and domain-expansion/accuracy investigations. The independent depression-hierarchy
-and rainfall-volume stages remain ahead. The present downstream trace is
+regional DEM comparisons, and domain-expansion/accuracy investigations. The depression-hierarchy and rainfall-volume stages are implemented, and the
+first static runoff-redistribution increment is available. The present downstream trace is
 **point-based** and always stops at the analysis domain boundary, a preserved
 sink, or a configured resource/distance limit. It does not simulate rainfall
 travel time or discharge.

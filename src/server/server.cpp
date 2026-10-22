@@ -451,6 +451,34 @@ void Server::setupRoutes()
         return QHttpServerResponse(QByteArrayLiteral("application/vnd.aowis.raster-f64le"), output);
     });
 
+    // Static volume-balance estimate for a persisted rainfall scenario.
+    this->http.route("/v1/jobs/<arg>/rainfall-scenarios/<arg>/redistribution",
+                     QHttpServerRequest::Method::Get,
+                     [this](const QString &id, const QString &scenario_id,
+                            const QHttpServerRequest &request)
+    {
+        const QJsonObject job = this->service.job(id);
+        if (job.isEmpty()) return errorResponse(QStringLiteral("Unknown job"), Status::NotFound);
+        if (job.value(QStringLiteral("state")) != QStringLiteral("completed"))
+            return errorResponse(QStringLiteral("Analysis not completed"), Status::Conflict);
+        const QUrlQuery query(request.url());
+        int offset = 0;
+        int limit = 50;
+        if ((query.hasQueryItem(QStringLiteral("offset")) &&
+             !readInt(query, QStringLiteral("offset"), &offset)) ||
+            (query.hasQueryItem(QStringLiteral("limit")) &&
+             !readInt(query, QStringLiteral("limit"), &limit)))
+            return errorResponse(QStringLiteral("Invalid redistribution pagination"), Status::BadRequest);
+        QString error;
+        const QJsonObject result = this->service.rainfallRedistribution(
+            id, scenario_id, offset, limit, &error);
+        if (!error.isEmpty())
+            return errorResponse(error, error.startsWith(QStringLiteral("Invalid"))
+                ? Status::BadRequest : error.startsWith(QStringLiteral("Unknown"))
+                ? Status::NotFound : Status::InternalServerError);
+        return jsonResponse(result);
+    });
+
     this->http.route("/v1/jobs/<arg>/catchment", QHttpServerRequest::Method::Get,
                      [this](const QString &id, const QHttpServerRequest &request)
     {

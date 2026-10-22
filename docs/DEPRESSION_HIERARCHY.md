@@ -59,7 +59,18 @@ its results remain available following a service restart.
 ## Next work
 
 Benchmark hierarchy build/serialization, large basin memory consumption and
-reference comparisons on real GLO-30 areas. Add spill-network queries and
-optimized storage curves for large connected basins before the rainfall-volume
-redistribution stage. Rainfall routing and spill transfer belong to Stage 8,
-not Stage 6's static topographic storage calculations.
+reference comparisons on real GLO-30 areas. Add spill-network queries, source terrain fingerprints, and optimized storage
+curves for large connected basins. Stage 8 now supplies an initial static
+volume-only redistribution query; dynamic hydraulics and water-depth rasters
+remain future work, not part of these storage curves.
+
+## Relationship to rainfall redistribution
+
+Stage 8 uses this same saved **original-elevation** hierarchy, not the filled
+routing terrain. Each leaf's `capacity_at_spill_m3` acts as its maximum
+independent storage before water can cross the saddle to sibling basins or to
+its parent. An internal parent capacity **includes** its children: summing
+all individual capacities or stored-subtree results would double-count water.
+Only root basins are summed in the Stage 8 total. The actual scenario endpoint
+is described in [RUNOFF_REDISTRIBUTION.md](RUNOFF_REDISTRIBUTION.md); these
+static storage curves alone are not evidence of stormwater inundation.

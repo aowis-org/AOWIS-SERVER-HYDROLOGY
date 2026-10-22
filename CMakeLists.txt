@@ -30,7 +30,9 @@ add_library(aowis-hydrology-core STATIC
     src/core/depression_hierarchy.cpp
     src/core/depression_archive.cpp
     src/core/rainfall.cpp
+    src/core/redistribution.cpp
     include/aowis/hydrology/rainfall.h
+    include/aowis/hydrology/redistribution.h
     include/aowis/hydrology/depression_archive.h
     include/aowis/hydrology/depression_hierarchy.h
     include/aowis/hydrology/geometry.h
@@ -129,6 +131,11 @@ if(BUILD_TESTING)
     target_link_libraries(aowis-hydrology-rainfall-test PRIVATE AOWIS::Hydrology)
     add_test(NAME aowis-hydrology-rainfall COMMAND aowis-hydrology-rainfall-test)
     set_tests_properties(aowis-hydrology-rainfall PROPERTIES LABELS "hydrology;aowis")
+
+    add_executable(aowis-hydrology-redistribution-test tests/test_redistribution.cpp)
+    target_link_libraries(aowis-hydrology-redistribution-test PRIVATE AOWIS::Hydrology)
+    add_test(NAME aowis-hydrology-redistribution COMMAND aowis-hydrology-redistribution-test)
+    set_tests_properties(aowis-hydrology-redistribution PROPERTIES LABELS "hydrology;aowis")
 
     if(AOWIS_HYDROLOGY_WITH_GDAL)
         add_executable(aowis-hydrology-geotiff-test tests/test_geotiff.cpp)
