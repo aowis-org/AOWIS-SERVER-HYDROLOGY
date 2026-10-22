@@ -132,7 +132,7 @@ The reported water levels belong to **lumped reservoir approximations**. A snaps
 
 - **Map** continues to own DEM acquisition and cached source tiles. It does not own this hydraulic solver.
 - **Hydrology** already produces static basin topology, storage relationships, and total runoff volumes. This new core is deliberately separate from scenario persistence and REST: event-duration and total rainfall depth alone do **not** determine an inflow hydrograph.
-- A future preparation stage must translate basin hierarchy into a set of **disjoint reservoir control volumes**, calibrate individual hydraulic controls, and generate timed per-basin lateral inflows from rainfall/runoff routing.
+- The opt-in [timed-runoff forcing adapter](TEMPORAL_RUNOFF_FORCING.md) now distributes Stage 7 event runoff totals into **externally specified time fractions** and maps the original DEM's dry-D8 leaf inflow volumes into per-reservoir intervals. This is not a travel-time calculation: all dry-D8 arrivals are assumed immediate, and the caller must separately provide physically disjoint reservoir curves and calibrated controls.
 - Exposing timed simulations over the service will require a separate job identity, input provenance, model-specific cache version and cancellation/status handling. It must never silently overwrite the static redistribution result or reuse its cache key.
 - An external domain-outflow boundary, physically defensible time-varying surface infiltration, and connections to SWMM are separate future capabilities.
 
@@ -142,7 +142,7 @@ The reported water levels belong to **lumped reservoir approximations**. A snaps
 
 The solver **does not** yet have:
 
-- rainfall-to-inflow hydrograph generation or rainfall intensity varying within one input interval;
+- physically inferred rainfall-to-runoff timing or travel-time routing; the separate adapter accepts explicit event-time fractions and applies them uniformly, with zero source-to-basin delay;
 - an outlet to an outside-domain reservoir, floodplain surface propagation, infiltration, evapotranspiration or negative discharge boundaries;
 - implicit time integration / hydraulic inertia / momentum conservation;
 - general culvert hydraulics, partially submerged apertures, complex multiway controls, backwater through connected channels or surveyed spillway cross-sections sourced automatically;
