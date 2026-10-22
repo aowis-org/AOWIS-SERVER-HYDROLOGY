@@ -148,8 +148,8 @@ These requests require a configured Map server for the *initial* terrain-analysi
 - Invalid UUID, noncompleted analysis, invalid pagination, corrupt or missing raster/archive: the query fails rather than returning fabricated zeros.
 - DEM with any missing elevation: query fails in this increment, including missing boundary pixels.
 - Large valid DEMs currently need in-memory source, dry-flow graph, routing accumulators and hierarchy; this operation is **not out-of-core**.
-- There is no new *redistribution job ID*: this is a cached, on-demand query on a saved scenario. The result is persisted as a derived, disposable binary cache separate from the authoritative rainfall input and terrain source. The initial solve can block its HTTP request.
-- There is no flooded-area GeoJSON or water-depth raster endpoint yet.
+- Asynchronous redistribution tasks have UUID task IDs and bounded background execution. The result is persisted as a derived, disposable binary cache separate from authoritative rainfall input and terrain source. REST GET never initiates a new long-running solve.
+- There is no flooded-area GeoJSON or water-depth raster **REST** endpoint yet. A conservative C++-only static standing-water reconstruction is now available for eligible basin configurations; see [STATIC_INUNDATION.md](STATIC_INUNDATION.md).
 
 ## 5. Pure C++ library
 
@@ -187,4 +187,4 @@ Automated tests (`aowis-hydrology-redistribution`) cover zero/partial/full pit s
 ./compile_linux_tests.sh --both
 ```
 
-Versioned, paginated scenario caching is implemented (see [REDISTRIBUTION_CACHE.md](REDISTRIBUTION_CACHE.md)). Background execution with cooperative cancellation is implemented, but progress percentage/ETA and durable task histories are not. Important remaining work: reliable water-level/depth maps and polygon windows, improve spill routing beyond the rectangular DEM domain, add robust cache content fingerprints and multi-process coordination, and benchmark/compare real DEMs with external hydrology software.
+Versioned, paginated scenario caching is implemented (see [REDISTRIBUTION_CACHE.md](REDISTRIBUTION_CACHE.md)). Background execution with cooperative cancellation is implemented, but progress percentage/ETA and durable task histories are not. A first conservative C++ water-level/depth reconstruction for isolated and fully connected roots is described in [STATIC_INUNDATION.md](STATIC_INUNDATION.md); it deliberately rejects partially merged siblings. Important remaining work: service/REST depth windows and more generally reliable water-level/depth maps, improve spill routing beyond the rectangular DEM domain, add robust cache content fingerprints and multi-process coordination, and benchmark/compare real DEMs with external hydrology software.
