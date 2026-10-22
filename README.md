@@ -11,7 +11,7 @@ The first implementation provides:
 - A reusable, Qt-independent **C++20** hydrology core (`AOWIS::Hydrology`), with GeographicLib geodesy and D8 analysis entry points usable by linked applications.
 - Regional elevation-grid analysis using **Priority-Flood depression filling**, flat-area routing without artificial elevation ramps, **D8 flow direction**, and **flow accumulation** in upstream cells and square metres.
 - **Physical depression-fill diagnostics** including per-cell potential fill depth and area-weighted total potential fill volume; the original DEM remains unchanged. See [DEM conditioning](docs/CONDITIONING.md).
-- **Depression hierarchy and basin storage (core library):** 8-connected raster-minimum and saddle topology, nested parent/child basins, physical spill capacities and bounded water-level/volume queries derived from the original terrain. See [Depression hierarchy](docs/DEPRESSION_HIERARCHY.md). The service/REST results for this new layer are scheduled for the next increment.
+- **Depression hierarchy and basin storage (core/service/REST):** 8-connected raster-minimum and saddle topology, nested parent/child basins, physical spill capacities and bounded water-level/volume queries derived from the original terrain. See [Depression hierarchy](docs/DEPRESSION_HIERARCHY.md). Basin artifacts now persist with analysis jobs, with UUID-addressed queries and sampled curves.
 - **Catchment delineation** upstream of a chosen terrain cell.
 - **Downstream tracing and D8 channel-network extraction:** reusable flow-graph queries, length/slope metrics, tributary junctions and Strahler stream order. Includes **watershed GeoJSON polygons**, geographically selected downstream-affected channels and bounded window extraction. See [Drainage networks](docs/DRAINAGE_NETWORKS.md).
 - Optional **constrained local breaching** of short DEM obstructions, with explicit excavation and path limits, physical cut-depth diagnostics and separate unmodified DEM elevations. Disabled by default.
@@ -19,7 +19,7 @@ The first implementation provides:
 - A thin **Qt 6 REST adapter** (`aowis-server-hydrology`) exposing that service's operations over HTTP, with no separate job/analysis implementation.
 - Acquisition of source-precision floating-point elevation windows through **AOWIS-SERVER-MAP**, via HTTP in a distributed deployment and the existing Map C++ `TerrainData` instance when embedded. The Qt-independent, read-only `AOWIS::HydrologyRaster` GeoTIFF reader remains available separately for development fixtures and controlled reference comparisons; it is not a production server terrain provider.
 
-The job service has a reusable in-process interface for the same operations served over HTTP. Geographic polygons can now **select topological drainage source cells**, but rainfall depth, partial-cell overlap, persisted basin storage curves and REST basin queries, Fill–Spill–Merge, SWMM execution and full standalone GUI/Map wiring are **not yet implemented**. These are separate roadmap stages.
+The job service has a reusable in-process interface for the same operations served over HTTP. Geographic polygons can now **select topological drainage source cells**, but rainfall depth, partial-cell overlap, Fill–Spill–Merge, SWMM execution and full standalone GUI/Map wiring are **not yet implemented**. These are separate roadmap stages.
 
 ### Interpretation and limitations
 
@@ -27,7 +27,7 @@ Copernicus GLO-30 is a digital **surface** model. Its nominal resolution is insu
 
 D8 accumulation counts **all contributing cells** (including the cell itself); it is not a volume or flow rate. The analysis currently uses a geographic WGS84 raster, with latitude-adjusted physical slopes and areas. Analysis bounds must enclose **the relevant upstream watershed**; results are necessarily truncated at any clipped boundary. The present implementation is in-memory and targets regional GLO-30 data, not nationwide metre-resolution DEMs.
 
-The input terrain and conditioned elevations are kept separately. The filled physical surface is flat at a depression's spill level—**no artificial epsilon height increment is added**. A separate flat-routing graph provides D8 connectivity. Use `fill_depressions=false` to preserve closed basins as real sinks. The potential fill-depth raster is available in either mode. The diagnostic fill volume is not a rainfall-storage or flood estimate. See [DEM conditioning](docs/CONDITIONING.md) and [Depression hierarchy](docs/DEPRESSION_HIERARCHY.md). Connected basin storage now exists in the **core library**, but remains distinct from flood simulation; server-side storage queries are a later increment.
+The input terrain and conditioned elevations are kept separately. The filled physical surface is flat at a depression's spill level—**no artificial epsilon height increment is added**. A separate flat-routing graph provides D8 connectivity. Use `fill_depressions=false` to preserve closed basins as real sinks. The potential fill-depth raster is available in either mode. The diagnostic fill volume is not a rainfall-storage or flood estimate. See [DEM conditioning](docs/CONDITIONING.md) and [Depression hierarchy](docs/DEPRESSION_HIERARCHY.md). Connected basin storage is exposed through the reusable service and REST API, but remains distinct from flood simulation.
 
 ## Geometry and GeographicLib
 
@@ -170,6 +170,35 @@ The REST mode uses the following **Map endpoint**, added in the matching Map pat
 `GET /terrain/v1/analysis/grid?dataset=copernicus-glo30&west=...&south=...&east=...&north=...&columns=256&rows=256`
 
 It returns raw IEEE754 **float32 little-endian**, row-major, north-to-south elevations, one sample per cell centre, with `Content-Type: application/vnd.aowis.dem-f32le`. Invalid/missing elevations are NaN. The caller requests at most 512×512 cells, and all adjacent requests use an identical overall grid geometry, avoiding per-render-tile boundaries. Map provides this contract in its HTTP route and its equivalent in-process `TerrainData::analysisGrid` call. The matching Map patch must be applied for either mode. Native GeoTIFF source pixel values are sampled at the requested cell centres without bilinear interpolation. Request grid alignment matters: Hydrology currently constructs an approximately 30 m WGS84 analysis grid and Map samples the containing native pixel at each cell centre. This does not imply exact 1-arcsecond alignment. The service rejects incomplete input rather than treating missing DEM cells as outlets.
+
+## Depression storage API
+
+Each completed terrain analysis contains a checksum-validated, versioned `basins.aowbin`
+archive derived from the **original DEM**. Jobs also expose `basin_count`.
+The service computes these results once as part of each new job; previous
+pre-release analyses without the artifact need to be rerun. Basin entity IDs
+are deterministic **UUIDs within their analysis job**, not internal array
+indices. Pagination bounds the HTTP response; no extra Copernicus downloads
+are triggered by basin queries.
+
+```http
+GET /v1/jobs/{analysis-uuid}/basins?offset=0&limit=50
+GET /v1/jobs/{analysis-uuid}/basins/{basin-uuid}
+GET /v1/jobs/{analysis-uuid}/basins/{basin-uuid}/storage?level_m=12.0
+GET /v1/jobs/{analysis-uuid}/basins/{basin-uuid}/curve?samples=9
+```
+
+The matching `AOWIS::HydrologyService` methods are `basins()`, `basin()`,
+`basinStorage()`, and `basinStorageCurve()`. Pagination limits are 1–100,
+curve samples 2–16. A basin response includes UUID-linked parent/children,
+minimum cell coordinates, formation/spill elevations, capacity at spill,
+area and cell count, and whether spill reaches the analysis boundary.
+Unresolved spill values are JSON `null`. Storage curves return topographic
+water volume and inundated cell area at evenly spaced levels between basin
+formation and spill. A query may fail when the connected pond exceeds its
+2-million-cell per-sample traversal budget; clients should then use spill
+capacity from the basin summary rather than interpreting missing results
+as zero. **These values are static topographic estimates, not simulated storm flooding.**
 
 ## REST API
 

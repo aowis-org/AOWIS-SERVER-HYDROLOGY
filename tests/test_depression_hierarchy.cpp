@@ -2,6 +2,7 @@
 #undef NDEBUG
 #endif
 #include <aowis/hydrology/depression_hierarchy.h>
+#include <aowis/hydrology/depression_archive.h>
 
 #include <algorithm>
 #include <cassert>
@@ -191,6 +192,38 @@ int main()
     assert(conditioned.source.elevations_m == paired.elevations_m);
     assert(buildDepressionHierarchy(conditioned.source).basins.size() == nested.basins.size());
     assert(paired.elevations_m == copy);
+
+    // Persisted hierarchy is byte-stable and retains the exact hierarchy,
+    // double-precision capacities and reconstructed child relationships.
+    const std::vector<std::uint8_t> archive = encodeDepressionHierarchy(nested);
+    const DepressionHierarchy restored = decodeDepressionHierarchy(archive, 7, 5);
+    assert(restored.basins.size() == nested.basins.size());
+    assert(restored.basins[2].child_indices.size() == 2);
+    assert(restored.basins[0].parent_index == 2);
+    assert(approximately(restored.basins[2].capacity_at_spill_m3,
+                         nested.basins[2].capacity_at_spill_m3));
+    assert(archive == encodeDepressionHierarchy(restored));
+    std::vector<std::uint8_t> truncated = archive;
+    truncated.pop_back();
+    rejected = false;
+    try { (void)decodeDepressionHierarchy(truncated, 7, 5); }
+    catch (const std::invalid_argument &) { rejected = true; }
+    assert(rejected);
+    std::vector<std::uint8_t> corrupted = archive;
+    corrupted[50] ^= 1U;
+    rejected = false;
+    try { (void)decodeDepressionHierarchy(corrupted, 7, 5); }
+    catch (const std::invalid_argument &) { rejected = true; }
+    assert(rejected);
+    rejected = false;
+    try { (void)decodeDepressionHierarchy(archive, 8, 5); }
+    catch (const std::invalid_argument &) { rejected = true; }
+    assert(rejected);
+    const DepressionHierarchy empty_hierarchy = buildDepressionHierarchy(gridOf(3,3, {
+       5,5,5, 5,5,5, 5,5,5
+    }));
+    const std::vector<std::uint8_t> empty_archive = encodeDepressionHierarchy(empty_hierarchy);
+    assert(decodeDepressionHierarchy(empty_archive, 3, 3).basins.empty());
 
     // Resource limits and cancellation are explicit failures.
     rejected = false;

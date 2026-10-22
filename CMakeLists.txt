@@ -28,6 +28,8 @@ add_library(aowis-hydrology-core STATIC
     src/core/spatial_queries.cpp
     src/core/geometry.cpp
     src/core/depression_hierarchy.cpp
+    src/core/depression_archive.cpp
+    include/aowis/hydrology/depression_archive.h
     include/aowis/hydrology/depression_hierarchy.h
     include/aowis/hydrology/geometry.h
     include/aowis/hydrology/analysis.h

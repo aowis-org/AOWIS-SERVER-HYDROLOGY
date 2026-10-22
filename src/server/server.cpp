@@ -152,6 +152,92 @@ void Server::setupRoutes()
         return jsonResponse(this->service.job(id), Status::Accepted);
     });
 
+    // UUID-addressed basin hierarchy endpoints. The same operations are
+    // available to an embedded GUI through AOWIS::HydrologyService.
+    this->http.route("/v1/jobs/<arg>/basins", QHttpServerRequest::Method::Get,
+                     [this](const QString &id, const QHttpServerRequest &request)
+    {
+        const QJsonObject job = this->service.job(id);
+        if (job.isEmpty()) return errorResponse(QStringLiteral("Unknown job"), Status::NotFound);
+        if (job.value(QStringLiteral("state")) != QStringLiteral("completed"))
+            return errorResponse(QStringLiteral("Analysis not completed"), Status::Conflict);
+        const QUrlQuery query(request.url());
+        int offset = 0;
+        int limit = 50;
+        if ((query.hasQueryItem(QStringLiteral("offset")) &&
+             !readInt(query, QStringLiteral("offset"), &offset)) ||
+            (query.hasQueryItem(QStringLiteral("limit")) &&
+             !readInt(query, QStringLiteral("limit"), &limit)))
+            return errorResponse(QStringLiteral("Invalid basin pagination"), Status::BadRequest);
+        QString error;
+        const QJsonObject result = this->service.basins(id, offset, limit, &error);
+        if (!error.isEmpty())
+            return errorResponse(error, error.startsWith(QStringLiteral("Invalid"))
+                ? Status::BadRequest : Status::InternalServerError);
+        return jsonResponse(result);
+    });
+
+    this->http.route("/v1/jobs/<arg>/basins/<arg>", QHttpServerRequest::Method::Get,
+                     [this](const QString &id, const QString &basin_uuid)
+    {
+        const QJsonObject job = this->service.job(id);
+        if (job.isEmpty()) return errorResponse(QStringLiteral("Unknown job"), Status::NotFound);
+        if (job.value(QStringLiteral("state")) != QStringLiteral("completed"))
+            return errorResponse(QStringLiteral("Analysis not completed"), Status::Conflict);
+        QString error;
+        const QJsonObject result = this->service.basin(id, basin_uuid, &error);
+        if (!error.isEmpty())
+            return errorResponse(error, error.startsWith(QStringLiteral("Unknown basin"))
+                ? Status::NotFound : error.startsWith(QStringLiteral("Invalid"))
+                ? Status::BadRequest : Status::InternalServerError);
+        return jsonResponse(result);
+    });
+
+    this->http.route("/v1/jobs/<arg>/basins/<arg>/storage", QHttpServerRequest::Method::Get,
+                     [this](const QString &id, const QString &basin_uuid,
+                            const QHttpServerRequest &request)
+    {
+        const QJsonObject job = this->service.job(id);
+        if (job.isEmpty()) return errorResponse(QStringLiteral("Unknown job"), Status::NotFound);
+        if (job.value(QStringLiteral("state")) != QStringLiteral("completed"))
+            return errorResponse(QStringLiteral("Analysis not completed"), Status::Conflict);
+        const QUrlQuery query(request.url());
+        bool valid = false;
+        const double level = query.queryItemValue(QStringLiteral("level_m")).toDouble(&valid);
+        if (!valid || !std::isfinite(level))
+            return errorResponse(QStringLiteral("Invalid basin water level"), Status::BadRequest);
+        QString error;
+        const QJsonObject result = this->service.basinStorage(id, basin_uuid, level, &error);
+        if (!error.isEmpty())
+            return errorResponse(error, error.startsWith(QStringLiteral("Invalid")) ||
+                error.startsWith(QStringLiteral("Water level"))
+                ? Status::BadRequest : error.startsWith(QStringLiteral("Unknown basin"))
+                ? Status::NotFound : Status::InternalServerError);
+        return jsonResponse(result);
+    });
+
+    this->http.route("/v1/jobs/<arg>/basins/<arg>/curve", QHttpServerRequest::Method::Get,
+                     [this](const QString &id, const QString &basin_uuid,
+                            const QHttpServerRequest &request)
+    {
+        const QJsonObject job = this->service.job(id);
+        if (job.isEmpty()) return errorResponse(QStringLiteral("Unknown job"), Status::NotFound);
+        if (job.value(QStringLiteral("state")) != QStringLiteral("completed"))
+            return errorResponse(QStringLiteral("Analysis not completed"), Status::Conflict);
+        const QUrlQuery query(request.url());
+        int samples = 9;
+        if (query.hasQueryItem(QStringLiteral("samples")) &&
+            !readInt(query, QStringLiteral("samples"), &samples))
+            return errorResponse(QStringLiteral("Invalid curve sample count"), Status::BadRequest);
+        QString error;
+        const QJsonObject result = this->service.basinStorageCurve(id, basin_uuid, samples, &error);
+        if (!error.isEmpty())
+            return errorResponse(error, error.startsWith(QStringLiteral("Invalid"))
+                ? Status::BadRequest : error.startsWith(QStringLiteral("Unknown basin"))
+                ? Status::NotFound : Status::InternalServerError);
+        return jsonResponse(result);
+    });
+
     this->http.route("/v1/jobs/<arg>/raster/<arg>", QHttpServerRequest::Method::Get,
                      [this](const QString &id, const QString &layer,
                             const QHttpServerRequest &request)

@@ -34,6 +34,32 @@ A 7 × 5 elevation grid with a 16 m rim, two 10 m pits and a 12 m saddle produce
 
 `aowis-hydrology-depressions` tests the simple-pit volume, two-pit hierarchy, formation-level restrictions, flat plateaus, missing elevations, cancellation, resource limits, and 30 randomized landscapes checked against independent sub-spill flood fills. Run through `./compile_linux_tests.sh --both` or through CTest with label `hydrology`.
 
+## Persistent basin results and queries
+
+Completed jobs persist a checksum-validated little-endian `basins.aowbin`
+archive (format `AOWHDH01`). It records each node, spill metadata and physical
+capacity; parent relations reconstruct child lists on load. Source elevations
+remain stored independently as `elevation.f32` and are loaded for explicit
+water-level sampling. The original DEM is never recomputed from the
+conditioned or breached routing surface. Corrupt, oversized, missing or
+mismatched hierarchy artifacts cause explicit errors. Pre-release completed
+jobs from before this stage need to be rerun.
+
+All basin entities exposed to a client use deterministic, job-scoped UUIDs.
+The library `AnalysisService` exposes `basins(job, offset, limit)`,
+`basin(job, basin_uuid)`, `basinStorage(job, basin_uuid, level)`, and
+`basinStorageCurve(job, basin_uuid, samples)`. The HTTP adapter provides
+matching `/v1/jobs/{id}/basins` and `/basins/{basin-uuid}` endpoints with
+`/storage?level_m=` and `/curve?samples=` children. Pages contain at most
+100 basins; sampled curves contain 2–16 levels, including formation and
+spill. Storage queries use a bounded 2-million-cell flood traversal.
+Hierarchy construction occurs before marking the terrain job complete, and
+its results remain available following a service restart.
+
 ## Next work
 
-Persist depression hierarchy summaries with the terrain analysis, expose paginated basin and storage-curve queries through `AOWIS::HydrologyService` and its HTTP adapter, add large-region memory/performance tests and externally validated real-terrain fixtures. Rainfall-volume redistribution and spill transfer will be added in Stage 8, not conflated with Stage 6's topographic storage figures.
+Benchmark hierarchy build/serialization, large basin memory consumption and
+reference comparisons on real GLO-30 areas. Add spill-network queries and
+optimized storage curves for large connected basins before the rainfall-volume
+redistribution stage. Rainfall routing and spill transfer belong to Stage 8,
+not Stage 6's static topographic storage calculations.

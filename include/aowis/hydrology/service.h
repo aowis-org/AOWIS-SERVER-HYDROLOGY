@@ -90,6 +90,15 @@ public:
     QJsonObject affectedNetwork(const QString &id, const QJsonObject &request,
                                 QString *error) const;
 
+    // UUID-addressed depression hierarchy for a completed terrain analysis.
+    // Numeric basin positions are strictly internal and never public entity IDs.
+    QJsonObject basins(const QString &id, int offset, int limit, QString *error) const;
+    QJsonObject basin(const QString &id, const QString &basin_uuid, QString *error) const;
+    QJsonObject basinStorage(const QString &id, const QString &basin_uuid,
+                             double level_m, QString *error) const;
+    QJsonObject basinStorageCurve(const QString &id, const QString &basin_uuid,
+                                  int samples, QString *error) const;
+
     static QByteArray layerMime(const QString &layer);
 
 private:

@@ -1,8 +1,10 @@
 #include <aowis/hydrology/service.h>
+#include <aowis/hydrology/depression_archive.h>
 #include <aowis/hydrology/spatial_queries.h>
 
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonDocument>
 #include <QMutexLocker>
 #include <QStringList>
@@ -38,6 +40,7 @@ struct AnalysisService::Job
     std::uint32_t rejected_breach_candidates = 0;
     double breach_excavation_m3 = 0.0;
     float maximum_breach_cut_m = 0.0f;
+    std::uint64_t basin_count = 0;
     std::atomic<bool> cancelled {false};
 };
 
@@ -146,6 +149,122 @@ std::int64_t downstreamValue(const char *ptr)
 std::uint64_t countValue(const char *ptr)
 {
     return qFromLittleEndian<quint64>(ptr);
+}
+
+// UUIDv5 makes each basin ID deterministic within its analysis job and
+// preserves identity over server restarts. Array offsets are NOT entity IDs.
+QString basinUuid(const QString &job_id, std::uint64_t index)
+{
+    const QUuid namespace_uuid(QStringLiteral("{") + job_id + QStringLiteral("}"));
+    if (namespace_uuid.isNull())
+        throw std::runtime_error("Invalid analysis UUID");
+    return QUuid::createUuidV5(namespace_uuid, QString::number(qulonglong(index)).toUtf8())
+        .toString(QUuid::WithoutBraces);
+}
+
+DepressionHierarchy loadHierarchy(const QString &folder, std::uint32_t columns,
+                                  std::uint32_t rows)
+{
+    QFile file(QDir(folder).filePath(QStringLiteral("basins.aowbin")));
+    const std::uint64_t cells = std::uint64_t(columns) * rows;
+    const std::uint64_t maximum_bytes = 41ULL + 162ULL * cells;
+    if (!file.open(QIODevice::ReadOnly) || file.size() < 41 ||
+        std::uint64_t(file.size()) > maximum_bytes || file.size() > std::numeric_limits<int>::max())
+        throw std::runtime_error("Missing or oversized depression hierarchy archive");
+    const QByteArray bytes = file.readAll();
+    if (bytes.size() != file.size())
+        throw std::runtime_error("Failed to read complete depression hierarchy archive");
+    return decodeDepressionHierarchy(std::vector<std::uint8_t>(
+        reinterpret_cast<const std::uint8_t *>(bytes.constData()),
+        reinterpret_cast<const std::uint8_t *>(bytes.constData()) + bytes.size()),
+        columns, rows);
+}
+
+ElevationGrid loadOriginalElevation(const QString &folder, const ElevationGrid &geometry)
+{
+    const std::uint64_t cells = std::uint64_t(geometry.columns) * geometry.rows;
+    QFile file(QDir(folder).filePath(QStringLiteral("elevation.f32")));
+    if (!file.open(QIODevice::ReadOnly) || file.size() != qint64(cells * 4))
+        throw std::runtime_error("Missing or incomplete source elevation raster");
+    ElevationGrid source = geometry;
+    source.elevations_m.resize(std::size_t(cells));
+    QByteArray buffer(32768, '\0');
+    std::uint64_t cell = 0;
+    while (cell < cells)
+    {
+        const qsizetype take = qsizetype(std::min<std::uint64_t>(8192, cells - cell) * 4);
+        if (file.read(buffer.data(), take) != take)
+            throw std::runtime_error("Truncated source elevation raster");
+        for (qsizetype i = 0; i < take; i += 4)
+        {
+            const quint32 bits = qFromLittleEndian<quint32>(buffer.constData() + i);
+            float elevation = 0.0f;
+            std::memcpy(&elevation, &bits, sizeof(bits));
+            source.elevations_m[std::size_t(cell++)] = elevation;
+        }
+    }
+    return source;
+}
+
+const DepressionBasin &findBasin(const DepressionHierarchy &hierarchy,
+                                 const QString &job_id, const QString &uuid)
+{
+    const QUuid requested(QStringLiteral("{") + uuid + QStringLiteral("}"));
+    if (requested.isNull())
+        throw std::invalid_argument("Invalid basin UUID");
+    for (const DepressionBasin &basin : hierarchy.basins)
+    {
+        if (basinUuid(job_id, basin.index) == uuid.toLower())
+            return basin;
+    }
+    throw std::invalid_argument("Unknown basin UUID");
+}
+
+QJsonObject basinJson(const DepressionHierarchy &hierarchy, const QString &job_id,
+                      const DepressionBasin &basin)
+{
+    QJsonObject json;
+    json.insert(QStringLiteral("id"), basinUuid(job_id, basin.index));
+    if (basin.parent_index >= 0)
+        json.insert(QStringLiteral("parent_id"), basinUuid(job_id, std::uint64_t(basin.parent_index)));
+    else
+        json.insert(QStringLiteral("parent_id"), QJsonValue::Null);
+    QJsonArray children;
+    for (const std::uint64_t child : basin.child_indices)
+        children.append(basinUuid(job_id, child));
+    json.insert(QStringLiteral("child_ids"), children);
+    json.insert(QStringLiteral("minimum_x"), int(basin.minimum_cell % hierarchy.columns));
+    json.insert(QStringLiteral("minimum_y"), int(basin.minimum_cell / hierarchy.columns));
+    json.insert(QStringLiteral("minimum_elevation_m"), basin.minimum_elevation_m);
+    json.insert(QStringLiteral("formation_elevation_m"), basin.formation_elevation_m);
+    if (std::isfinite(basin.spill_elevation_m))
+    {
+        json.insert(QStringLiteral("spill_elevation_m"), basin.spill_elevation_m);
+        json.insert(QStringLiteral("capacity_at_spill_m3"), basin.capacity_at_spill_m3);
+        json.insert(QStringLiteral("area_below_spill_m2"), basin.area_below_spill_m2);
+        json.insert(QStringLiteral("cells_below_spill"), double(basin.cells_below_spill));
+        json.insert(QStringLiteral("spill_x"), int(basin.spill_cell % hierarchy.columns));
+        json.insert(QStringLiteral("spill_y"), int(basin.spill_cell / hierarchy.columns));
+    }
+    else
+    {
+        json.insert(QStringLiteral("spill_elevation_m"), QJsonValue::Null);
+        json.insert(QStringLiteral("capacity_at_spill_m3"), QJsonValue::Null);
+        json.insert(QStringLiteral("area_below_spill_m2"), QJsonValue::Null);
+    }
+    json.insert(QStringLiteral("spills_to_domain_boundary"), basin.spills_to_domain_boundary);
+    json.insert(QStringLiteral("model"), QStringLiteral("static_topographic_storage"));
+    return json;
+}
+
+QJsonObject stateJson(const BasinStorageState &state)
+{
+    return QJsonObject{
+        {QStringLiteral("water_level_m"), state.water_level_m},
+        {QStringLiteral("water_volume_m3"), state.water_volume_m3},
+        {QStringLiteral("inundated_cell_area_m2"), state.inundated_cell_area_m2},
+        {QStringLiteral("inundated_cells"), double(state.inundated_cells)}
+    };
 }
 
 bool parseGeographicRing(const QJsonArray &input, GeographicRing *ring,
@@ -391,6 +510,7 @@ QJsonObject AnalysisService::jobJson(const QSharedPointer<Job> &job) const
     result.insert(QStringLiteral("potential_fill_cells"), double(job->potential_fill_cells));
     result.insert(QStringLiteral("potential_fill_volume_m3"), job->potential_fill_volume_m3);
     result.insert(QStringLiteral("maximum_potential_fill_m"), double(job->maximum_potential_fill_m));
+    result.insert(QStringLiteral("basin_count"), double(job->basin_count));
     return result;
 }
 
@@ -446,6 +566,15 @@ void AnalysisService::restoreJobs()
         job->potential_fill_cells = std::uint64_t(saved.value(QStringLiteral("potential_fill_cells")).toDouble());
         job->potential_fill_volume_m3 = saved.value(QStringLiteral("potential_fill_volume_m3")).toDouble();
         job->maximum_potential_fill_m = float(saved.value(QStringLiteral("maximum_potential_fill_m")).toDouble());
+        job->basin_count = std::uint64_t(saved.value(QStringLiteral("basin_count")).toDouble());
+        bool missing_basin_archive = false;
+        if (job->state == QStringLiteral("completed") &&
+            !QFileInfo::exists(QDir(jobDirectory(id)).filePath(QStringLiteral("basins.aowbin"))))
+        {
+            job->state = QStringLiteral("failed");
+            job->error = QStringLiteral("Missing depression hierarchy artifact; rerun analysis");
+            missing_basin_archive = true;
+        }
         if (job->state != QStringLiteral("completed") && job->state != QStringLiteral("failed") &&
             job->state != QStringLiteral("canceled"))
         {
@@ -459,6 +588,9 @@ void AnalysisService::restoreJobs()
         }
         QMutexLocker locker(&this->jobs_mutex);
         this->job_map.insert(id, job);
+        locker.unlock();
+        if (missing_basin_archive)
+            writeManifest(job);
     }
 }
 
@@ -538,6 +670,28 @@ void AnalysisService::runJob(const QSharedPointer<Job> &job)
         writeArray(folder.filePath(QStringLiteral("upstream-area.f64")), result.upstream_area_m2);
         writeArray(folder.filePath(QStringLiteral("upstream-count.u64")), result.upstream_cell_count);
         writeArray(folder.filePath(QStringLiteral("downstream.i64")), result.downstream);
+        {
+            QMutexLocker locker(&this->jobs_mutex);
+            job->state = QStringLiteral("analyzing-basins");
+        }
+        writeManifest(job);
+        const DepressionHierarchy hierarchy = buildDepressionHierarchy(
+            result.source, true, &job->cancelled);
+        if (job->cancelled.load())
+            throw std::runtime_error("Job canceled");
+        const std::vector<std::uint8_t> encoded = encodeDepressionHierarchy(hierarchy);
+        QSaveFile archive(folder.filePath(QStringLiteral("basins.aowbin")));
+        if (!archive.open(QIODevice::WriteOnly) ||
+            archive.write(reinterpret_cast<const char *>(encoded.data()),
+                          qsizetype(encoded.size())) != qsizetype(encoded.size()) ||
+            !archive.commit())
+            throw std::runtime_error("Cannot save depression hierarchy archive");
+        {
+            QMutexLocker locker(&this->jobs_mutex);
+            job->basin_count = hierarchy.basins.size();
+            job->state = QStringLiteral("saving");
+        }
+        writeManifest(job);
         if (job->cancelled.load())
             throw std::runtime_error("Job canceled");
         {
@@ -1032,6 +1186,155 @@ QJsonObject AnalysisService::affectedNetwork(const QString &id,
         output.insert(QStringLiteral("local_stream_order"), true);
         output.insert(QStringLiteral("model"), QStringLiteral("topological_d8_influence"));
         return output;
+    }
+    catch (const std::exception &ex)
+    {
+        if (error != nullptr) *error = QString::fromUtf8(ex.what());
+        return {};
+    }
+}
+
+
+QJsonObject AnalysisService::basins(const QString &id, int offset, int limit, QString *error) const
+{
+    if (error != nullptr) error->clear();
+    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
+    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
+    {
+        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
+        return {};
+    }
+    if (offset < 0 || limit < 1 || limit > 100)
+    {
+        if (error != nullptr) *error = QStringLiteral("Invalid basin pagination (limit 1..100)");
+        return {};
+    }
+    try
+    {
+        const DepressionHierarchy hierarchy = loadHierarchy(jobDirectory(id),
+            item->grid.columns, item->grid.rows);
+        QJsonArray page;
+        for (std::size_t index = std::size_t(offset);
+             index < hierarchy.basins.size() && page.size() < limit; ++index)
+            page.append(basinJson(hierarchy, id, hierarchy.basins[index]));
+        return QJsonObject{
+            {QStringLiteral("job_id"), id},
+            {QStringLiteral("total_basins"), double(hierarchy.basins.size())},
+            {QStringLiteral("offset"), offset},
+            {QStringLiteral("limit"), limit},
+            {QStringLiteral("has_more"), std::uint64_t(offset) + std::uint64_t(page.size()) < hierarchy.basins.size()},
+            {QStringLiteral("basins"), page},
+            {QStringLiteral("model"), QStringLiteral("static_topographic_storage")}
+        };
+    }
+    catch (const std::exception &ex)
+    {
+        if (error != nullptr) *error = QString::fromUtf8(ex.what());
+        return {};
+    }
+}
+
+QJsonObject AnalysisService::basin(const QString &id, const QString &basin_uuid,
+                                  QString *error) const
+{
+    if (error != nullptr) error->clear();
+    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
+    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
+    {
+        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
+        return {};
+    }
+    try
+    {
+        const DepressionHierarchy hierarchy = loadHierarchy(jobDirectory(id),
+            item->grid.columns, item->grid.rows);
+        return basinJson(hierarchy, id, findBasin(hierarchy, id, basin_uuid));
+    }
+    catch (const std::exception &ex)
+    {
+        if (error != nullptr) *error = QString::fromUtf8(ex.what());
+        return {};
+    }
+}
+
+QJsonObject AnalysisService::basinStorage(const QString &id, const QString &basin_uuid,
+                                          double level_m, QString *error) const
+{
+    if (error != nullptr) error->clear();
+    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
+    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
+    {
+        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
+        return {};
+    }
+    if (!std::isfinite(level_m))
+    {
+        if (error != nullptr) *error = QStringLiteral("Invalid basin water level");
+        return {};
+    }
+    try
+    {
+        const QString folder = jobDirectory(id);
+        const DepressionHierarchy hierarchy = loadHierarchy(folder, item->grid.columns,
+                                                              item->grid.rows);
+        const DepressionBasin &selected = findBasin(hierarchy, id, basin_uuid);
+        const ElevationGrid elevation = loadOriginalElevation(folder, item->grid);
+        const BasinStorageState storage = basinStorageAtLevel(elevation, hierarchy,
+                                                              selected.index, level_m);
+        QJsonObject output = stateJson(storage);
+        output.insert(QStringLiteral("basin_id"), basinUuid(id, selected.index));
+        output.insert(QStringLiteral("job_id"), id);
+        output.insert(QStringLiteral("model"), QStringLiteral("static_topographic_storage"));
+        return output;
+    }
+    catch (const std::exception &ex)
+    {
+        if (error != nullptr) *error = QString::fromUtf8(ex.what());
+        return {};
+    }
+}
+
+QJsonObject AnalysisService::basinStorageCurve(const QString &id, const QString &basin_uuid,
+                                               int samples, QString *error) const
+{
+    if (error != nullptr) error->clear();
+    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
+    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
+    {
+        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
+        return {};
+    }
+    if (samples < 2 || samples > 16)
+    {
+        if (error != nullptr) *error = QStringLiteral("Invalid basin curve sample count (2..16)");
+        return {};
+    }
+    try
+    {
+        const QString folder = jobDirectory(id);
+        const DepressionHierarchy hierarchy = loadHierarchy(folder, item->grid.columns,
+                                                              item->grid.rows);
+        const DepressionBasin &selected = findBasin(hierarchy, id, basin_uuid);
+        if (!std::isfinite(selected.spill_elevation_m))
+            throw std::invalid_argument("Basin has no known spill elevation");
+        const ElevationGrid elevation = loadOriginalElevation(folder, item->grid);
+        QJsonArray curve;
+        for (int index = 0; index < samples; ++index)
+        {
+            const double level = index + 1 == samples ? selected.spill_elevation_m :
+                selected.formation_elevation_m +
+                (selected.spill_elevation_m - selected.formation_elevation_m) *
+                (double(index) / double(samples - 1));
+            const BasinStorageState storage = basinStorageAtLevel(elevation, hierarchy,
+                selected.index, level, 2000000);
+            curve.append(stateJson(storage));
+        }
+        return QJsonObject{
+            {QStringLiteral("job_id"), id},
+            {QStringLiteral("basin_id"), basinUuid(id, selected.index)},
+            {QStringLiteral("model"), QStringLiteral("static_topographic_storage")},
+            {QStringLiteral("samples"), curve}
+        };
     }
     catch (const std::exception &ex)
     {

@@ -7,6 +7,7 @@
 #include <QElapsedTimer>
 #include <QTemporaryDir>
 #include <QThread>
+#include <QUuid>
 
 #include <atomic>
 #include <cassert>
@@ -191,6 +192,66 @@ int main(int argc, char **argv)
             successful_id, 0.001, &error);
         assert(error.isEmpty() && !persisted_network.isEmpty());
     }
+    // One closed, static basin persists across restarts. UUID identities are
+    // stable, and level/volume samples use source elevations, not D8 heights.
+    QString basin_job_id;
+    QString basin_id;
+    configuration.terrain_reader = [](const ElevationGrid &geometry, const QString &,
+                                      const std::atomic<bool> &)
+    {
+        ElevationGrid grid = geometry;
+        grid.elevations_m.assign(std::size_t(grid.columns) * grid.rows, 15.0f);
+        grid.elevations_m[std::size_t(grid.rows / 2) * grid.columns + grid.columns / 2] = 10.0f;
+        return grid;
+    };
+    {
+        AnalysisService service(configuration);
+        QString error;
+        assert(service.initialize(&error));
+        basin_job_id = service.submit(smallRequest(), &error);
+        assert(!basin_job_id.isEmpty() && error.isEmpty());
+        waitForState(service, basin_job_id, QStringLiteral("completed"));
+        assert(service.job(basin_job_id).value(QStringLiteral("basin_count")).toInt() == 1);
+        const QJsonObject listing = service.basins(basin_job_id, 0, 1, &error);
+        assert(error.isEmpty() && listing.value(QStringLiteral("total_basins")).toInt() == 1);
+        assert(listing.value(QStringLiteral("basins")).toArray().size() == 1);
+        const QJsonObject single = listing.value(QStringLiteral("basins")).toArray()[0].toObject();
+        basin_id = single.value(QStringLiteral("id")).toString();
+        assert(QUuid(QStringLiteral("{") + basin_id + QStringLiteral("}")).isNull() == false);
+        assert(single.value(QStringLiteral("minimum_elevation_m")).toDouble() == 10.0);
+        assert(single.value(QStringLiteral("spill_elevation_m")).toDouble() == 15.0);
+        assert(single.value(QStringLiteral("capacity_at_spill_m3")).toDouble() > 0.0);
+        assert(service.basins(basin_job_id, 1, 1, &error)
+               .value(QStringLiteral("basins")).toArray().isEmpty());
+        assert(service.basins(basin_job_id, 0, 0, &error).isEmpty());
+        assert(error.startsWith(QStringLiteral("Invalid")));
+        const QJsonObject detail = service.basin(basin_job_id, basin_id, &error);
+        assert(error.isEmpty() && detail.value(QStringLiteral("id")).toString() == basin_id);
+        const QJsonObject storage = service.basinStorage(basin_job_id, basin_id, 12.0, &error);
+        assert(error.isEmpty() && storage.value(QStringLiteral("water_volume_m3")).toDouble() > 0.0);
+        const QJsonObject curve = service.basinStorageCurve(basin_job_id, basin_id, 5, &error);
+        assert(error.isEmpty() && curve.value(QStringLiteral("samples")).toArray().size() == 5);
+        assert(curve.value(QStringLiteral("samples")).toArray().last().toObject()
+               .value(QStringLiteral("water_volume_m3")).toDouble() ==
+               single.value(QStringLiteral("capacity_at_spill_m3")).toDouble());
+        assert(service.basinStorage(basin_job_id, basin_id, 16.0, &error).isEmpty());
+        assert(!error.isEmpty());
+        assert(service.basin(basin_job_id, QStringLiteral("not-a-uuid"), &error).isEmpty());
+        assert(error.startsWith(QStringLiteral("Invalid")));
+    }
+    {
+        AnalysisService restored(configuration);
+        QString error;
+        assert(restored.initialize(&error));
+        assert(restored.job(basin_job_id).value(QStringLiteral("state")) == QStringLiteral("completed"));
+        const QJsonObject persisted = restored.basins(basin_job_id, 0, 10, &error);
+        assert(error.isEmpty() && persisted.value(QStringLiteral("total_basins")).toInt() == 1);
+        assert(persisted.value(QStringLiteral("basins")).toArray().first().toObject()
+               .value(QStringLiteral("id")).toString() == basin_id);
+        assert(!restored.basinStorageCurve(basin_job_id, basin_id, 3, &error).isEmpty());
+        assert(error.isEmpty());
+    }
+
     // An incomplete raster must be rejected even if its only missing cell is
     // at the edge; otherwise a false drainage outlet can appear there.
     configuration.terrain_reader = [](const ElevationGrid &geometry, const QString &,
