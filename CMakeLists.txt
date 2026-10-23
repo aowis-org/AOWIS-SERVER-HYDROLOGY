@@ -205,6 +205,16 @@ if(BUILD_TESTING)
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_benchmark_resource_scaling.py")
         set_tests_properties(aowis-hydrology-resource-benchmark-tool PROPERTIES
             LABELS "hydrology;aowis")
+        add_test(NAME aowis-hydrology-derived-cache-benchmark-tool
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_benchmark_derived_caches.py")
+        set_tests_properties(aowis-hydrology-derived-cache-benchmark-tool PROPERTIES
+            LABELS "hydrology;aowis;http-contract")
+        add_test(NAME aowis-hydrology-documentation-links
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_documentation_links.py")
+        set_tests_properties(aowis-hydrology-documentation-links PROPERTIES
+            LABELS "hydrology;aowis")
     endif()
 endif()
 

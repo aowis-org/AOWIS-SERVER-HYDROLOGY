@@ -68,6 +68,8 @@ uncalibrated hydraulic controls. See [Product scope and open questions](docs/ROA
 [Benchmark methodology and commands](docs/BENCHMARKING.md),
 [Measured performance and engineering conclusions](docs/BENCHMARK_FINDINGS.md).
 
+**Release verification:** [Automated contracts and product acceptance](docs/VERIFICATION.md).
+
 ## Building and testing
 
 Requires CMake 3.21+, a C++20 compiler and GeographicLib. Qt 6 Core and

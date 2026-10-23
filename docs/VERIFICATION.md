@@ -43,6 +43,8 @@ The test exercises:
 - basin listing, drainage network, downstream tracing, synchronous and
   asynchronous catchment masks (byte-identical outputs), transient task cleanup;
 - a persisted rainfall scenario and raw `float64` runoff window;
+- explicit background redistribution cache creation, repeated byte-equivalent
+  cache-only pages, mass-balance consistency and cache reuse after restart;
 - discovering and reading jobs, rasters and the scenario after process restart;
 - bounded terrain-job admission (429 without disk artifacts), queued-job
   cancellation, immediate slot reuse, and canceled-job persistence on restart.
@@ -188,3 +190,45 @@ persisted raster against known upstream counts at multiple outlets; the HTTP
 contract validates synchronous/async byte-identical masks. Memory mapping
 reduces duplicated user-space graph arrays, but page-cache residency and
 output-mask memory are still significant at large grid sizes.
+
+
+## Product acceptance and operational verification
+
+The complete test target includes the numerical reference cases, the C++
+service-layer cancellation/admission and persistence tests, the black-box
+HTTP contract, executable CLI/configuration tests, synthetic resource
+benchmark utilities, the derived-cache benchmark mock, retention-tool
+safety and relative documentation links. Execute both Debug and Release:
+
+```bash
+./tools/setup_cpp_httplib.sh  # Only needed if the vendored header is absent.
+git submodule update --init --recursive  # For ordinary Git clones.
+./compile_linux_tests.sh --both
+```
+
+`aowis-hydrology-derived-cache-benchmark-tool` uses its own disposable HTTP
+fixture and verifies the **measurement workflow**, not live numerical
+performance. `aowis-hydrology-documentation-links` checks that local
+README/doc references still resolve. Neither test replaces real Map-server
+integration, true memory profiling or independent validation against
+observed hydrological measurements.
+
+Before releasing or embedding Hydrology in Standalone, also verify the
+following with appropriate real workloads:
+
+| Contract | Required evidence |
+| --- | --- |
+| API and binaries | Real-server HTTP contract passes; same deterministic raster bytes and documented JSON/MIME codes after a restart |
+| Embedded operation | Link `AOWIS::HydrologyService` without an HTTP listener, use the host-owned Map adapter, and verify callbacks and lifetime |
+| Scientific correctness | Numerical references and mass-balance tests pass; experimental coupled routing remains explicitly labeled |
+| Persistence and derived cache | Primary integrity checks reject damaged files; derived caches remain byte-identical on repeated and post-restart reads |
+| Resource safety | Confirm 429 admission/queue limits, cancellation/cleanup, realistic concurrent process RSS and disk consumption |
+| Performance | Record comparable core, live Map and cached-read measurements with input identities, hardware and source revision |
+| Documentation | Examples, API route names, configuration limits and relative documentation links match the built product |
+
+A passed synthetic suite validates the tested contracts; it is not evidence
+that large-domain hydraulics are scientifically calibrated, that all machines
+have adequate RAM, or that Map/GUI/Standalone have been integrated in an
+end-user deployment. Use the [benchmark operating guide](BENCHMARKING.md)
+for repeatable workload measurements and [product boundaries](ROADMAP.md)
+for the remaining scientific/GUI integration obligations.

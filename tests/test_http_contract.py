@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Black-box Hydrology HTTP contract regression against a deterministic Map mock.
 
-The same tests must pass against both the Qt adapter and its future replacement.
+The tests check the server’s public contract independently of its HTTP adapter.
 No Map service, credentials, internet access, external datasets or Python packages
 are required. Run through CTest or pass the built server executable explicitly.
 """
@@ -466,8 +466,34 @@ class HttpContractTests(unittest.TestCase):
         self.assertEqual(self.expect_json(202, "DELETE", detail_path)["state"], "completed")
         self.expect_json(404, "GET", task_path + "/unknown")
 
+        # Derived redistribution is a disposable but persistent, content-
+        # identified cache. A GET must not silently generate it; POST queues
+        # the calculation. Repeated reads and post-restart reads must agree.
+        redistribution_path = scenario_path + "/redistribution"
+        missing_cache = self.expect_json(409, "GET", redistribution_path)
+        self.assertIn("error", missing_cache)
+        started = self.expect_json(202, "POST", redistribution_path)
+        self.assertFalse(started["cache_ready"])
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            redistribution_status = self.expect_json(200, "GET", redistribution_path + "/status")
+            if redistribution_status["state"] in ("completed", "failed", "canceled"):
+                break
+            time.sleep(0.025)
+        self.assertEqual(redistribution_status["state"], "completed", redistribution_status)
+        self.assertTrue(redistribution_status["cache_ready"])
+        redistribution = self.expect_json(200, "GET", redistribution_path + "?offset=0&limit=50")
+        self.assertTrue(redistribution["cache_hit"])
+        self.assertAlmostEqual(redistribution["generated_runoff_m3"],
+                               scenario["effective_runoff_volume_m3"],
+                               delta=1e-7 * max(1, scenario["effective_runoff_volume_m3"]))
+        self.assertLessEqual(abs(redistribution["mass_balance_error_m3"]),
+                             1e-7 * max(1, redistribution["generated_runoff_m3"]))
+        self.assertEqual(self.expect_json(200, "GET", redistribution_path + "?offset=0&limit=50"),
+                         redistribution)
+
         # The next process must discover both jobs and the immutable scenario.
-        # This does not yet test interrupted writes (Stage 4).
+        # Interrupted artifact publication is covered by service recovery tests.
         self.stop_server()
         self.start_server()
         # Catchment tasks, unlike completed terrain analyses, are intentionally
@@ -478,6 +504,8 @@ class HttpContractTests(unittest.TestCase):
         for layer, expected in snapshots.items():
             self.assertEqual(self.raster(first["id"], layer)[1], expected, layer)
         self.assertEqual(self.call("GET", runoff_path)[2], runoff)
+        self.assertEqual(self.expect_json(200, "GET", redistribution_path + "?offset=0&limit=50"),
+                         redistribution)
 
 
 if __name__ == "__main__":

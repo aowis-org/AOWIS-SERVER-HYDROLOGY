@@ -251,3 +251,20 @@ concurrent task types and CPU/memory behavior of the Map source are excluded.
 The `max_active_terrain_cells` admission control therefore limits concurrent
 terrain-grid size, **not actual process allocations**. Production workloads
 should be profiled separately under realistic overlapping task mixes.
+
+## Derived-cache HTTP measurements still required
+
+The HTTP-derived-cache performance tool is documented in
+[BENCHMARKING.md](BENCHMARKING.md). There is **no measured production-host
+baseline yet** for redistribution cache first-generation latency, steady-state
+cache-only GET percentiles, simultaneous cache readers, or restart-first
+reads. The tool is deliberately separate from the synthetic-core resource
+scaling measurements above. Do not quote a performance improvement from
+cache identities or cpp-httplib until matched before/after measurements exist.
+
+For the same persisted analysis/scenario, preserve JSON reports from the
+first explicit cache build, ordinary repeated reads and the first reads
+following a service restart. Check the canonical result SHA-256 and record
+whether the cache was already present. When comparing two implementations,
+also compare payload content, server process and Map process memory, worker
+saturation, operating system page cache state and host activity.

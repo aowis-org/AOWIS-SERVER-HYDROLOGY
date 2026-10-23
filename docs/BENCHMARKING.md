@@ -13,6 +13,7 @@ flood prediction; use independent hydrological reference cases for that.
 | `aowis-hydrology-benchmark` | Deterministic synthetic terrain, actual core D8, original-DEM hierarchy, runoff redistribution, stage RSS/timings | Map, Qt service, network, GeoTIFF, persistence, dynamic coupled routing |
 | `tools/benchmark_resource_scaling.py` | Independent synthetic core executions across multiple DEM sizes, repeat distributions of runtime and peak process RSS | Concurrent memory use or a safe memory-budget coefficient |
 | `tools/benchmark_map_http.py` | One new or saved real-Map job, repeated result reads, optional exact Map/processed-DEM window parity | Long-term throughput; `--repeats` does **not** repeat full analysis |
+| `tools/benchmark_derived_caches.py` | A saved terrain job and rainfall scenario: missing-cache generation, repeated cache-only page retrieval and concurrent reads | Actual cold OS page cache, server CPU, process RSS or live Map performance |
 | `tools/benchmark_map_series.py` | Independent sequential Map-sourced jobs, worker and source-call timing distributions | Concurrent analyses |
 | `tools/benchmark_map_concurrency.py` | Read-only replay of the same Map patch layout with configurable parallel GETs | Hydrology scheduling or production transport setting |
 | `tools/benchmark_map_jobs.py` | Simultaneous new terrain-analysis jobs, throughput, per-job stage times, optional process RSS | Sustainable admission rate, total host memory or automatic job cleanup |
@@ -275,7 +276,7 @@ recomputed and outliers investigated.
 | `terrain_fetch_details.map_request_wall_ms` | Wall span from first Map call issuance to last completed reply |
 | `terrain_fetch_details.raster_copy_ms` | Copy/assembly time for received elevation patches |
 | `terrain_fetch_details.first_request_ms`, `fastest_request_ms`, `slowest_request_ms` | Per-request observations, not percentiles |
-| `terrain_peak_in_flight` | Peak HTTP patch calls outstanding **within that job** |
+| `terrain_fetch_details.peak_in_flight` | Peak HTTP patch calls outstanding **within that job** |
 
 Some fields are unavailable for old jobs or custom injected readers; use
 `null`, never synthetic zero. HTTP `GET /status` exposes worker/request caps.
@@ -284,6 +285,57 @@ milliseconds or pure network latency. Reusing an HTTP session may reduce
 connection setup but should not be called an optimization without a measured
 end-to-end benefit. Persisted timing metadata is observational and does not
 change DEM values.
+
+## Derived-cache lifecycle and restart benchmark
+
+The derived-cache benchmark requires an **existing completed** Hydrology job;
+there is no Map request or terrain-analysis submission. It can either reuse
+an existing rainfall scenario or explicitly create one. The script does not
+silently delete or invalidate caches, which are scientific derived outputs
+linked to a saved scenario. To avoid modifying persisted data, the default
+mode requires an existing scenario and refuses to build a missing cache unless
+`--build-missing` is supplied.
+
+```bash
+# Create a separate benchmark rainfall scenario and generate its derived cache.
+./tools/benchmark_derived_caches.py \
+  --url http://127.0.0.1:8123 --job-id JOB_UUID \
+  --create-scenario --build-missing --repeats 10 \
+  --concurrent-clients 4 > derived-cache-first.json
+
+# Reuse the exact scenario_id emitted above. Does not recalculate by default.
+./tools/benchmark_derived_caches.py \
+  --url http://127.0.0.1:8123 --job-id JOB_UUID \
+  --scenario-id SCENARIO_UUID --repeats 10 \
+  --concurrent-clients 4 > derived-cache-reuse.json
+
+# For restart validation, stop/start Hydrology without deleting its output
+# and run the same --scenario-id invocation once more.
+```
+
+The report distinguishes the first cache-only GET (200 vs 409), explicitly
+requested redistribution submission/wait, sequential GET samples and one wave
+of simultaneous GETs. It SHA-256 hashes the canonical JSON result and **fails**
+if repeated or parallel responses disagree. Matching hashes before and after
+restart are useful reproducibility evidence, but hash equality of a derived
+result is not independent physical validation.
+
+A first GET after service restart is **not** necessarily OS-cold: Linux may
+retain source/raster pages in the page cache. Each run contains network and
+client overhead, and `urllib` does not reproduce every production client’s
+connection-reuse strategy. The benchmark measures no RAM peak; combine it
+with actual process RSS/profiling on the target host. Baseline/candidate
+comparisons require the same persisted analysis and scenario, CPU load,
+server configuration, repetition counts and client machine. Record the
+repository revision and machine information next to both JSON reports.
+The generated benchmark scenario is retained, like any other scenario, until
+a deliberately requested offline cleanup.
+
+The benchmark's offline protocol test is registered with CTest as
+`aowis-hydrology-derived-cache-benchmark-tool`. It tests HTTP fixture logic
+without measuring the actual service. For an end-to-end functional contract
+against the real server and deterministic Map fixture, continue running
+`aowis-hydrology-http-contract`.
 
 ## Reporting, limitations and regression checks
 
@@ -307,7 +359,7 @@ benchmark of the analysis engine.
 The default CTest suite excludes expensive live benchmarks. Offline fixture
 checks are provided in `tests/test_benchmark_map_http.py`,
 `test_benchmark_map_series.py`, `test_benchmark_map_concurrency.py`, and
-`test_benchmark_map_jobs.py`; they do not require running servers. Benchmark
+`test_benchmark_map_jobs.py`, and `test_benchmark_derived_caches.py`; the latter also uses an offline mock and none require running production servers. Benchmark
 smoke tests are registered when `AOWIS_HYDROLOGY_BUILD_BENCHMARKS=ON`.
 
 The recorded performance conclusions and restart checklist are in
