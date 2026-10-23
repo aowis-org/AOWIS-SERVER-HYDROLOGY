@@ -1,0 +1,11 @@
+{
+  "reference": "analytic free overflow; independent RK4 0.001s",
+  "scenarios": ["single_free_outlet_20s", "two_reservoir_inflow_and_outlet_15s"],
+  "rows": [
+    {"dt_s": 1, "analytic_storage_max_error_m3": 4.6737159336647, "analytic_interval_discharge_max_error_m3_s": 1.0852180345259, "rk4_storage_max_error_m3": 9.8996099536039, "rk4_transfer_max_error_m3": 6.8866851851058, "rk4_outflow_max_error_m3": 3.0129247684835, "rk4_interval_discharge_max_error_m3_s": 0.8691859837349, "max_mass_balance_error_m3": 6.6791017161449e-13, "accepted_substeps": 35, "rejected_substeps": 0},
+    {"dt_s": 0.5, "analytic_storage_max_error_m3": 2.2963178887649, "analytic_interval_discharge_max_error_m3_s": 0.52471031566232, "rk4_storage_max_error_m3": 4.8381838026016, "rk4_transfer_max_error_m3": 3.3656930800604, "rk4_outflow_max_error_m3": 1.4724907225261, "rk4_interval_discharge_max_error_m3_s": 0.41651819316641, "max_mass_balance_error_m3": 5.4312110364663e-13, "accepted_substeps": 70, "rejected_substeps": 0},
+    {"dt_s": 0.25, "analytic_storage_max_error_m3": 1.1383439219098, "analytic_interval_discharge_max_error_m3_s": 0.25813595549034, "rk4_storage_max_error_m3": 2.3923251777198, "rk4_transfer_max_error_m3": 1.6642262105778, "rk4_outflow_max_error_m3": 0.72809896712749, "rk4_interval_discharge_max_error_m3_s": 0.20406392965997, "max_mass_balance_error_m3": 8.1645801230934e-13, "accepted_substeps": 140, "rejected_substeps": 0},
+    {"dt_s": 0.125, "analytic_storage_max_error_m3": 0.56675652124454, "analytic_interval_discharge_max_error_m3_s": 0.12804281905505, "rk4_storage_max_error_m3": 1.1896055390671, "rk4_transfer_max_error_m3": 0.8275516793413, "rk4_outflow_max_error_m3": 0.36205385971149, "rk4_interval_discharge_max_error_m3_s": 0.10101998497061, "max_mass_balance_error_m3": 7.4928951931952e-13, "accepted_substeps": 280, "rejected_substeps": 0},
+    {"dt_s": 0.0625, "analytic_storage_max_error_m3": 0.28277909020903, "analytic_interval_discharge_max_error_m3_s": 0.063768693327301, "rk4_storage_max_error_m3": 0.59317988596285, "rk4_transfer_max_error_m3": 0.41264687718109, "rk4_outflow_max_error_m3": 0.1805330087665, "rk4_interval_discharge_max_error_m3_s": 0.050261394882739, "max_mass_balance_error_m3": 1.2505552149378e-12, "accepted_substeps": 560, "rejected_substeps": 0}
+  ]
+}

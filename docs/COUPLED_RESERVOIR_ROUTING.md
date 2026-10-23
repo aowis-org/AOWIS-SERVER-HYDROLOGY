@@ -141,6 +141,11 @@ The reported water levels belong to **lumped reservoir approximations**. A snaps
 - The opt-in coupled simulation service now has separate job UUIDs, explicit input manifests, versioned cache files, cancellation and status APIs. It never overwrites static redistribution results or reuses their cache keys. It does not yet automatically build inflow histories from saved rainfall scenarios.
 - The opt-in [free-overflow boundary outlet](BOUNDARY_OUTLETS.md) now accounts for discharge leaving modeled reservoirs while preserving simultaneous update and per-snapshot conservation. It is not an inferred DEM feature or backwater calculation; it can now be configured explicitly through the separate persisted coupled simulation service. Physically defensible time-varying infiltration and connections to SWMM remain future capabilities.
 
+See [numerical verification and reference cases](NUMERICAL_VERIFICATION.md) for
+closed-form and independently integrated routing benchmarks, observed
+first-order timestep convergence, discharge-error measurements, and the
+limits of conservation-only assertions.
+
 ## Validation and known limitations
 
 `tests/test_coupled_routing.cpp` checks signed two-reservoir transfer, external inflows across successive intervals, conservation, simultaneous three-reservoir coupling, connection-list order invariance, step rejection, submerged-orifice cases, bad input, cancellation and work-limit exhaustion. All other hydrology tests remain present. The model must also be compared against independently validated reservoir-routing solutions before operational use.

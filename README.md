@@ -57,6 +57,7 @@ uncalibrated hydraulic controls. See [Product scope and open questions](docs/ROA
 [Free-overflow controls](docs/SPILL_HYDRAULICS.md),
 [Calibrated/submerged controls](docs/SUBMERGED_SPILL_CONTROLS.md),
 [Coupled reservoir routing](docs/COUPLED_RESERVOIR_ROUTING.md),
+[numerical verification and reference cases](docs/NUMERICAL_VERIFICATION.md),
 [External outlets](docs/BOUNDARY_OUTLETS.md),
 [Timed runoff](docs/TEMPORAL_RUNOFF_FORCING.md),
 [D8 travel-time approximation](docs/TRAVEL_TIME_RUNOFF.md),

@@ -80,6 +80,15 @@ CLI tests cover invalid and boundary values; HTTP status exposes the effective
 limit and current dispatched-cell count. This is an admission heuristic, not
 a measurement of actual RSS or a guarantee for other workload types.
 
+## Independent numerical reference tests
+
+The `numerical-verification` CTest label selects the analytic DEM and
+reservoir-routing benchmarks, including a closed-form free-outlet solution
+and a separately implemented RK4 coupled-network reference. Test failures
+include poor timestep refinement, mass conservation or known terrain
+geometry. See [numerical verification](NUMERICAL_VERIFICATION.md) for
+assumptions, measured error values, and exact reproducibility commands.
+
 ## Numerical and performance baselines
 
 The C++ CTest suite checks pure-core algorithms, conservation cases, DEM
