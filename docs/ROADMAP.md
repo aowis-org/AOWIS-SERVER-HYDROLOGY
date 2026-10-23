@@ -32,8 +32,14 @@ a separate idle check 5 seconds later saw 94 MiB. The benchmark now records
 post-wave sampled RSS separately from timed execution, to distinguish transient
 worker cleanup from settled process memory. Hierarchy construction retains
 identical grouping for equal-height plateaus and avoids hash-map grouping for
-singleton height levels while reusing scratch vectors; live GLO-30 speedup
-remains to be independently established. The source scripts are explicitly included in repository ZIPs rather than accidentally ignored by a broad `benchmark*` rule. **Remaining:** remeasure hierarchy optimization on live GLO-30, compare per-job Map patch request limits under four simultaneous analyses, test repeated large/city/metro grids with RSS after cleanup, compare independently configured GRASS/WhiteboxTools results, and design out-of-core processing only if justified. **Exit:** repeatable field-realistic benchmark reports, documented numerical accuracy, tested resource limits and representative service-deployment performance.
+singleton height levels while reusing scratch vectors; live GLO-30 results on a 948,600-cell job reduced hierarchy time from
+1,122 ms to 664 ms and total worker time from 2,256 ms to 1,648 ms,
+with unchanged basin counts and sampled DEM hashes (one run per version).
+Four-job batch throughput was unchanged at approximately 1.12 jobs/s,
+indicating overlapping source fetch and computation contention. The
+multi-job benchmark now retains per-job Map patch timings and reports
+the effective server worker/request settings to support a controlled
+2-versus-4 Map-requests-per-job comparison. The source scripts are explicitly included in repository ZIPs rather than accidentally ignored by a broad `benchmark*` rule. **Remaining:** compare per-job Map patch request limits under four simultaneous analyses, test repeated large/city/metro grids with RSS after cleanup, compare independently configured GRASS/WhiteboxTools results, and design out-of-core processing only if justified. **Exit:** repeatable field-realistic benchmark reports, documented numerical accuracy, tested resource limits and representative service-deployment performance.
 
 ## External integration checkpoints
 

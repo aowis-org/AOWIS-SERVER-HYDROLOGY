@@ -25,6 +25,7 @@ class Fixture:
         self.identical = True
         self.started = []
         self.invalid_queue = False
+        self.invalid_map_field = False
 
     def __enter__(self):
         fixture = self
@@ -51,7 +52,12 @@ class Fixture:
                         "stage_timings_ms": {"terrain_fetch": 20., "d8_analysis": 10.,
                             "depression_hierarchy": 10., "total_worker": 50.,
                             "queue_wait": -1.0 if fixture.invalid_queue else 1.0},
-                        "terrain_fetch_details": {"peak_in_flight": 4}})
+                        "terrain_fetch_details": {
+                            "peak_in_flight": 4, "transport": "map_http",
+                            "patch_count": 2, "response_bytes": 64,
+                            "map_request_ms": 15.0, "map_request_wall_ms": -1.0 if fixture.invalid_map_field else 12.0,
+                            "raster_copy_ms": 0.2, "first_request_ms": 8.0,
+                            "fastest_request_ms": 7.0, "slowest_request_ms": 8.0}})
                 return result
 
             def do_POST(self):
@@ -71,7 +77,8 @@ class Fixture:
 
             def do_GET(self):
                 if self.path == "/status":
-                    self.send_json({"status": "ok"})
+                    self.send_json({"status": "ok", "max_concurrent_analyses": 4,
+                                    "map_requests_per_analysis": 2})
                     return
                 path, _, query = self.path.partition("?")
                 chunks = path.strip("/").split("/")
@@ -147,6 +154,12 @@ class ConcurrentJobTests(unittest.TestCase):
             self.assertTrue(all(wave["jobs_details"][0]["elevation_window_sha256"] ==
                 report["elevation_window_sha256"] for wave in report["measured_waves"]))
             self.assertEqual(report["results"][1]["queue_wait_ms"]["median"], 1.0)
+            self.assertEqual(report["server_settings"], {
+                "max_concurrent_analyses": 4, "map_requests_per_analysis": 2})
+            self.assertEqual(report["results"][1]["terrain_fetch_details"]["map_request_wall_ms"]["median"], 12.0)
+            self.assertEqual(report["results"][1]["terrain_fetch_details"]["map_request_ms"]["median"], 15.0)
+            self.assertEqual(report["results"][1]["terrain_fetch_details"]["patch_count"]["median"], 2)
+            self.assertEqual(report["measured_waves"][0]["jobs_details"][0]["terrain_fetch_details"]["transport"], "map_http")
 
     def test_invalid_queue_wait_is_rejected(self):
         fixture = Fixture()
@@ -155,6 +168,27 @@ class ConcurrentJobTests(unittest.TestCase):
             args = minimal_args("--hydrology-url", url)
             with self.assertRaisesRegex(jobs.single.BenchmarkError, "invalid timing queue_wait"):
                 jobs.benchmark(args)
+
+    def test_invalid_map_diagnostic_is_rejected(self):
+        fixture = Fixture()
+        fixture.invalid_map_field = True
+        with fixture as url:
+            args = minimal_args("--hydrology-url", url)
+            with self.assertRaisesRegex(jobs.single.BenchmarkError, "invalid Map diagnostic map_request_wall_ms"):
+                jobs.benchmark(args)
+
+    def test_missing_optional_map_diagnostics_are_supported(self):
+        baseline = (4, 4, "dataset", 3, 2, "digest")
+        details = {"latency_ms": 100.0, "queue_wait_ms": 0.1,
+                   "terrain_peak_in_flight": 4, "terrain_fetch_details": {},
+                   "stage_timings_ms": {key: 10.0 for key in jobs.STAGES}}
+        wave = {"jobs": 1, "round": 1, "identity": baseline,
+                "completion_wall_ms": 100.0,
+                "completed_jobs_per_second": 10.0,
+                "jobs_details": [details], "rss": None}
+        group = jobs.summarize([wave], [1], 1, 0, 16)["results"][0]
+        self.assertIsNone(group["terrain_fetch_details"]["map_request_wall_ms"])
+        self.assertIsNone(group["terrain_fetch_details"]["transport"])
 
     def test_output_drift_is_rejected(self):
         fixture = Fixture()

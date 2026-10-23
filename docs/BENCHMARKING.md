@@ -455,6 +455,49 @@ jq '{created: .total_jobs_created, results: [.results[] | {
 }]}' benchmark-map-jobs.json
 ```
 
+The report also records `server_settings.max_concurrent_analyses` and
+`server_settings.map_requests_per_analysis` from Hydrology `/status` when
+available, so outputs from differently configured runs can be compared
+without guessing the active INI settings. For each job, `terrain_fetch_details`
+contains the validated existing Map HTTP request timings and patch counters;
+`results[].terrain_fetch_details` includes their per-level distributions.
+`map_request_ms` is the **sum** of overlapping request lifetimes and must not
+be treated as elapsed time. `map_request_wall_ms` spans first request issue
+to last completion and is the relevant network interval; `terrain_fetch`
+includes additional setup and raster assembly. These values distinguish
+transport contention from D8 and hierarchy CPU time but do **not** measure
+Map's internal CPU usage or globally outstanding Map requests. Missing
+optional fields from older servers appear as `null`; mixed availability in
+one measured level is rejected to prevent misleading medians.
+
+To test whether Map request oversubscription limits four-worker throughput,
+keep `[server] max_concurrent_analyses=4`, change only `[terrain]
+max_concurrent_requests` from `4` to `2`, and **restart Hydrology**. Confirm
+`/status` before each run, and repeat the same live benchmark with identical
+bounds, budgets, number of rounds, and running Map instance. For a
+948,600-cell job, one round of the 1/2/4-job comparison requires explicitly
+setting `--max-cells 1000000 --max-batch-cells 5000000
+--max-total-cells 8000000`; each run creates seven persisted jobs. Example
+summary of each resulting report:
+
+```bash
+jq '{settings: .server_settings, results: [.results[] | {
+  jobs, throughput: .throughput_jobs_per_second.median,
+  fetch_ms: .stage_timings_ms.terrain_fetch.median,
+  map_wall_ms: .terrain_fetch_details.map_request_wall_ms.median,
+  map_request_sum_ms: .terrain_fetch_details.map_request_ms.median,
+  copy_ms: .terrain_fetch_details.raster_copy_ms.median,
+  hierarchy_ms: .stage_timings_ms.depression_hierarchy.median,
+  peak_hydrology_kib: .rss_kib.hydrology.peak_kib.median,
+  settled_hydrology_kib: .rss_kib.hydrology.settled_kib.median
+}]}' benchmark-map-jobs-large.json
+```
+
+The default 4-request cap may outperform 2 even under high load; neither
+configuration is preferable without comparing measurements. `settled_kib`
+can remain elevated due to allocator arenas, memory caches, or live objects,
+and should not be labelled a leak without allocation/lifetime evidence.
+
 Newly submitted jobs now include `stage_timings_ms.queue_wait` in their
 persistent metadata: the monotonic wall time between enqueueing in the
 analysis thread pool and starting its worker. It is **excluded** from

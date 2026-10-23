@@ -122,7 +122,11 @@ With local PIDs, it also samples RSS again after an independently configurable
 post-wave delay (`--rss-settle-seconds`, default 2), without including that
 wait in batch execution time. Each report includes raw wave RSS and per-level
 memory distributions; a delayed reading is not proof of complete reclamation.
-It does not change the service scheduler or delete the persisted jobs it creates.
+It additionally records per-job Map request/copy durations, their concurrent-job
+distributions, and the worker/Map request limits reported by the server.
+Those details support controlled experiments with the `terrain/max_concurrent_requests`
+INI setting without modifying the service scheduler. It never deletes the
+persisted jobs it creates.
 
 `tools/benchmark_map_http.py` benchmarks a live Map → Hydrology terrain job,
 repeated bounded raster and basin queries, DEM window parity between Map and

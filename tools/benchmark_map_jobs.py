@@ -23,6 +23,11 @@ from benchmark_map_series import distribution
 
 
 STAGES = ("terrain_fetch", "d8_analysis", "depression_hierarchy", "total_worker")
+# Per-request durations are summed across overlapping HTTP calls. The wall
+# interval from first issue to last completion is reported separately.
+MAP_TIMINGS = ("map_request_ms", "map_request_wall_ms", "raster_copy_ms",
+               "first_request_ms", "fastest_request_ms", "slowest_request_ms")
+MAP_COUNTS = ("patch_count", "response_bytes")
 
 
 def levels_arg(value):
@@ -213,6 +218,20 @@ def submit_and_poll(args, barrier, slot):
     peak = fetch.get("peak_in_flight")
     if not isinstance(peak, int) or isinstance(peak, bool) or not 1 <= peak <= 4:
         raise single.BenchmarkError(f"job {job_id}: invalid Map peak_in_flight")
+    diagnostics = {}
+    for name in MAP_TIMINGS + MAP_COUNTS:
+        value = fetch.get(name)
+        if value is None:
+            continue  # historical/mock services may not expose the full set
+        if (not isinstance(value, (int, float)) or isinstance(value, bool) or
+                not math.isfinite(value) or value < 0 or
+                (name in MAP_COUNTS and (not isinstance(value, int) or value < 0))):
+            raise single.BenchmarkError(f"job {job_id}: invalid Map diagnostic {name}")
+        diagnostics[name] = value
+    if "transport" in fetch:
+        if not isinstance(fetch["transport"], str) or not fetch["transport"]:
+            raise single.BenchmarkError(f"job {job_id}: invalid Map transport")
+        diagnostics["transport"] = fetch["transport"]
     cols, rows = metadata.get("columns"), metadata.get("rows")
     if not isinstance(cols, int) or isinstance(cols, bool) or not isinstance(rows, int) or isinstance(rows, bool) or cols < 1 or rows < 1 or cols * rows > args.max_cells:
         raise single.BenchmarkError(f"job {job_id}: invalid result dimensions")
@@ -233,6 +252,7 @@ def submit_and_poll(args, barrier, slot):
             "stage_timings_ms": {field: stage[field] for field in STAGES},
             "queue_wait_ms": queue_wait,
             "terrain_peak_in_flight": peak,
+            "terrain_fetch_details": diagnostics,
             "metadata": metadata}
 
 
@@ -331,6 +351,21 @@ def summarize(waves, levels, rounds, warmup_rounds, expected_cells):
         if any(value is None for value in queue_waits) and not all(
                 value is None for value in queue_waits):
             raise single.BenchmarkError("mixed queue-wait diagnostics across jobs")
+        transport = [job.get("terrain_fetch_details", {}) for wave in batch
+                     for job in wave["jobs_details"]]
+        transport_stats = {}
+        for field in MAP_TIMINGS + MAP_COUNTS:
+            values = [item.get(field) for item in transport]
+            if all(value is None for value in values):
+                transport_stats[field] = None
+            elif any(value is None for value in values):
+                raise single.BenchmarkError(f"mixed Map diagnostic {field} across jobs")
+            else:
+                transport_stats[field] = distribution(values)
+        transports = {item.get("transport") for item in transport}
+        if len(transports) != 1:
+            raise single.BenchmarkError("mixed Map transport types across jobs")
+        transport_stats["transport"] = next(iter(transports))
         rss_samples = [wave.get("rss") for wave in batch]
         if all(sample is None for sample in rss_samples):
             rss_stats = None
@@ -344,6 +379,7 @@ def summarize(waves, levels, rounds, warmup_rounds, expected_cells):
                 for field in ("peak_kib", "peak_increase_kib", "settled_kib", "settled_change_kib")}
                 for name in sorted(process_names)}
         group = {"jobs": level, "waves": rounds, "rss_kib": rss_stats,
+                 "terrain_fetch_details": transport_stats,
                  "queue_wait_ms": (distribution(queue_waits)
                                    if all(value is not None for value in queue_waits) else None),
                  "wall_ms": distribution([wave["completion_wall_ms"] for wave in batch]),
@@ -379,6 +415,8 @@ def summarize(waves, levels, rounds, warmup_rounds, expected_cells):
                 "Round order is rotated; changing caches, CPU load, memory and disk I/O can affect every measurement.",
                 "Queue wait is measured by Hydrology before worker execution and does not count toward total_worker.",
                 "Absent queue-wait metadata from older servers is reported as null.",
+                "map_request_ms sums possibly overlapping Map HTTP request lifetimes; map_request_wall_ms is the issue-to-completion interval, not necessarily the whole terrain fetch.",
+                "server_settings are read from Hydrology /status before jobs are submitted; no Map global concurrency limit is inferred.",
             ]}
 
 
@@ -387,6 +425,14 @@ def benchmark(args, on_progress=None):
     status, _ = single.http_json(args.hydrology_url, "/status", args.request_timeout)
     if status.get("status") != "ok":
         raise single.BenchmarkError("Hydrology server status is not ok")
+    settings = {}
+    for name in ("max_concurrent_analyses", "map_requests_per_analysis"):
+        value = status.get(name)
+        if value is None:
+            continue  # mock or older server
+        if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 4:
+            raise single.BenchmarkError(f"invalid /status setting {name}")
+        settings[name] = value
     waves = []
     reference = None
     total_waves = len(args.jobs) * (args.rounds + args.warmup_rounds)
@@ -403,7 +449,9 @@ def benchmark(args, on_progress=None):
                 raise single.BenchmarkError("analysis outputs changed across waves")
             if iteration >= args.warmup_rounds:
                 waves.append(wave)
-    return summarize(waves, args.jobs, args.rounds, args.warmup_rounds, cells)
+    report = summarize(waves, args.jobs, args.rounds, args.warmup_rounds, cells)
+    report["server_settings"] = settings
+    return report
 
 
 def main(argv=None):
