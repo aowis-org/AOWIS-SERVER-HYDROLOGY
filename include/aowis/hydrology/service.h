@@ -55,6 +55,9 @@ struct ServiceConfig
     QString output_directory;
     QString dataset = QStringLiteral("copernicus-glo30");
     std::uint64_t maximum_cells = 10000000;
+    // DEM-based coupled geometry/scenario forcing is an additional costly
+    // workload. Keep its independently configurable ceiling explicit.
+    std::uint64_t maximum_coupled_dem_cells = 10000000;
     // Bounded number of simultaneous terrain-analysis jobs (1..4). Each
     // REST job can also issue source.max_concurrent_requests Map requests.
     // Keep the default at one for embedded integrations and large rasters.

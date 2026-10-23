@@ -464,7 +464,7 @@ QJsonObject readPage(const QString &folder, const QJsonObject &manifest, int off
 }
 
 ElevationGrid loadDem(const QString &job_folder, const QJsonObject &analysis,
-                      const std::atomic<bool> *cancelled)
+                      std::uint64_t maximum_cells, const std::atomic<bool> *cancelled)
 {
     ElevationGrid grid;
     grid.columns = std::uint32_t(analysis.value(QStringLiteral("columns")).toInt());
@@ -476,7 +476,7 @@ ElevationGrid loadDem(const QString &job_folder, const QJsonObject &analysis,
     grid.geometry.vertical_datum = analysis.value(QStringLiteral("vertical_datum")) ==
         QStringLiteral("EGM2008") ? VerticalDatum::Egm2008 : VerticalDatum::Unknown;
     const std::uint64_t count = std::uint64_t(grid.columns) * grid.rows;
-    requireSimulation(count > 0 && count <= 10000000, "Invalid terrain grid size");
+    requireSimulation(count > 0 && count <= maximum_cells, "Coupled DEM cell limit exceeded");
     QFile file(QDir(job_folder).filePath(QStringLiteral("elevation.f32")));
     if (!file.open(QIODevice::ReadOnly) || file.size() != qint64(count * 4))
         throw std::runtime_error("Missing original elevation raster");
@@ -500,9 +500,9 @@ ElevationGrid loadDem(const QString &job_folder, const QJsonObject &analysis,
 }
 
 SpillGeometry loadGeometry(const QString &folder, const QJsonObject &analysis,
-                           const std::atomic<bool> *cancelled)
+                           std::uint64_t maximum_cells, const std::atomic<bool> *cancelled)
 {
-    const ElevationGrid grid = loadDem(folder, analysis, cancelled);
+    const ElevationGrid grid = loadDem(folder, analysis, maximum_cells, cancelled);
     QFile file(QDir(folder).filePath(QStringLiteral("basins.aowbin")));
     if (!file.open(QIODevice::ReadOnly) || file.size() < 41 ||
         file.size() > 41 + 162 * qint64(grid.columns) * grid.rows ||
@@ -586,6 +586,7 @@ struct PreparedForcing
 PreparedForcing buildScenarioForcing(const QString &job_folder, const QJsonObject &analysis,
                                     const QJsonObject &request,
                                     const std::vector<CoupledReservoir> &reservoirs,
+                                    std::uint64_t maximum_cells,
                                     const std::atomic<bool> *cancelled)
 {
     const ScenarioForcingInput input = parseScenarioForcing(request);
@@ -606,7 +607,7 @@ PreparedForcing buildScenarioForcing(const QString &job_folder, const QJsonObjec
     const double expected_runoff = number(scenario, "effective_runoff_volume_m3");
     requireSimulation(duration > 0.0 && expected_runoff >= 0.0,
         "Invalid saved rainfall scenario duration or runoff volume");
-    const ElevationGrid elevation = loadDem(job_folder, analysis, cancelled);
+    const ElevationGrid elevation = loadDem(job_folder, analysis, maximum_cells, cancelled);
     const DepressionHierarchy hierarchy = loadSavedHierarchy(job_folder, elevation.columns,
                                                                elevation.rows, cancelled);
     const std::vector<double> runoff = readRunoffRaster(scenario_folder,
@@ -711,7 +712,16 @@ QJsonObject AnalysisService::startCoupledSimulation(const QString &id,
             copy.insert(QStringLiteral("connections"), QJsonArray());
             return copy;
         }();
-        (void)boundedArray(request, "connections", 0, MaximumConnections);
+        const QJsonArray requested_connections =
+            boundedArray(request, "connections", 0, MaximumConnections);
+        if (!requested_connections.isEmpty() || request.contains(QStringLiteral("scenario_forcing")))
+        {
+            const double columns = analysis.value(QStringLiteral("columns")).toDouble();
+            const double rows = analysis.value(QStringLiteral("rows")).toDouble();
+            requireSimulation(columns >= 2 && rows >= 2 &&
+                columns * rows <= double(this->config.maximum_coupled_dem_cells),
+                "Coupled DEM cell limit exceeded");
+        }
         requireSimulation(!request.contains(QStringLiteral("options")) ||
             request.value(QStringLiteral("options")).isObject(),
             "Invalid coupled simulation options");
@@ -786,7 +796,7 @@ void AnalysisService::runCoupledTask(const QSharedPointer<CoupledTask> &task)
         SpillGeometry geometry;
         if (!connections.isEmpty())
             geometry = loadGeometry(QDir(this->config.output_directory).filePath(task->analysis_id),
-                                    analysis, &task->cancelled);
+                                    analysis, this->config.maximum_coupled_dem_cells, &task->cancelled);
         SimulationInput input = parseInput(task->request, &geometry,
             task->request.contains(QStringLiteral("scenario_forcing")));
         QJsonObject forcing_provenance;
@@ -794,7 +804,8 @@ void AnalysisService::runCoupledTask(const QSharedPointer<CoupledTask> &task)
         {
             PreparedForcing prepared = buildScenarioForcing(
                 QDir(this->config.output_directory).filePath(task->analysis_id),
-                analysis, task->request, input.reservoirs, &task->cancelled);
+                analysis, task->request, input.reservoirs,
+                this->config.maximum_coupled_dem_cells, &task->cancelled);
             input.intervals = std::move(prepared.intervals);
             forcing_provenance = prepared.provenance;
         }

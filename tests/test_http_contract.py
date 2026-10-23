@@ -223,6 +223,8 @@ class HttpContractTests(unittest.TestCase):
         self.assertEqual(status["service"], "aowis-server-hydrology")
         self.assertEqual(status["max_concurrent_analyses"], 1)
         self.assertEqual(status["max_outstanding_analyses"], 8)
+        self.assertEqual(status["max_cells"], 10000)
+        self.assertEqual(status["max_coupled_dem_cells"], 10000000)
         self.assertEqual(status["http_workers"], 8)
         self.assertEqual(status["http_max_queued_requests"], 32)
         self.assertEqual(status["terrain_jobs"]["outstanding"], 0)

@@ -97,7 +97,7 @@ uses Map REST; optional GDAL GeoTIFF readers are for testing/development.
   newest terminal tasks remain readable while the service is running. Masks
   are disk-spooled, not kept in the job map, and are deleted on server shutdown.
   Canceled queued tasks release capacity immediately. Full-grid catchment
-  graph reconstruction is serialized across both APIs; a second synchronous
+  D8 graph traversal is serialized across both APIs; a second synchronous
   catchment request receives HTTP 429 rather than allocating another graph. The legacy synchronous
   `GET /catchment` remains compatible for existing clients; asynchronous
   requests are recommended for large grids. Catchment status and masks are not

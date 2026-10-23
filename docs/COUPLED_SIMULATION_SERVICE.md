@@ -18,7 +18,17 @@ The client is responsible for defensible stage–storage models and calibrated c
 | `GET` | `/v1/jobs/{job-id}/coupled-simulations/{simulation-id}/snapshots?offset=0&limit=25` | Read verified, bounded time-series rows, no solver work |
 | `DELETE` | `/v1/jobs/{job-id}/coupled-simulations/{simulation-id}` | Request cooperative cancellation of an active simulation |
 
-`POST` requires a **completed analysis job**. A saved rainfall scenario is required only for an opt-in `scenario_forcing` request. The accepted response includes a `simulation_id`, a `job_id`, `state`, `result_ready`, `model`, `error`, and work counters. Poll until `state=completed`; `failed`, `canceled` and `interrupted` are terminal. Query snapshots only when `result_ready=true`.
+`POST` requires a **completed analysis job**. DEM-dependent requests (internal
+`connections` or `scenario_forcing`) additionally require an analysis with no more
+than `server/max_coupled_dem_cells` cells (default 10 million, adjustable up to
+100 million). This is independent of the terrain-analysis `server/max_cells`
+limit; explicit reservoir/inflow simulations without DEM geometry are unaffected.
+Oversized DEM-dependent requests fail at admission, before creating a simulation
+folder or scheduling work, and return HTTP 400. The `/status` endpoint exposes
+both limits for clients to discover. Increasing the limit requires a suitable
+RAM budget for elevation, basin geometry and scenario-forcing scratch arrays.
+
+A saved rainfall scenario is required only for an opt-in `scenario_forcing` request. The accepted response includes a `simulation_id`, a `job_id`, `state`, `result_ready`, `model`, `error`, and work counters. Poll until `state=completed`; `failed`, `canceled` and `interrupted` are terminal. Query snapshots only when `result_ready=true`.
 
 The C++ `AnalysisService` methods mirror the REST methods: `startCoupledSimulation`, `coupledSimulationStatus`, `coupledSimulationSnapshots`, and `cancelCoupledSimulation`. The standalone host uses these methods on its existing service instance; **no localhost request is required**.
 

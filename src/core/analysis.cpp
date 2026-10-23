@@ -504,18 +504,18 @@ AnalysisResult analyze(const ElevationGrid &grid, const AnalysisOptions &options
     return result;
 }
 
-std::vector<std::uint8_t> delineateCatchment(const AnalysisResult &result,
-                                             std::uint64_t outlet_index,
-                                             const std::atomic<bool> *cancel_requested)
+std::vector<std::uint8_t> delineateCatchmentWithReader(
+    std::uint32_t columns, std::uint32_t rows, std::uint64_t outlet_index,
+    bool outlet_valid, const std::function<std::int64_t(std::uint64_t)> &downstream_at,
+    const std::atomic<bool> *cancel_requested)
 {
-    const std::size_t count = result.downstream.size();
-    if (outlet_index >= count ||
-        result.upstream_cell_count.size() != count ||
-        result.upstream_cell_count[std::size_t(outlet_index)] == 0)
+    const std::uint64_t count = std::uint64_t(columns) * rows;
+    if (columns < 2 || rows < 2 || outlet_index >= count || !outlet_valid ||
+        !downstream_at)
         throw std::invalid_argument("Catchment outlet lies outside the valid DEM");
     if (cancel_requested && cancel_requested->load())
         throw std::runtime_error("Catchment task canceled");
-    std::vector<std::uint8_t> mask(count, 0);
+    std::vector<std::uint8_t> mask(std::size_t(count), 0);
     std::queue<std::uint64_t> frontier;
     mask[std::size_t(outlet_index)] = 1;
     frontier.push(outlet_index);
@@ -526,18 +526,35 @@ std::vector<std::uint8_t> delineateCatchment(const AnalysisResult &result,
             throw std::runtime_error("Catchment task canceled");
         const std::uint64_t current = frontier.front();
         frontier.pop();
+        const std::int64_t x = std::int64_t(current % columns);
+        const std::int64_t y = std::int64_t(current / columns);
         for (int direction = 0; direction < 8; ++direction)
         {
-            std::uint64_t adjacent = 0;
-            if (!neighbor(result.source, current, direction, &adjacent) ||
-                mask[std::size_t(adjacent)] ||
-                result.downstream[std::size_t(adjacent)] != std::int64_t(current))
-                continue;
+            const std::int64_t ax = x + NeighborDx[direction];
+            const std::int64_t ay = y + NeighborDy[direction];
+            if (ax < 0 || ay < 0 || ax >= columns || ay >= rows) continue;
+            const std::uint64_t adjacent = std::uint64_t(ay) * columns + std::uint64_t(ax);
+            if (mask[std::size_t(adjacent)] ||
+                downstream_at(adjacent) != std::int64_t(current)) continue;
             mask[std::size_t(adjacent)] = 1;
             frontier.push(adjacent);
         }
     }
     return mask;
+}
+
+std::vector<std::uint8_t> delineateCatchment(const AnalysisResult &result,
+                                             std::uint64_t outlet_index,
+                                             const std::atomic<bool> *cancel_requested)
+{
+    const std::uint64_t count = std::uint64_t(result.source.columns) * result.source.rows;
+    if (result.downstream.size() != count || result.upstream_cell_count.size() != count)
+        throw std::invalid_argument("Catchment flow graph dimensions mismatch");
+    return delineateCatchmentWithReader(result.source.columns, result.source.rows,
+        outlet_index, outlet_index < count &&
+            result.upstream_cell_count[std::size_t(outlet_index)] != 0,
+        [&result](std::uint64_t index) { return result.downstream[std::size_t(index)]; },
+        cancel_requested);
 }
 
 void cellCoordinate(const ElevationGrid &grid, std::uint64_t index,

@@ -282,6 +282,17 @@ Useful GET/POST endpoints after job completion:
 | Static inundation | `POST /rainfall-scenarios/{id}/inundation`, `GET .../inundation/status`, `GET .../inundation/depth?...`, `DELETE .../inundation` |
 | Coupled simulation | `POST /coupled-simulations`, `GET /coupled-simulations/{id}`, `GET /coupled-simulations/{id}/snapshots?...`, `DELETE /coupled-simulations/{id}` |
 
+Catchment requests traverse the immutable memory-mapped downstream raster;
+only the requested outlet's contributing-cell count is read, so each request
+avoids materializing two complete 64-bit flow-graph arrays. One-byte-per-cell
+output and the upstream traversal queue remain proportional to the domain and
+catchment. The asynchronous API is preferable for large full-grid results.
+
+`server/max_coupled_dem_cells` separately controls DEM-dependent coupled
+simulations (10 million by default, up to 100 million with sufficient memory).
+Purely explicit reservoir simulations do not load an elevation raster. Both
+terrain and coupled cell ceilings are advertised by `GET /status`.
+
 Most large raster responses are **headerless binary arrays**, window-limited
 to 512 × 512 cells. Interpret their sample type, units and north-to-south row
 order according to the relevant feature document and the saved job's geometry.

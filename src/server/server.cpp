@@ -45,6 +45,7 @@ ServiceConfig serviceConfig(const ServerConfig &config)
     result.output_directory = config.output_directory;
     result.dataset = config.dataset;
     result.maximum_cells = config.maximum_cells;
+    result.maximum_coupled_dem_cells = config.maximum_coupled_dem_cells;
     result.max_concurrent_analyses = config.max_concurrent_analyses;
     result.max_outstanding_analyses = config.max_outstanding_analyses;
     return result;
@@ -127,6 +128,8 @@ void Server::setupRoutes()
             {QStringLiteral("service"), QStringLiteral("aowis-server-hydrology")},
             {QStringLiteral("status"), QStringLiteral("ok")},
             {QStringLiteral("max_concurrent_analyses"), this->config.max_concurrent_analyses},
+            {QStringLiteral("max_cells"), double(this->config.maximum_cells)},
+            {QStringLiteral("max_coupled_dem_cells"), double(this->config.maximum_coupled_dem_cells)},
             {QStringLiteral("max_outstanding_analyses"), this->config.max_outstanding_analyses},
             {QStringLiteral("http_workers"), this->config.http_workers},
             {QStringLiteral("http_max_queued_requests"), this->config.http_max_queued_requests},
@@ -713,7 +716,8 @@ void Server::setupRoutes()
         const QJsonObject result = this->service.startCoupledSimulation(id, document.object(), &error);
         if (!error.isEmpty())
             return errorResponse(error, error.startsWith(QStringLiteral("Invalid")) ||
-                error.startsWith(QStringLiteral("Duplicate"))
+                error.startsWith(QStringLiteral("Duplicate")) ||
+                error.startsWith(QStringLiteral("Coupled DEM cell limit exceeded"))
                 ? Status::BadRequest : error.startsWith(QStringLiteral("Unknown"))
                 ? Status::NotFound : error.startsWith(QStringLiteral("Coupled simulation queue full"))
                 ? Status::Conflict : Status::InternalServerError);

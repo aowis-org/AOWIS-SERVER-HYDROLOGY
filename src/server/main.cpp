@@ -23,6 +23,9 @@ listen_address=127.0.0.1
 port=8123
 output_directory=
 max_cells=10000000
+; DEM-dependent coupled simulations have a separate cap (4..100000000).
+; Without DEM geometry or scenario forcing, explicit reservoir runs need no DEM.
+max_coupled_dem_cells=10000000
 ; Independent analysis workers (1..4). Default 1 to limit memory use.
 max_concurrent_analyses=1
 ; Maximum queued plus active terrain jobs (1..64, at least worker count).
@@ -94,6 +97,14 @@ bool loadConfig(const QString &file_path, bool explicitly_requested,
         return false;
     }
     config->maximum_cells = std::uint64_t(max_cells);
+    const qulonglong coupled_max = settings.value(QStringLiteral("server/max_coupled_dem_cells"),
+        10000000).toString().toULongLong(&valid);
+    if (!valid || coupled_max < 4 || coupled_max > 100000000)
+    {
+        *error = QStringLiteral("max_coupled_dem_cells must be between 4 and 100000000");
+        return false;
+    }
+    config->maximum_coupled_dem_cells = std::uint64_t(coupled_max);
     config->max_concurrent_analyses = settings.value(
         QStringLiteral("server/max_concurrent_analyses"), 1).toString().toInt(&valid);
     if (!valid || config->max_concurrent_analyses < 1 ||

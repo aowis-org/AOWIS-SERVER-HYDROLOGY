@@ -6,6 +6,7 @@
 #include <aowis/hydrology/spatial_queries.h>
 
 #include <QCryptographicHash>
+#include <QByteArrayView>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -119,7 +120,7 @@ QString writeArray(const QString &path, const std::vector<T> &values)
         {
             if (file.write(buffer.constData(), used) != used)
                 throw std::runtime_error("Cannot write analysis result");
-            hash.addData(buffer.constData(), used);
+            hash.addData(QByteArrayView(buffer.constData(), used));
             used = 0;
         }
         if constexpr (sizeof(T) == 4)
@@ -140,7 +141,7 @@ QString writeArray(const QString &path, const std::vector<T> &values)
     {
         if (file.write(buffer.constData(), used) != used)
             throw std::runtime_error("Cannot write analysis result");
-        hash.addData(buffer.constData(), used);
+        hash.addData(QByteArrayView(buffer.constData(), used));
     }
     if (!file.commit())
         throw std::runtime_error("Cannot commit analysis result");
@@ -703,6 +704,13 @@ AnalysisService::~AnalysisService()
 
 bool AnalysisService::initialize(QString *error)
 {
+    if (this->config.maximum_coupled_dem_cells < 4 ||
+        this->config.maximum_coupled_dem_cells > 100000000ULL)
+    {
+        if (error != nullptr)
+            *error = QStringLiteral("max_coupled_dem_cells must be between 4 and 100000000");
+        return false;
+    }
     if (this->config.max_concurrent_analyses < 1 ||
         this->config.max_concurrent_analyses > 4)
     {
@@ -1051,7 +1059,7 @@ void AnalysisService::runJob(const QSharedPointer<Job> &job)
             !archive.commit())
             throw std::runtime_error("Cannot save depression hierarchy archive");
         QCryptographicHash basin_hash(QCryptographicHash::Sha256);
-        basin_hash.addData(reinterpret_cast<const char *>(encoded.data()), qsizetype(encoded.size()));
+        basin_hash.addData(QByteArrayView(reinterpret_cast<const char *>(encoded.data()), qsizetype(encoded.size())));
         {
             QMutexLocker locker(&this->jobs_mutex);
             job->artifact_integrity.insert(QStringLiteral("basins.aowbin"),
@@ -1353,10 +1361,9 @@ QByteArray AnalysisService::catchmentImpl(const QString &id, int x, int y,
         if (error != nullptr) *error = QStringLiteral("Invalid catchment outlet cell");
         return {};
     }
-    // Every catchment materializes whole-grid graph arrays today. Protect
-    // the process against concurrent allocations, including calls through
-    // the legacy synchronous C++/HTTP API. Async workers may wait here; sync
-    // handlers return a busy error without occupying an HTTP worker.
+    // Map the downstream file instead of materializing two whole-grid graph
+    // arrays; still bound concurrent traversal and full-grid mask allocations.
+    // Async workers may wait here; sync handlers return a busy error.
     if (cancel_requested)
     {
         while (!this->catchment_calculation_slot.tryAcquire(1, 50))
@@ -1389,26 +1396,25 @@ QByteArray AnalysisService::catchmentImpl(const QString &id, int x, int y,
             throw std::runtime_error("Missing or incomplete flow graph");
         if (cancel_requested && cancel_requested->load())
             throw std::runtime_error("Catchment task canceled");
-        const QByteArray links_bytes = links.readAll();
-        const QByteArray counts_bytes = counts.readAll();
-        if (links_bytes.size() != qsizetype(cells * 8) ||
-            counts_bytes.size() != qsizetype(cells * 8))
-            throw std::runtime_error("Cannot read complete flow graph");
-        AnalysisResult result;
-        result.source = item->grid;
-        result.downstream.resize(std::size_t(cells));
-        result.upstream_cell_count.resize(std::size_t(cells));
-        for (std::uint64_t cell = 0; cell < cells; ++cell)
-        {
-            if ((cell & 8191u) == 0 && cancel_requested && cancel_requested->load())
-                throw std::runtime_error("Catchment task canceled");
-            result.downstream[std::size_t(cell)] = downstreamValue(
-                links_bytes.constData() + qsizetype(cell * 8));
-            result.upstream_cell_count[std::size_t(cell)] = countValue(
-                counts_bytes.constData() + qsizetype(cell * 8));
-        }
-        const std::vector<std::uint8_t> mask = delineateCatchment(result,
-            std::uint64_t(y) * item->grid.columns + std::uint64_t(x), cancel_requested);
+        // D8 contributors are always immediate neighbors. Map the immutable
+        // downstream file and only read the eight bytes needed for outlet
+        // validity from the count file. This avoids two extra 8-byte-per-cell
+        // buffers and two reconstructed vectors on every catchment request.
+        const std::uint64_t outlet = std::uint64_t(y) * item->grid.columns + std::uint64_t(x);
+        if (!counts.seek(qint64(outlet * 8)))
+            throw std::runtime_error("Cannot seek contributing-cell count");
+        const QByteArray outlet_bytes = counts.read(8);
+        if (outlet_bytes.size() != 8)
+            throw std::runtime_error("Cannot read contributing-cell count");
+        const uchar *mapped = links.map(0, qint64(cells * 8));
+        if (!mapped)
+            throw std::runtime_error("Cannot memory-map downstream raster");
+        const std::vector<std::uint8_t> mask = delineateCatchmentWithReader(
+            item->grid.columns, item->grid.rows, outlet,
+            countValue(outlet_bytes.constData()) != 0,
+            [mapped](std::uint64_t cell) {
+                return downstreamValue(reinterpret_cast<const char *>(mapped + cell * 8));
+            }, cancel_requested);
         return QByteArray(reinterpret_cast<const char *>(mask.data()), qsizetype(mask.size()));
     }
     catch (const std::exception &ex)

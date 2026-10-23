@@ -109,6 +109,31 @@ int main()
     assert(catchment_cancellation_observed);
     catchment_cancelled.store(false);
     assert(delineateCatchment(result, 24, &catchment_cancelled) == catchment);
+    // File-backed service queries use the same traversal with random-access
+    // downstream values, without reconstructing a second graph in memory.
+    for (std::uint64_t outlet = 0; outlet < result.downstream.size(); ++outlet)
+    {
+        const auto reference = delineateCatchment(result, outlet);
+        const auto mapped_style = delineateCatchmentWithReader(grid.columns, grid.rows,
+            outlet, result.upstream_cell_count[std::size_t(outlet)] != 0,
+            [&result](std::uint64_t cell) { return result.downstream[std::size_t(cell)]; });
+        assert(reference == mapped_style);
+    }
+    bool bad_reader_outlet = false;
+    try {
+        (void)delineateCatchmentWithReader(grid.columns, grid.rows, 25, true,
+            [](std::uint64_t) { return std::int64_t(-1); });
+    } catch (const std::invalid_argument &) { bad_reader_outlet = true; }
+    assert(bad_reader_outlet);
+    bool reader_cancelled = false;
+    catchment_cancelled.store(true);
+    try {
+        (void)delineateCatchmentWithReader(grid.columns, grid.rows, 24, true,
+            [&result](std::uint64_t cell) { return result.downstream[std::size_t(cell)]; },
+            &catchment_cancelled);
+    } catch (const std::runtime_error &) { reader_cancelled = true; }
+    assert(reader_cancelled);
+    catchment_cancelled.store(false);
     assert(catchment[24] == 1);
     assert(result.upstream_cell_count[24] >= 1);
     std::uint64_t counted = 0;

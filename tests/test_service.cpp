@@ -24,6 +24,8 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <utility>
+#include <vector>
 #include <stdexcept>
 #include <limits>
 
@@ -89,6 +91,11 @@ int main(int argc, char **argv)
         invalid.max_concurrent_analyses = 5;
         AnalysisService oversized_service(invalid);
         assert(!oversized_service.initialize(&error));
+        invalid = configuration;
+        invalid.maximum_coupled_dem_cells = 3;
+        AnalysisService invalid_coupled(invalid);
+        assert(!invalid_coupled.initialize(&error));
+        assert(error.contains(QStringLiteral("max_coupled_dem_cells")));
     }
     {
         QTemporaryDir concurrent_directory;
@@ -345,6 +352,19 @@ int main(int argc, char **argv)
         assert(error.contains(QStringLiteral("Invalid constrained breach")));
         const QByteArray mask = service.catchment(successful_id, columns - 1, rows - 1, &error);
         assert(error.isEmpty() && mask.size() == columns * rows);
+        // The memory-mapped D8 traversal must match the saved upstream-cell
+        // totals for outlets across different locations, not only a corner.
+        for (const auto &[ox, oy] : std::vector<std::pair<int, int>>{
+                 {0, 0}, {1, 1}, {columns / 2, rows / 2}, {columns - 1, rows - 1}})
+        {
+            const QByteArray catchment_mask = service.catchment(successful_id, ox, oy, &error);
+            assert(error.isEmpty() && catchment_mask.size() == columns * rows);
+            const auto outlet = std::size_t(oy) * columns + ox;
+            const quint64 expected = qFromLittleEndian<quint64>(data.constData() + outlet * 8);
+            assert(catchment_mask.at(qsizetype(outlet)) == 1);
+            assert(std::count(catchment_mask.cbegin(), catchment_mask.cend(), char(1)) ==
+                   std::ptrdiff_t(expected));
+        }
         // Async catchment must preserve exact bytes without holding a
         // long-running HTTP handler, including concurrent task polls.
         assert(service.startCatchment(successful_id, -1, 0, &error).isEmpty());
@@ -519,6 +539,30 @@ int main(int argc, char **argv)
         assert(service.cancel(successful_id)); // completed jobs remain completed
         assert(service.job(successful_id).value(QStringLiteral("state")) ==
             QStringLiteral("completed"));
+    }
+    // A completed terrain analysis can exceed the stricter coupled DEM
+    // budget, but pure prescribed-inflow simulations need no raster loading.
+    // Reject a DEM-dependent job before creating any simulation directory.
+    {
+        ServiceConfig limited_config = configuration;
+        limited_config.maximum_coupled_dem_cells = 4;
+        AnalysisService limited(limited_config);
+        QString error;
+        assert(limited.initialize(&error));
+        const QJsonObject saved = limited.job(successful_id);
+        assert(saved.value(QStringLiteral("state")) == QStringLiteral("completed"));
+        assert(saved.value(QStringLiteral("columns")).toInt() *
+               saved.value(QStringLiteral("rows")).toInt() > 4);
+        const QString folder = QDir(configuration.output_directory).filePath(
+            successful_id + QStringLiteral("/coupled-simulations"));
+        const QStringList old_entries = QDir(folder).entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+        const QJsonObject dem_required{
+            {QStringLiteral("connections"), QJsonArray{QJsonObject{}}},
+            {QStringLiteral("reservoirs"), QJsonArray()}
+        };
+        assert(limited.startCoupledSimulation(successful_id, dem_required, &error).isEmpty());
+        assert(error == QStringLiteral("Coupled DEM cell limit exceeded"));
+        assert(QDir(folder).entryList(QDir::Dirs | QDir::NoDotAndDotDot) == old_entries);
     }
     // Metadata and binary results remain available across service restarts.
     {

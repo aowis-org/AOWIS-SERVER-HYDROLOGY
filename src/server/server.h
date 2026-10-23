@@ -18,6 +18,9 @@ struct ServerConfig
     QString output_directory;
     QString dataset = QStringLiteral("copernicus-glo30");
     std::uint64_t maximum_cells = 10000000;
+    // DEM-based coupled geometry/scenario forcing is an additional costly
+    // workload. Keep its independently configurable ceiling explicit.
+    std::uint64_t maximum_coupled_dem_cells = 10000000;
     int max_concurrent_analyses = 1;
     int max_outstanding_analyses = 8;
     int http_workers = 8;

@@ -92,7 +92,10 @@ The HTTP contract suite compares synchronous and asynchronous catchment masks
 byte-for-byte, checks invalid outlet requests, task polling, and verifies that
 transient catchment task metadata is not restored after restart. For very large
 catchments, prefer the async API so the HTTP request worker performs only
-submission/polling, rather than running full-grid graph reconstruction.
+submission/polling, rather than traversing the full-grid flow graph. The
+immutable downstream raster is memory-mapped and only the outlet's saved
+contributing-cell count is read; results do not require decoding two complete
+64-bit arrays. Catchment output masks still require one byte per grid cell.
 
 One worker processes catchment tasks at a time to bound peak memory. The task
 queue admits four queued/running calculations and retains four completed or
@@ -146,3 +149,20 @@ checksum at startup to avoid decoding all basin records into memory; its full
 semantic record validation remains performed by the archive decoder when the
 hierarchy is read. Tests cover missing files, truncation, equal-length damage,
 archive corruption, interrupted publication and legacy inventories.
+
+## Coupled DEM and catchment resource contracts
+
+`server/max_cells` limits terrain-analysis admission; the independently
+configurable `server/max_coupled_dem_cells` (default 10 million, range 4 to
+100 million) limits the additional DEM read/geometry work required for coupled
+internal connections and scenario forcing. Both are exposed by `/status`.
+Purely explicit calibrated reservoir simulations do not load terrain and are
+not restricted by the coupled DEM budget. Oversized DEM-dependent requests
+are rejected before a simulation is enqueued or its directory created.
+
+Numerical-core tests compare the catchment random-access traversal with the
+existing in-memory D8 analysis output. The service test checks the mapped
+persisted raster against known upstream counts at multiple outlets; the HTTP
+contract validates synchronous/async byte-identical masks. Memory mapping
+reduces duplicated user-space graph arrays, but page-cache residency and
+output-mask memory are still significant at large grid sizes.

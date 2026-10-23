@@ -45,6 +45,7 @@ class ServerConfigurationCliTests(unittest.TestCase):
         self.assertIn(str(target), self.run_cli("--write-default-config", target).stdout)
         self.assertIn("max_concurrent_analyses=1", target.read_text(encoding="utf-8"))
         self.assertIn("max_outstanding_analyses=8", target.read_text(encoding="utf-8"))
+        self.assertIn("max_coupled_dem_cells=10000000", target.read_text(encoding="utf-8"))
         content = target.read_bytes()
         self.run_cli("--write-default-config", target, success=False)
         self.assertEqual(target.read_bytes(), content)
@@ -94,6 +95,17 @@ class ServerConfigurationCliTests(unittest.TestCase):
                                            success=False).stderr)
         target.write_text("[server]\nmax_concurrent_analyses=2\n"
                           "max_outstanding_analyses=2\n", encoding="utf-8")
+        self.run_cli("--config", target, "--check-config")
+
+    def test_coupled_dem_budget_validation(self):
+        target = self.root / "coupled-limits.ini"
+        for setting in ("max_coupled_dem_cells=0", "max_coupled_dem_cells=100000001",
+                        "max_coupled_dem_cells=not-a-number"):
+            target.write_text("[server]\n" + setting + "\n", encoding="utf-8")
+            self.assertIn("max_coupled_dem_cells", self.run_cli(
+                "--config", target, "--check-config", success=False).stderr)
+        target.write_text("[server]\nmax_cells=100000000\n"
+                          "max_coupled_dem_cells=100000000\n", encoding="utf-8")
         self.run_cli("--config", target, "--check-config")
 
     def test_http_transport_limits(self):

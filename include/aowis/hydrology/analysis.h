@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -81,6 +82,16 @@ AnalysisResult analyze(const ElevationGrid &grid,
 std::vector<std::uint8_t> delineateCatchment(const AnalysisResult &result,
                                              std::uint64_t outlet_index,
                                              const std::atomic<bool> *cancel_requested = nullptr);
+
+// Catchment delineation from an immutable random-access D8 graph. The reader
+// returns the downstream cell index (-1 for an outlet) for the given cell.
+// This permits service callers to traverse memory-mapped persistent flow
+// rasters without reconstructing two entire in-memory 64-bit graph arrays.
+// outlet_valid must be derived from the saved contributing-cell count.
+std::vector<std::uint8_t> delineateCatchmentWithReader(
+    std::uint32_t columns, std::uint32_t rows, std::uint64_t outlet_index,
+    bool outlet_valid, const std::function<std::int64_t(std::uint64_t)> &downstream_at,
+    const std::atomic<bool> *cancel_requested = nullptr);
 
 // Centre-of-cell for an index in the grid, in the grid's native CRS.
 void cellCoordinate(const ElevationGrid &grid, std::uint64_t index,
