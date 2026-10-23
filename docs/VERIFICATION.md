@@ -67,6 +67,19 @@ The suite is a *minimum* migration compatibility gate. It does not prove that
 all routes or all accepted payloads are compatible; more cases can be added as
 needed, without changing the existing baseline expectations.
 
+## Terrain execution-cell budget
+
+In addition to the per-job `max_cells` cap and outstanding queue depth, the
+service admits only enough *running* terrain jobs to fit its combined cell
+budget. The default `max_active_terrain_cells=0` inherits `max_cells`.
+The service test holds one terrain reader while submitting another to verify
+that a second worker is not dispatched beyond the cell budget, and that
+waiting work starts when running work releases its reservation. Requests
+larger than the budget are rejected before any job metadata is created.
+CLI tests cover invalid and boundary values; HTTP status exposes the effective
+limit and current dispatched-cell count. This is an admission heuristic, not
+a measurement of actual RSS or a guarantee for other workload types.
+
 ## Numerical and performance baselines
 
 The C++ CTest suite checks pure-core algorithms, conservation cases, DEM

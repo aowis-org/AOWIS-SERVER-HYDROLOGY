@@ -704,11 +704,26 @@ AnalysisService::~AnalysisService()
 
 bool AnalysisService::initialize(QString *error)
 {
+    if (this->config.maximum_cells < 4 ||
+        this->config.maximum_cells > 100000000ULL)
+    {
+        if (error != nullptr)
+            *error = QStringLiteral("max_cells must be between 4 and 100000000");
+        return false;
+    }
     if (this->config.maximum_coupled_dem_cells < 4 ||
         this->config.maximum_coupled_dem_cells > 100000000ULL)
     {
         if (error != nullptr)
             *error = QStringLiteral("max_coupled_dem_cells must be between 4 and 100000000");
+        return false;
+    }
+    if (this->config.max_active_terrain_cells != 0 &&
+        (this->config.max_active_terrain_cells < 4 ||
+         this->config.max_active_terrain_cells > 400000000ULL))
+    {
+        if (error != nullptr)
+            *error = QStringLiteral("max_active_terrain_cells must be 0 or between 4 and 400000000");
         return false;
     }
     if (this->config.max_concurrent_analyses < 1 ||
@@ -1146,6 +1161,18 @@ QString AnalysisService::submit(const AnalysisRequest &request, QString *error)
         if (error != nullptr) *error = QStringLiteral("Analysis exceeds configured cell limit or is too small");
         return {};
     }
+    // An individual job must be runnable under the aggregate terrain-cell
+    // limit; reject before creating a job directory, rather than queueing a
+    // task that can never be dispatched. Zero means "use maximum_cells".
+    const std::uint64_t active_cell_limit = this->config.max_active_terrain_cells == 0
+        ? this->config.maximum_cells : this->config.max_active_terrain_cells;
+    if (std::uint64_t(columns_d) * std::uint64_t(rows_d) > active_cell_limit)
+    {
+        if (error != nullptr)
+            *error = QStringLiteral("Terrain analysis exceeds active terrain cell budget (%1 cells)")
+                .arg(qulonglong(active_cell_limit));
+        return {};
+    }
     // Admission covers not only jobs already published in job_map but also
     // other submit() calls preparing manifests. It must be reserved before
     // UUID/directory creation so rejected requests leave no disk artifacts.
@@ -1219,18 +1246,32 @@ QString AnalysisService::submit(const AnalysisRequest &request, QString *error)
 void AnalysisService::scheduleTerrainJobs()
 {
     QMutexLocker locker(&this->jobs_mutex);
+    const std::uint64_t cell_limit = this->config.max_active_terrain_cells == 0
+        ? this->config.maximum_cells : this->config.max_active_terrain_cells;
     while (this->terrain_worker_slots < this->config.max_concurrent_analyses &&
            !this->terrain_queue.isEmpty())
     {
-        const QSharedPointer<Job> next = this->terrain_queue.dequeue();
-        if (next->cancelled.load()) continue;
+        const QSharedPointer<Job> next = this->terrain_queue.head();
+        if (next->cancelled.load())
+        {
+            this->terrain_queue.dequeue();
+            continue;
+        }
+        const std::uint64_t cells = std::uint64_t(next->grid.columns) * next->grid.rows;
+        // FIFO: a large queued analysis cannot be bypassed indefinitely by
+        // later small jobs. Wait for a running worker to release its cells.
+        if (this->active_terrain_cells > cell_limit ||
+            cells > cell_limit - this->active_terrain_cells) break;
+        this->terrain_queue.dequeue();
         ++this->terrain_worker_slots;
-        this->workers.start([this, next]()
+        this->active_terrain_cells += cells;
+        this->workers.start([this, next, cells]()
         {
             runJob(next);
             {
                 QMutexLocker locker(&this->jobs_mutex);
                 --this->terrain_worker_slots;
+                this->active_terrain_cells -= cells;
             }
             scheduleTerrainJobs();
         });
@@ -1276,7 +1317,10 @@ QJsonObject AnalysisService::terrainJobCapacity() const
         {QStringLiteral("queued"), queued},
         {QStringLiteral("running"), running},
         {QStringLiteral("outstanding"), queued + running},
-        {QStringLiteral("limit"), this->config.max_outstanding_analyses}
+        {QStringLiteral("limit"), this->config.max_outstanding_analyses},
+        {QStringLiteral("active_cells"), double(this->active_terrain_cells)},
+        {QStringLiteral("active_cell_limit"), double(this->config.max_active_terrain_cells == 0
+            ? this->config.maximum_cells : this->config.max_active_terrain_cells)}
     };
 }
 

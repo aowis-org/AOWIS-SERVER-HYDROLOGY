@@ -66,6 +66,11 @@ struct ServiceConfig
     // Independent from completed/failed/canceled results, which stay on disk.
     // Must be >= max_concurrent_analyses (1..64).
     int max_outstanding_analyses = 8;
+    // Bound the *combined* cells in dispatched terrain workers, not merely
+    // their number. Zero (default) inherits maximum_cells. This is a workload
+    // proxy, NOT a guaranteed peak-RSS bound; rainfall/coupled tasks have
+    // separate queues and can overlap terrain computations.
+    std::uint64_t max_active_terrain_cells = 0;
     TerrainReader terrain_reader; // optional; defaults to Map HTTP/in-process adapter
 };
 
@@ -286,6 +291,7 @@ private:
     QHash<QString, QSharedPointer<Job>> job_map;
     QQueue<QSharedPointer<Job>> terrain_queue; // cancelable before worker dispatch
     int terrain_worker_slots = 0; // active runnable slots, guarded by jobs_mutex
+    std::uint64_t active_terrain_cells = 0; // sum for dispatched workers, under jobs_mutex
     // Protected by jobs_mutex. Reserve a slot before touching the filesystem
     // to make admission atomic even with concurrent library API callers.
     int terrain_admission_reservations = 0;

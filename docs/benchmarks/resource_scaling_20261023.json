@@ -1,0 +1,77 @@
+{
+  "schema": "aowis_hydrology_resource_scaling_v1",
+  "scope": "sequential independent core benchmark processes",
+  "terrain": "pitted",
+  "seed": 17,
+  "peak_rss_scope": "entire Linux benchmark process; unknown on other systems",
+  "memory_bound": false,
+  "not_measured": [
+    "Qt service",
+    "Map",
+    "HTTP",
+    "concurrent workload",
+    "disk cache"
+  ],
+  "results": [
+    {
+      "columns": 256,
+      "rows": 256,
+      "cells": 65536,
+      "samples": 2,
+      "stage_time_ms": {
+        "min": 67.963113,
+        "median": 72.4251875,
+        "max": 76.887262
+      },
+      "peak_process_rss_bytes": {
+        "min": 9424896,
+        "median": 9437184.0,
+        "max": 9449472
+      },
+      "observed_peak_rss_bytes_per_cell": 144.0,
+      "identities": [
+        "357cd261fe213f57"
+      ]
+    },
+    {
+      "columns": 512,
+      "rows": 512,
+      "cells": 262144,
+      "samples": 2,
+      "stage_time_ms": {
+        "min": 408.652226,
+        "median": 434.4800265,
+        "max": 460.307827
+      },
+      "peak_process_rss_bytes": {
+        "min": 30994432,
+        "median": 31014912.0,
+        "max": 31035392
+      },
+      "observed_peak_rss_bytes_per_cell": 118.3125,
+      "identities": [
+        "b8394d358d43a84b"
+      ]
+    },
+    {
+      "columns": 1024,
+      "rows": 1024,
+      "cells": 1048576,
+      "samples": 2,
+      "stage_time_ms": {
+        "min": 2100.268569,
+        "median": 2166.5119075000002,
+        "max": 2232.755246
+      },
+      "peak_process_rss_bytes": {
+        "min": 115568640,
+        "median": 115570688.0,
+        "max": 115572736
+      },
+      "observed_peak_rss_bytes_per_cell": 110.216796875,
+      "identities": [
+        "28c391d17bdd1d86"
+      ]
+    }
+  ]
+}

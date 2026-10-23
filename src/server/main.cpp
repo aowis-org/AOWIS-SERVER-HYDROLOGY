@@ -30,6 +30,9 @@ max_coupled_dem_cells=10000000
 max_concurrent_analyses=1
 ; Maximum queued plus active terrain jobs (1..64, at least worker count).
 max_outstanding_analyses=8
+; Combined raster cells in running terrain jobs; 0 inherits max_cells.
+; This is a concurrency guard, NOT a physical process-memory limit.
+max_active_terrain_cells=0
 ; Bounded cpp-httplib request workers and queued connections.
 http_workers=8
 http_max_queued_requests=32
@@ -121,6 +124,14 @@ bool loadConfig(const QString &file_path, bool explicitly_requested,
         *error = QStringLiteral("server/max_outstanding_analyses must be between max_concurrent_analyses and 64");
         return false;
     }
+    const qulonglong active_cells = settings.value(
+        QStringLiteral("server/max_active_terrain_cells"), 0).toString().toULongLong(&valid);
+    if (!valid || active_cells > 400000000ULL || (active_cells != 0 && active_cells < 4))
+    {
+        *error = QStringLiteral("max_active_terrain_cells must be 0 or between 4 and 400000000");
+        return false;
+    }
+    config->max_active_terrain_cells = std::uint64_t(active_cells);
     auto readHttpInt = [&](const QString &key, int fallback, int minimum, int maximum,
                            int *target) -> bool {
         bool parsed = false;

@@ -46,6 +46,7 @@ class ServerConfigurationCliTests(unittest.TestCase):
         self.assertIn("max_concurrent_analyses=1", target.read_text(encoding="utf-8"))
         self.assertIn("max_outstanding_analyses=8", target.read_text(encoding="utf-8"))
         self.assertIn("max_coupled_dem_cells=10000000", target.read_text(encoding="utf-8"))
+        self.assertIn("max_active_terrain_cells=0", target.read_text(encoding="utf-8"))
         content = target.read_bytes()
         self.run_cli("--write-default-config", target, success=False)
         self.assertEqual(target.read_bytes(), content)
@@ -96,6 +97,19 @@ class ServerConfigurationCliTests(unittest.TestCase):
         target.write_text("[server]\nmax_concurrent_analyses=2\n"
                           "max_outstanding_analyses=2\n", encoding="utf-8")
         self.run_cli("--config", target, "--check-config")
+
+    def test_active_terrain_cell_budget_validation(self):
+        target = self.root / "active-cells.ini"
+        for setting in ("max_active_terrain_cells=-1", "max_active_terrain_cells=3",
+                        "max_active_terrain_cells=400000001", "max_active_terrain_cells=abc"):
+            with self.subTest(setting=setting):
+                target.write_text("[server]\n" + setting + "\n", encoding="utf-8")
+                self.assertIn("max_active_terrain_cells", self.run_cli(
+                    "--config", target, "--check-config", success=False).stderr)
+        for amount in (0, 4, 10000000, 400000000):
+            target.write_text(f"[server]\nmax_active_terrain_cells={amount}\n",
+                              encoding="utf-8")
+            self.run_cli("--config", target, "--check-config")
 
     def test_coupled_dem_budget_validation(self):
         target = self.root / "coupled-limits.ini"

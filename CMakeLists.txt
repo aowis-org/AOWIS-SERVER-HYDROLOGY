@@ -200,6 +200,11 @@ if(BUILD_TESTING)
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_prune_hydrology.py")
         set_tests_properties(aowis-hydrology-prune-safety PROPERTIES
             LABELS "hydrology;aowis")
+        add_test(NAME aowis-hydrology-resource-benchmark-tool
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_benchmark_resource_scaling.py")
+        set_tests_properties(aowis-hydrology-resource-benchmark-tool PROPERTIES
+            LABELS "hydrology;aowis")
     endif()
 endif()
 

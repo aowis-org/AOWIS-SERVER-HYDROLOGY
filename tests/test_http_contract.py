@@ -225,6 +225,10 @@ class HttpContractTests(unittest.TestCase):
         self.assertEqual(status["max_outstanding_analyses"], 8)
         self.assertEqual(status["max_cells"], 10000)
         self.assertEqual(status["max_coupled_dem_cells"], 10000000)
+        # An unspecified active-cell budget inherits this test server's
+        # max_cells=10000, not the production default of ten million.
+        self.assertEqual(status["max_active_terrain_cells"], 10000)
+        self.assertEqual(status["terrain_jobs"]["active_cell_limit"], 10000)
         self.assertEqual(status["http_workers"], 8)
         self.assertEqual(status["http_max_queued_requests"], 32)
         self.assertEqual(status["terrain_jobs"]["outstanding"], 0)
@@ -265,6 +269,25 @@ class HttpContractTests(unittest.TestCase):
                 self.assertEqual(json.load(reply),
                                  {"error": "HTTP request body too large"})
         self.assertEqual(self.expect_json(200, "GET", "/v1/jobs")["jobs"], [])
+
+    def test_explicit_active_terrain_cell_budget(self):
+        # The effective limit defaults to max_cells, but can also be
+        # configured independently. Exercise both paths through HTTP.
+        inherited = self.expect_json(200, "GET", "/status")
+        self.assertEqual(inherited["max_active_terrain_cells"], 10000)
+        self.assertEqual(inherited["terrain_jobs"]["active_cell_limit"], 10000)
+
+        self.stop_server()
+        config = self.config.read_text(encoding="utf-8")
+        config = config.replace("max_cells=10000\n",
+                                "max_cells=10000\n"
+                                "max_active_terrain_cells=20000\n")
+        self.config.write_text(config, encoding="utf-8")
+        self.start_server()
+        overridden = self.expect_json(200, "GET", "/status")
+        self.assertEqual(overridden["max_cells"], 10000)
+        self.assertEqual(overridden["max_active_terrain_cells"], 20000)
+        self.assertEqual(overridden["terrain_jobs"]["active_cell_limit"], 20000)
 
     def test_bounded_admission_queued_cancel_and_restart(self):
         # Hold the worker in a terrain request, so the next job is definitely

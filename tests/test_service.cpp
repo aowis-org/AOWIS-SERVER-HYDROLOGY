@@ -83,9 +83,19 @@ int main(int argc, char **argv)
     // overlaps two jobs, does not admit a third, and can cancel a queued job.
     {
         ServiceConfig invalid = configuration;
+        invalid.maximum_cells = 0;
+        AnalysisService invalid_cells(invalid);
+        QString error;
+        assert(!invalid_cells.initialize(&error));
+        assert(error.contains(QStringLiteral("max_cells")));
+        invalid = configuration;
+        invalid.max_active_terrain_cells = 3;
+        AnalysisService invalid_cell_budget(invalid);
+        assert(!invalid_cell_budget.initialize(&error));
+        assert(error.contains(QStringLiteral("max_active_terrain_cells")));
+        invalid = configuration;
         invalid.max_concurrent_analyses = 0;
         AnalysisService invalid_service(invalid);
-        QString error;
         assert(!invalid_service.initialize(&error));
         assert(error.contains(QStringLiteral("max_concurrent_analyses")));
         invalid.max_concurrent_analyses = 5;
@@ -96,6 +106,72 @@ int main(int argc, char **argv)
         AnalysisService invalid_coupled(invalid);
         assert(!invalid_coupled.initialize(&error));
         assert(error.contains(QStringLiteral("max_coupled_dem_cells")));
+    }
+    {
+        // Same sized terrain analyses must share a *running-cell* budget.
+        // Jobs remain admitted and FIFO-queued while the budget is held.
+        QTemporaryDir budget_directory;
+        assert(budget_directory.isValid());
+        ServiceConfig limited = configuration;
+        limited.output_directory = budget_directory.path();
+        limited.max_concurrent_analyses = 2;
+        limited.max_outstanding_analyses = 3;
+        limited.max_active_terrain_cells = 912; // smallRequest() is 24 x 38
+        const TerrainReader reader = configuration.terrain_reader;
+        std::mutex lock;
+        std::condition_variable ready;
+        bool release = false;
+        int started = 0;
+        int active = 0;
+        int peak = 0;
+        limited.terrain_reader = [&](const ElevationGrid &grid, const QString &dataset,
+                                     const std::atomic<bool> &cancelled)
+        {
+            {
+                std::unique_lock<std::mutex> guard(lock);
+                ++started;
+                ++active;
+                peak = std::max(peak, active);
+                ready.notify_all();
+                if (!ready.wait_for(guard, std::chrono::seconds(5), [&] { return release; }))
+                    throw std::runtime_error("Terrain memory-budget test timed out");
+                --active;
+            }
+            return reader(grid, dataset, cancelled);
+        };
+        AnalysisService service(limited);
+        QString error;
+        assert(service.initialize(&error));
+        const QString first = service.submit(smallRequest(), &error);
+        assert(!first.isEmpty());
+        {
+            std::unique_lock<std::mutex> guard(lock);
+            assert(ready.wait_for(guard, std::chrono::seconds(5), [&] { return started == 1; }));
+        }
+        assert(service.terrainJobCapacity().value(QStringLiteral("active_cells")).toInt() == 912);
+        const QString second = service.submit(smallRequest(), &error);
+        assert(!second.isEmpty());
+        assert(service.job(second).value(QStringLiteral("state")) == QStringLiteral("queued"));
+        assert(service.terrainJobCapacity().value(QStringLiteral("active_cell_limit")).toInt() == 912);
+        QThread::msleep(40);
+        {
+            std::lock_guard<std::mutex> guard(lock);
+            assert(started == 1 && peak == 1);
+            release = true;
+        }
+        ready.notify_all();
+        waitForState(service, first, QStringLiteral("completed"));
+        waitForState(service, second, QStringLiteral("completed"));
+        assert(started == 2 && peak == 1);
+        // A grid larger than the budget must be rejected before disk admission.
+        ServiceConfig impossible = configuration;
+        impossible.output_directory = budget_directory.path();
+        impossible.max_active_terrain_cells = 100;
+        AnalysisService rejected(impossible);
+        assert(rejected.initialize(&error));
+        assert(rejected.submit(smallRequest(), &error).isEmpty());
+        assert(error.contains(QStringLiteral("active terrain cell budget")));
+        assert(rejected.terrainJobCapacity().value(QStringLiteral("outstanding")).toInt() == 0);
     }
     {
         QTemporaryDir concurrent_directory;

@@ -227,3 +227,27 @@ or a reproducible regression after an algorithm change.
 Until a real workflow exposes a bottleneck, further sub-10% transport
 micro-tuning has lower expected value than finishing GUI integration and
 scientifically validating runoff and inundation assumptions.
+
+## Memory scaling of independent synthetic core processes
+
+An additional two-repeat, sequential Release **core-only** measurement was
+collected on a containerized Linux x86-64 build environment on 2026-10-23.
+It is not the developer's Map/Qt server hardware and should not be compared
+as a matched pre/post performance result against the preceding observations.
+All inputs were pitted synthetic DEMs, seed 17, at 30 m. The raw summary,
+including timing distributions and input fingerprints, is preserved in
+[`benchmarks/resource_scaling_20261023.json`](benchmarks/resource_scaling_20261023.json).
+
+| Grid | Median total measured stages | Median whole-process peak RSS |
+| --- | ---: | ---: |
+| 256 × 256 (65,536 cells) | 72.43 ms | 9.0 MiB |
+| 512 × 512 (262,144 cells) | 434.48 ms | 29.6 MiB |
+| 1024 × 1024 (1,048,576 cells) | 2,166.51 ms | 110.2 MiB |
+
+This confirms that the tested workload's observed process peak increases
+substantially with grid size. It does **not** establish a safe RSS-per-cell
+coefficient or upper bound: basin geometry, fill/breach modes, extra services,
+concurrent task types and CPU/memory behavior of the Map source are excluded.
+The `max_active_terrain_cells` admission control therefore limits concurrent
+terrain-grid size, **not actual process allocations**. Production workloads
+should be profiled separately under realistic overlapping task mixes.

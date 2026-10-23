@@ -48,6 +48,7 @@ ServiceConfig serviceConfig(const ServerConfig &config)
     result.maximum_coupled_dem_cells = config.maximum_coupled_dem_cells;
     result.max_concurrent_analyses = config.max_concurrent_analyses;
     result.max_outstanding_analyses = config.max_outstanding_analyses;
+    result.max_active_terrain_cells = config.max_active_terrain_cells;
     return result;
 }
 } // namespace
@@ -131,6 +132,8 @@ void Server::setupRoutes()
             {QStringLiteral("max_cells"), double(this->config.maximum_cells)},
             {QStringLiteral("max_coupled_dem_cells"), double(this->config.maximum_coupled_dem_cells)},
             {QStringLiteral("max_outstanding_analyses"), this->config.max_outstanding_analyses},
+            {QStringLiteral("max_active_terrain_cells"), double(this->config.max_active_terrain_cells == 0
+                ? this->config.maximum_cells : this->config.max_active_terrain_cells)},
             {QStringLiteral("http_workers"), this->config.http_workers},
             {QStringLiteral("http_max_queued_requests"), this->config.http_max_queued_requests},
             {QStringLiteral("terrain_jobs"), this->service.terrainJobCapacity()},

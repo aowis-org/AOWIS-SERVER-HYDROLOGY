@@ -11,6 +11,7 @@ flood prediction; use independent hydrological reference cases for that.
 | Tool | Scope | What it does not measure |
 | --- | --- | --- |
 | `aowis-hydrology-benchmark` | Deterministic synthetic terrain, actual core D8, original-DEM hierarchy, runoff redistribution, stage RSS/timings | Map, Qt service, network, GeoTIFF, persistence, dynamic coupled routing |
+| `tools/benchmark_resource_scaling.py` | Independent synthetic core executions across multiple DEM sizes, repeat distributions of runtime and peak process RSS | Concurrent memory use or a safe memory-budget coefficient |
 | `tools/benchmark_map_http.py` | One new or saved real-Map job, repeated result reads, optional exact Map/processed-DEM window parity | Long-term throughput; `--repeats` does **not** repeat full analysis |
 | `tools/benchmark_map_series.py` | Independent sequential Map-sourced jobs, worker and source-call timing distributions | Concurrent analyses |
 | `tools/benchmark_map_concurrency.py` | Read-only replay of the same Map patch layout with configurable parallel GETs | Hydrology scheduling or production transport setting |
@@ -72,6 +73,38 @@ of float32 bit patterns; it is not a cryptographic identifier.
 rejects a residual exceeding `1e-7 × max(1, generated_runoff_m3)`.
 Repeat the **whole executable**, not just a query of its report, to obtain
 a distribution of independent wall-time observations.
+
+## Scaling measurements and terrain worker budgeting
+
+`max_active_terrain_cells` limits **combined running terrain-grid cells**,
+independently of the analysis worker-count and queued-job cap. Set 0 to inherit
+`max_cells` (the default), or a fixed value of 4..400000000 cells. This is a
+concurrency guard **not an allocation estimator**; per-cell transient memory
+varies with terrain, basin topology, fill/breach mode, archive processing,
+platform and allocator. The separate rainfall (up to two workers), catchment
+(one computation at a time), redistribution/inundation and coupled queues
+can overlap. The process can use significantly more memory than terrain alone.
+
+Run separate benchmark processes for at least three sizes:
+
+```bash
+./tools/benchmark_resource_scaling.py \
+  --executable ./build-hydrology-benchmark/aowis-hydrology-benchmark \
+  --size 256x256 --size 512x512 --size 1024x1024 \
+  --terrain pitted --seed 17 --repeats 3 > resource-scaling.json
+```
+
+The JSON reports min/median/max **process** peak RSS and core-stage time per
+size. Each sample is a **new sequential executable**, not an in-server job.
+`observed_peak_rss_bytes_per_cell` is for comparison of workload scaling,
+not a safe upper bound or a tuning constant. On non-Linux platforms unknown
+peak RSS stays `null`. Do not multiply the ratio by `max_active_terrain_cells`
+and call it a memory limit. For production sizing, additionally run
+`benchmark_map_jobs.py` against the full service and monitor host-wide RSS
+while running overlapping rainfall, catchment, coupled and redistribution
+operations; report operating system and memory pressure alongside timings.
+The Map-job tool measures Hydrology PID RSS, not global system RAM. Always
+retain the workload fingerprints and repeat counts in saved benchmark reports.
 
 ## Live Map and Hydrology setup
 

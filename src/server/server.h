@@ -23,6 +23,7 @@ struct ServerConfig
     std::uint64_t maximum_coupled_dem_cells = 10000000;
     int max_concurrent_analyses = 1;
     int max_outstanding_analyses = 8;
+    std::uint64_t max_active_terrain_cells = 0;
     int http_workers = 8;
     int http_max_queued_requests = 32;
     int http_read_timeout_s = 15;

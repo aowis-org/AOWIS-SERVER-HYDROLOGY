@@ -107,6 +107,12 @@ uses Map REST; optional GDAL GeoTIFF readers are for testing/development.
   scenario creation remains supported. Scenario-count admission is atomic for
   concurrent library callers. Task status is transient, persisted scenario
   archives are not.
+- Active terrain-worker cells are bounded independently by
+  `max_active_terrain_cells` (0 inherits `max_cells`, or explicit 4..400000000).
+  The service checks individual job feasibility before creating a job folder
+  and schedules admitted requests in FIFO order without exceeding the
+  aggregate running-cell budget. This limit is not a peak-RSS guarantee:
+  separate rainfall/catchment/redistribution/coupled worker pools may overlap.
 - Terrain workers (`max_concurrent_analyses`, 1–4) are separate from admission
   (`max_outstanding_analyses`, 1–64, >= worker count). Admission counts queued
   plus running terrain jobs and in-progress submission reservations. The
@@ -124,7 +130,8 @@ uses Map REST; optional GDAL GeoTIFF readers are for testing/development.
   after the server has been stopped. This also removes dependent scenario
   artifacts; no automatic retention deletion occurs.
 - `AnalysisService::terrainJobCapacity()` and the `terrain_jobs` object in
-  `/status` expose `queued`, `running`, `outstanding` and `limit` for operations
+  `/status` expose `queued`, `running`, `outstanding`, `limit`, `active_cells`
+  and `active_cell_limit` for operations
   and benchmarks. Analysis admission is separate from asynchronous
   redistribution, inundation and coupled-simulation task scheduling.
 - HTTP Map retrieval supports 1–4 parallel patch calls per active analysis;

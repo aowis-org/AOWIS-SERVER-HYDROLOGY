@@ -184,6 +184,7 @@ output_directory=
 max_cells=10000000
 max_concurrent_analyses=1
 max_outstanding_analyses=8
+max_active_terrain_cells=0
 http_workers=8
 http_max_queued_requests=32
 http_read_timeout_s=15
@@ -210,7 +211,18 @@ full-size `std::string` copy. Analysis workers and Map HTTP patch concurrency
 remain independently controlled. Embedded builds with
 `AOWIS_HYDROLOGY_BUILD_SERVER=OFF` do not require cpp-httplib.
 
-`max_cells` limits **one analysis**, not the total cell count in flight.
+`max_cells` limits the size of each terrain analysis. The independent
+`max_active_terrain_cells` guard controls the **sum of cells in dispatched
+terrain workers** (zero inherits `max_cells`; explicit values 4..400 million).
+An analysis larger than this running-cell budget is rejected before creating
+output. Accepted jobs that would exceed the budget remain in a FIFO queue
+until earlier workers finish. This is a **cell-count concurrency limit**,
+not a bound on RSS: algorithms have variable memory per cell, and separate
+rainfall, catchment, redistribution and coupled tasks may overlap. Measure
+actual process RSS under representative concurrent workloads before sizing a
+production deployment. /status reports `terrain_jobs.active_cells` and
+`terrain_jobs.active_cell_limit` alongside queue counts.
+
 `max_concurrent_analyses` accepts 1–4 (default 1) and controls whole-job
 parallelism. `max_outstanding_analyses` accepts 1–64 (default 8) and must
 be at least `max_concurrent_analyses`. It caps the **combined queued and
