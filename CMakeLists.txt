@@ -115,7 +115,7 @@ if(AOWIS_HYDROLOGY_BUILD_BENCHMARKS)
     endif()
 endif()
 
-option(AOWIS_HYDROLOGY_BUILD_SERVER "Build the Qt REST hydrology server" ON)
+option(AOWIS_HYDROLOGY_BUILD_SERVER "Build the cpp-httplib REST hydrology server" ON)
 option(AOWIS_HYDROLOGY_BUILD_SERVICE "Build the reusable Qt job service (no HTTP server dependency)" ${AOWIS_HYDROLOGY_BUILD_SERVER})
 option(AOWIS_HYDROLOGY_USE_LOCAL_MAP "Use the AOWIS Map C++ library for embedded terrain access" OFF)
 set(AOWIS_HYDROLOGY_MAP_SOURCE "" CACHE PATH "Source directory of AOWIS-SERVER-MAP")
@@ -152,15 +152,24 @@ if(AOWIS_HYDROLOGY_BUILD_SERVICE)
 endif()
 
 if(AOWIS_HYDROLOGY_BUILD_SERVER)
-    find_package(Qt6 REQUIRED COMPONENTS HttpServer)
+    set(AOWIS_HYDROLOGY_HTTPLIB_SOURCE
+        "${CMAKE_CURRENT_SOURCE_DIR}/external/cpp-httplib" CACHE PATH
+        "Directory containing pinned cpp-httplib httplib.h")
+    if(NOT EXISTS "${AOWIS_HYDROLOGY_HTTPLIB_SOURCE}/httplib.h")
+        message(FATAL_ERROR "cpp-httplib is missing. Run ./tools/setup_cpp_httplib.sh before configuring the server")
+    endif()
+    find_package(Threads REQUIRED)
     add_executable(aowis-server-hydrology
         src/server/main.cpp
         src/server/server.cpp
         src/server/server.h
+        src/server/http_adapter.h
     )
     target_compile_features(aowis-server-hydrology PRIVATE cxx_std_20)
     target_link_libraries(aowis-server-hydrology PRIVATE
-        AOWIS::HydrologyService Qt6::HttpServer)
+        AOWIS::HydrologyService Threads::Threads)
+    target_include_directories(aowis-server-hydrology PRIVATE
+        "${AOWIS_HYDROLOGY_HTTPLIB_SOURCE}")
     if(BUILD_TESTING)
         find_package(Python3 QUIET COMPONENTS Interpreter)
         if(Python3_Interpreter_FOUND)

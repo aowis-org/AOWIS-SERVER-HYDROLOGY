@@ -96,6 +96,28 @@ class ServerConfigurationCliTests(unittest.TestCase):
                           "max_outstanding_analyses=2\n", encoding="utf-8")
         self.run_cli("--config", target, "--check-config")
 
+    def test_http_transport_limits(self):
+        target = self.root / "http-limits.ini"
+        for setting, key in (
+            ("http_workers=0", "http_workers"),
+            ("http_workers=65", "http_workers"),
+            ("http_max_queued_requests=0", "http_max_queued_requests"),
+            ("http_max_queued_requests=1025", "http_max_queued_requests"),
+            ("http_read_timeout_s=0", "http_read_timeout_s"),
+            ("http_write_timeout_s=601", "http_write_timeout_s"),
+            ("http_keep_alive_timeout_s=121", "http_keep_alive_timeout_s"),
+        ):
+            with self.subTest(setting=setting):
+                target.write_text("[server]\n" + setting + "\n", encoding="utf-8")
+                self.assertIn(key, self.run_cli("--config", target,
+                                               "--check-config", success=False).stderr)
+        target.write_text("[server]\nhttp_workers=4\n"
+                          "http_max_queued_requests=8\n"
+                          "http_read_timeout_s=10\n"
+                          "http_write_timeout_s=30\n"
+                          "http_keep_alive_timeout_s=3\n", encoding="utf-8")
+        self.run_cli("--config", target, "--check-config")
+
     def test_equals_form_is_compatible(self):
         target = self.root / "equals" / "custom.ini"
         self.run_cli(f"--write-default-config={target}")

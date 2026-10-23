@@ -12,7 +12,7 @@ usage()
     cat <<'HELP'
 Usage: ./compile_linux.sh [--install-dependencies] [--no-run] [-- <server arguments>]
 
-Build the Qt 6 REST executable in build-linux using Ninja, then run it unless
+Build the cpp-httplib REST executable in build-linux using Ninja, then run it unless
 --no-run was selected. Pass command-line options to the server after --.
 
   --install-dependencies   Install CMake, Ninja, C++ and Qt 6 development
@@ -47,7 +47,7 @@ install_debian_dependencies()
         echo "Error: --install-dependencies requires Debian or a Debian-based system with apt-get." >&2
         exit 1
     fi
-    local packages=(build-essential cmake ninja-build qt6-base-dev qt6-httpserver-dev libgdal-dev)
+    local packages=(build-essential cmake ninja-build qt6-base-dev libgdal-dev)
     if (( EUID == 0 )); then
         apt-get update
         apt-get install -y "${packages[@]}"

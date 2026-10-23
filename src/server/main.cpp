@@ -27,6 +27,12 @@ max_cells=10000000
 max_concurrent_analyses=1
 ; Maximum queued plus active terrain jobs (1..64, at least worker count).
 max_outstanding_analyses=8
+; Bounded cpp-httplib request workers and queued connections.
+http_workers=8
+http_max_queued_requests=32
+http_read_timeout_s=15
+http_write_timeout_s=30
+http_keep_alive_timeout_s=5
 
 [terrain]
 dataset=copernicus-glo30
@@ -104,6 +110,29 @@ bool loadConfig(const QString &file_path, bool explicitly_requested,
         *error = QStringLiteral("server/max_outstanding_analyses must be between max_concurrent_analyses and 64");
         return false;
     }
+    auto readHttpInt = [&](const QString &key, int fallback, int minimum, int maximum,
+                           int *target) -> bool {
+        bool parsed = false;
+        const int value = settings.value(QStringLiteral("server/") + key, fallback)
+                              .toString().toInt(&parsed);
+        if (!parsed || value < minimum || value > maximum) {
+            *error = QStringLiteral("Invalid server/%1 (valid range %2..%3)")
+                         .arg(key).arg(minimum).arg(maximum);
+            return false;
+        }
+        *target = value;
+        return true;
+    };
+    if (!readHttpInt(QStringLiteral("http_workers"), 8, 1, 64, &config->http_workers) ||
+        !readHttpInt(QStringLiteral("http_max_queued_requests"), 32, 1, 1024,
+                     &config->http_max_queued_requests) ||
+        !readHttpInt(QStringLiteral("http_read_timeout_s"), 15, 1, 600,
+                     &config->http_read_timeout_s) ||
+        !readHttpInt(QStringLiteral("http_write_timeout_s"), 30, 1, 600,
+                     &config->http_write_timeout_s) ||
+        !readHttpInt(QStringLiteral("http_keep_alive_timeout_s"), 5, 1, 120,
+                     &config->http_keep_alive_timeout_s))
+        return false;
     const QString output_path = settings.value(QStringLiteral("server/output_directory")).toString().trimmed();
     if (!output_path.isEmpty())
         config->output_directory = QFileInfo(output_path).isAbsolute()

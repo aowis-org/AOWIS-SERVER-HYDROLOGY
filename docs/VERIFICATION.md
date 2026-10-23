@@ -99,3 +99,15 @@ queue admits four queued/running calculations and retains four completed or
 terminal results on disk. The original `GET /catchment` remains synchronous
 for existing integrations; replacing that route is not a prerequisite of
 HTTP-server migration.
+
+### HTTP transport checks
+
+`aowis-hydrology-http-contract` runs against the real cpp-httplib executable,
+including persisted outputs, task APIs and binary MIME types. The executable
+loads the pinned vendored `external/cpp-httplib/httplib.h`. Before the initial
+build, run `./tools/setup_cpp_httplib.sh`; the resulting header is packaged in
+future source ZIPs. The HTTP test also checks early rejection of oversized
+request bodies. `aowis-hydrology-server-config-cli` validates worker and
+request-queue bounds without opening network sockets. Measure HTTP throughput
+against identical workloads; a change of transport alone is not evidence of
+a measured speedup.

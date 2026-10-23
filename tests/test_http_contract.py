@@ -223,6 +223,8 @@ class HttpContractTests(unittest.TestCase):
         self.assertEqual(status["service"], "aowis-server-hydrology")
         self.assertEqual(status["max_concurrent_analyses"], 1)
         self.assertEqual(status["max_outstanding_analyses"], 8)
+        self.assertEqual(status["http_workers"], 8)
+        self.assertEqual(status["http_max_queued_requests"], 32)
         self.assertEqual(status["terrain_jobs"]["outstanding"], 0)
         self.assertEqual(status["map_requests_per_analysis"], 1)
         self.assertEqual(self.expect_json(200, "GET", "/v1/jobs")["jobs"], [])
@@ -233,6 +235,33 @@ class HttpContractTests(unittest.TestCase):
             self.assertIn("error", bad)
         oversized = self.expect_json(400, "POST", "/v1/jobs", b" " * 16385)
         self.assertEqual(oversized["error"], "Job request too large")
+        # The HTTP transport rejects payloads before they reach any route.
+        # Declare an oversized body without transmitting it: the transport
+        # must reject the declared Content-Length before reading the payload.
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as raw:
+            raw.settimeout(5)
+            raw.sendall(b"POST /v1/jobs HTTP/1.1\r\n"
+                        b"Host: 127.0.0.1\r\n"
+                        b"Content-Type: application/json\r\n"
+                        b"Content-Length: 262145\r\n"
+                        b"Connection: close\r\n\r\n")
+            # The server must answer directly from Content-Length rather than
+            # occupying a request worker waiting for bytes that never arrive.
+            # Verify the same JSON error contract as other transport errors.
+            with raw.makefile("rb") as reply:
+                status_line = reply.readline()
+                self.assertIn(b" 413 ", status_line, status_line)
+                headers = {}
+                while True:
+                    line = reply.readline()
+                    if line == b"\r\n":
+                        break
+                    name, _, value = line.partition(b":")
+                    headers[name.lower()] = value.strip()
+                self.assertEqual(headers.get(b"content-type"), b"application/json")
+                self.assertEqual(headers.get(b"connection"), b"close")
+                self.assertEqual(json.load(reply),
+                                 {"error": "HTTP request body too large"})
         self.assertEqual(self.expect_json(200, "GET", "/v1/jobs")["jobs"], [])
 
     def test_bounded_admission_queued_cancel_and_restart(self):

@@ -71,8 +71,19 @@ uncalibrated hydraulic controls. See [Product scope and open questions](docs/ROA
 
 Requires CMake 3.21+, a C++20 compiler and GeographicLib. Qt 6 Core and
 Network are required for the reusable application service; the HTTP executable
-additionally uses Qt HttpServer. Ninja is used by the Linux convenience
-scripts. GDAL is optional for the separate GeoTIFF fixture library.
+uses the pinned, vendored cpp-httplib v0.58.0 header instead of Qt HttpServer.
+Ninja is used by the Linux convenience scripts. GDAL is optional for the
+separate GeoTIFF fixture library. Initialize cpp-httplib once if the vendored
+source is not yet present (a generated handoff ZIP includes it after setup):
+
+```bash
+./tools/setup_cpp_httplib.sh
+```
+
+The setup script checks out the fixed upstream release and copies its header
+and license into `external/cpp-httplib/`; CMake never downloads dependencies.
+Include those generated source files in Git so ordinary clones and future ZIPs
+are self-contained.
 
 ```bash
 # With existing dependencies:
@@ -124,7 +135,7 @@ submodule setup. No dependency is downloaded implicitly by CMake.
 - `AOWIS::HydrologyService`: Qt Core/Network application service with jobs,
   persistence, queries and injectable terrain readers; no HTTP dependency.
 - `AOWIS::HydrologyRaster`: optional GDAL-backed GeoTIFF development reader.
-- `aowis-server-hydrology`: thin Qt HTTP/CLI adapter over the service.
+- `aowis-server-hydrology`: thin cpp-httplib HTTP/CLI adapter over the service.
 
 For a parent application that already has an initialized Map library:
 
@@ -173,6 +184,11 @@ output_directory=
 max_cells=10000000
 max_concurrent_analyses=1
 max_outstanding_analyses=8
+http_workers=8
+http_max_queued_requests=32
+http_read_timeout_s=15
+http_write_timeout_s=30
+http_keep_alive_timeout_s=5
 
 [terrain]
 dataset=copernicus-glo30
@@ -183,6 +199,16 @@ request_timeout_ms=180000
 patch_size=256
 max_concurrent_requests=4
 ```
+
+The inbound HTTP server uses 1–64 independent request workers (default 8)
+and a bounded waiting queue of 1–1024 connections (default 32). The INI
+also exposes read, write and keep-alive timeouts in seconds. Individual JSON
+request bodies are capped at 256 KiB by the transport *before* the service
+handles them; the API retains its stricter endpoint-specific validation.
+Large binary raster responses are streamed in bounded chunks without an extra
+full-size `std::string` copy. Analysis workers and Map HTTP patch concurrency
+remain independently controlled. Embedded builds with
+`AOWIS_HYDROLOGY_BUILD_SERVER=OFF` do not require cpp-httplib.
 
 `max_cells` limits **one analysis**, not the total cell count in flight.
 `max_concurrent_analyses` accepts 1–4 (default 1) and controls whole-job

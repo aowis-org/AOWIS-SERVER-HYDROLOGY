@@ -4,7 +4,7 @@
 
 The optional `AOWIS::HydrologyRaster` library can read a local directory of Copernicus GLO-30 DEM GeoTIFFs for **tests and development tools** without Map HTTP. It is not a production terrain-backend option in the Hydrology server; Map remains responsible for configured terrain acquisition, data policy and caching.
 
-The adapter uses the GDAL C++ raster API and is built as Qt-independent library `AOWIS::HydrologyRaster`, separate from `AOWIS::HydrologyService` and the Qt HTTP adapter. It is read-only: it never downloads, alters, or creates source GeoTIFFs. GDAL is an optional dependency: `AOWIS_HYDROLOGY_WITH_GDAL=OFF` omits this library. The existing Map REST/linked-library adapters and injected `terrain_reader` callbacks remain usable with GDAL disabled.
+The adapter uses the GDAL C++ raster API and is built as Qt-independent library `AOWIS::HydrologyRaster`, separate from `AOWIS::HydrologyService` and the cpp-httplib HTTP adapter. It is read-only: it never downloads, alters, or creates source GeoTIFFs. GDAL is an optional dependency: `AOWIS_HYDROLOGY_WITH_GDAL=OFF` omits this library. The existing Map REST/linked-library adapters and injected `terrain_reader` callbacks remain usable with GDAL disabled.
 
 Supported source constraints:
 

@@ -3,23 +3,23 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonParseError>
-#include <QHttpServerResponse>
 #include <QUrlQuery>
 #include <cmath>
+#include <cstddef>
 
 namespace Aowis::Hydrology
 {
 namespace
 {
-using Status = QHttpServerResponse::StatusCode;
+using Status = HttpResponse::StatusCode;
 
-QHttpServerResponse jsonResponse(const QJsonObject &json, Status status = Status::Ok)
+HttpResponse jsonResponse(const QJsonObject &json, Status status = Status::Ok)
 {
-    return QHttpServerResponse(QByteArrayLiteral("application/json"),
+    return HttpResponse(QByteArrayLiteral("application/json"),
                                QJsonDocument(json).toJson(QJsonDocument::Compact), status);
 }
 
-QHttpServerResponse errorResponse(const QString &error, Status status)
+HttpResponse errorResponse(const QString &error, Status status)
 {
     return jsonResponse(QJsonObject{{QStringLiteral("error"), error}}, status);
 }
@@ -51,40 +51,91 @@ ServiceConfig serviceConfig(const ServerConfig &config)
 }
 } // namespace
 
-Server::Server(const ServerConfig &config, QObject *parent)
-    : QObject(parent), config(config), service(serviceConfig(config))
+Server::Server(const ServerConfig &config)
+    : config(config), service(serviceConfig(config))
 {
+    // Independent HTTP workers must not own any Qt event-loop objects.
+    // Numerical work is admitted through the service's bounded queues.
+    constexpr std::size_t maxHttpBodyBytes = 256 * 1024;
+    // cpp-httplib enforces this limit while reading a body, but a client
+    // declaring an oversized Content-Length without sending the body would
+    // otherwise tie up a worker until read_timeout. Reject it from headers,
+    // before entering the route's body reader. Chunked/decoded bodies remain
+    // guarded by the transport's payload limit below.
+    this->http.set_payload_max_length(maxHttpBodyBytes);
+    this->http.set_pre_routing_handler([](const httplib::Request &request,
+                                          httplib::Response &response) {
+        if (request.has_header("Content-Length") &&
+            request.get_header_value_u64("Content-Length") > maxHttpBodyBytes)
+        {
+            response.status = httplib::StatusCode::PayloadTooLarge_413;
+            response.set_content(R"({"error":"HTTP request body too large"})",
+                                 "application/json");
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
+    this->http.set_read_timeout(config.http_read_timeout_s);
+    this->http.set_write_timeout(config.http_write_timeout_s);
+    this->http.set_keep_alive_timeout(config.http_keep_alive_timeout_s);
+    this->http.new_task_queue = [workers = config.http_workers,
+                                 queued = config.http_max_queued_requests]() {
+        return new httplib::ThreadPool(size_t(workers), size_t(workers), size_t(queued));
+    };
+    this->http.set_error_handler([](const httplib::Request &, httplib::Response &response)
+        -> httplib::Server::HandlerResponse {
+        // Preserve the precise domain error and its HTTP status. Only synthesize
+        // a body for transport-level errors such as 404 or oversized requests.
+        if (!response.body.empty())
+            return httplib::Server::HandlerResponse::Unhandled;
+        const QByteArray body = QJsonDocument(QJsonObject{
+            {QStringLiteral("error"), response.status == 413
+                ? QStringLiteral("HTTP request body too large")
+                : QStringLiteral("HTTP request failed")}}).toJson(QJsonDocument::Compact);
+        response.set_content(body.toStdString(), "application/json");
+        return httplib::Server::HandlerResponse::Handled;
+    });
     setupRoutes();
+}
+
+Server::~Server()
+{
+    this->http.stop();
+    if (this->listener.joinable()) this->listener.join();
+    // The service is destroyed after all HTTP workers have stopped.
 }
 
 bool Server::start(QString *error_message)
 {
-    if (!this->service.initialize(error_message))
-        return false;
-    if (!this->tcp.listen(this->config.listen_address, this->config.port) ||
-        !this->http.bind(&this->tcp))
+    if (!this->service.initialize(error_message)) return false;
+    const std::string host = this->config.listen_address.toString().toStdString();
+    if (!this->http.bind_to_port(host, this->config.port))
     {
-        if (error_message != nullptr) *error_message = this->tcp.errorString();
+        if (error_message) *error_message = QStringLiteral("Cannot bind Hydrology HTTP listener to %1:%2")
+            .arg(this->config.listen_address.toString()).arg(this->config.port);
         return false;
     }
+    this->listener = std::thread([this] { this->http.listen_after_bind(); });
     return true;
 }
 
 void Server::setupRoutes()
 {
-    this->http.route("/status", QHttpServerRequest::Method::Get, [this]()
+    this->http.route("/status", HttpRequest::Method::Get, [this]()
     {
         return jsonResponse(QJsonObject{
             {QStringLiteral("service"), QStringLiteral("aowis-server-hydrology")},
             {QStringLiteral("status"), QStringLiteral("ok")},
             {QStringLiteral("max_concurrent_analyses"), this->config.max_concurrent_analyses},
             {QStringLiteral("max_outstanding_analyses"), this->config.max_outstanding_analyses},
+            {QStringLiteral("http_workers"), this->config.http_workers},
+            {QStringLiteral("http_max_queued_requests"), this->config.http_max_queued_requests},
             {QStringLiteral("terrain_jobs"), this->service.terrainJobCapacity()},
             {QStringLiteral("map_requests_per_analysis"), this->config.source.max_concurrent_requests}});
     });
 
-    this->http.route("/v1/jobs", QHttpServerRequest::Method::Post,
-                     [this](const QHttpServerRequest &request)
+    this->http.route("/v1/jobs", HttpRequest::Method::Post,
+                     [this](const HttpRequest &request)
     {
         if (request.body().size() > 16384)
             return errorResponse(QStringLiteral("Job request too large"), Status::BadRequest);
@@ -139,12 +190,12 @@ void Server::setupRoutes()
         return jsonResponse(this->service.job(id), Status::Accepted);
     });
 
-    this->http.route("/v1/jobs", QHttpServerRequest::Method::Get, [this]()
+    this->http.route("/v1/jobs", HttpRequest::Method::Get, [this]()
     {
         return jsonResponse(QJsonObject{{QStringLiteral("jobs"), this->service.jobs()}});
     });
 
-    this->http.route("/v1/jobs/<arg>", QHttpServerRequest::Method::Get,
+    this->http.route("/v1/jobs/<arg>", HttpRequest::Method::Get,
                      [this](const QString &id)
     {
         const QJsonObject found = this->service.job(id);
@@ -152,7 +203,7 @@ void Server::setupRoutes()
         return jsonResponse(found);
     });
 
-    this->http.route("/v1/jobs/<arg>", QHttpServerRequest::Method::Delete,
+    this->http.route("/v1/jobs/<arg>", HttpRequest::Method::Delete,
                      [this](const QString &id)
     {
         if (!this->service.cancel(id))
@@ -162,8 +213,8 @@ void Server::setupRoutes()
 
     // UUID-addressed basin hierarchy endpoints. The same operations are
     // available to an embedded GUI through AOWIS::HydrologyService.
-    this->http.route("/v1/jobs/<arg>/basins", QHttpServerRequest::Method::Get,
-                     [this](const QString &id, const QHttpServerRequest &request)
+    this->http.route("/v1/jobs/<arg>/basins", HttpRequest::Method::Get,
+                     [this](const QString &id, const HttpRequest &request)
     {
         const QJsonObject job = this->service.job(id);
         if (job.isEmpty()) return errorResponse(QStringLiteral("Unknown job"), Status::NotFound);
@@ -185,7 +236,7 @@ void Server::setupRoutes()
         return jsonResponse(result);
     });
 
-    this->http.route("/v1/jobs/<arg>/basins/<arg>", QHttpServerRequest::Method::Get,
+    this->http.route("/v1/jobs/<arg>/basins/<arg>", HttpRequest::Method::Get,
                      [this](const QString &id, const QString &basin_uuid)
     {
         const QJsonObject job = this->service.job(id);
@@ -201,9 +252,9 @@ void Server::setupRoutes()
         return jsonResponse(result);
     });
 
-    this->http.route("/v1/jobs/<arg>/basins/<arg>/storage", QHttpServerRequest::Method::Get,
+    this->http.route("/v1/jobs/<arg>/basins/<arg>/storage", HttpRequest::Method::Get,
                      [this](const QString &id, const QString &basin_uuid,
-                            const QHttpServerRequest &request)
+                            const HttpRequest &request)
     {
         const QJsonObject job = this->service.job(id);
         if (job.isEmpty()) return errorResponse(QStringLiteral("Unknown job"), Status::NotFound);
@@ -224,9 +275,9 @@ void Server::setupRoutes()
         return jsonResponse(result);
     });
 
-    this->http.route("/v1/jobs/<arg>/basins/<arg>/curve", QHttpServerRequest::Method::Get,
+    this->http.route("/v1/jobs/<arg>/basins/<arg>/curve", HttpRequest::Method::Get,
                      [this](const QString &id, const QString &basin_uuid,
-                            const QHttpServerRequest &request)
+                            const HttpRequest &request)
     {
         const QJsonObject job = this->service.job(id);
         if (job.isEmpty()) return errorResponse(QStringLiteral("Unknown job"), Status::NotFound);
@@ -246,9 +297,9 @@ void Server::setupRoutes()
         return jsonResponse(result);
     });
 
-    this->http.route("/v1/jobs/<arg>/raster/<arg>", QHttpServerRequest::Method::Get,
+    this->http.route("/v1/jobs/<arg>/raster/<arg>", HttpRequest::Method::Get,
                      [this](const QString &id, const QString &layer,
-                            const QHttpServerRequest &request)
+                            const HttpRequest &request)
     {
         const QJsonObject job = this->service.job(id);
         if (job.isEmpty()) return errorResponse(QStringLiteral("Unknown job"), Status::NotFound);
@@ -269,11 +320,11 @@ void Server::setupRoutes()
         if (!error.isEmpty())
             return errorResponse(error, error.startsWith(QStringLiteral("Invalid"))
                 ? Status::BadRequest : Status::InternalServerError);
-        return QHttpServerResponse(mime, data);
+        return HttpResponse(mime, data);
     });
 
-    this->http.route("/v1/jobs/<arg>/trace", QHttpServerRequest::Method::Get,
-                     [this](const QString &id, const QHttpServerRequest &request)
+    this->http.route("/v1/jobs/<arg>/trace", HttpRequest::Method::Get,
+                     [this](const QString &id, const HttpRequest &request)
     {
         const QJsonObject job = this->service.job(id);
         if (job.isEmpty()) return errorResponse(QStringLiteral("Unknown job"), Status::NotFound);
@@ -300,8 +351,8 @@ void Server::setupRoutes()
         return jsonResponse(feature);
     });
 
-    this->http.route("/v1/jobs/<arg>/network", QHttpServerRequest::Method::Get,
-                     [this](const QString &id, const QHttpServerRequest &request)
+    this->http.route("/v1/jobs/<arg>/network", HttpRequest::Method::Get,
+                     [this](const QString &id, const HttpRequest &request)
     {
         const QJsonObject job = this->service.job(id);
         if (job.isEmpty()) return errorResponse(QStringLiteral("Unknown job"), Status::NotFound);
@@ -339,8 +390,8 @@ void Server::setupRoutes()
         return jsonResponse(feature_collection);
     });
 
-    this->http.route("/v1/jobs/<arg>/watershed", QHttpServerRequest::Method::Get,
-                     [this](const QString &id, const QHttpServerRequest &request)
+    this->http.route("/v1/jobs/<arg>/watershed", HttpRequest::Method::Get,
+                     [this](const QString &id, const HttpRequest &request)
     {
         const QJsonObject job = this->service.job(id);
         if (job.isEmpty()) return errorResponse(QStringLiteral("Unknown job"), Status::NotFound);
@@ -361,8 +412,8 @@ void Server::setupRoutes()
         return jsonResponse(result);
     });
 
-    this->http.route("/v1/jobs/<arg>/affected-network", QHttpServerRequest::Method::Post,
-                     [this](const QString &id, const QHttpServerRequest &request)
+    this->http.route("/v1/jobs/<arg>/affected-network", HttpRequest::Method::Post,
+                     [this](const QString &id, const HttpRequest &request)
     {
         const QJsonObject job = this->service.job(id);
         if (job.isEmpty()) return errorResponse(QStringLiteral("Unknown job"), Status::NotFound);
@@ -386,8 +437,8 @@ void Server::setupRoutes()
     // Terrain analysis jobs may host many independent rainfall scenarios.
     // Scenario rasters and manifests are immutable after creation, so
     // fetching a scenario never reruns or changes the DEM analysis.
-    this->http.route("/v1/jobs/<arg>/rainfall-scenarios", QHttpServerRequest::Method::Post,
-                     [this](const QString &id, const QHttpServerRequest &request)
+    this->http.route("/v1/jobs/<arg>/rainfall-scenarios", HttpRequest::Method::Post,
+                     [this](const QString &id, const HttpRequest &request)
     {
         if (request.body().size() > 262144)
             return errorResponse(QStringLiteral("Rainfall request exceeds 256 KiB"), Status::BadRequest);
@@ -413,8 +464,8 @@ void Server::setupRoutes()
     // Optional asynchronous scenario creation. The legacy POST above keeps
     // its response contract; the task API does not block the HTTP event loop.
     this->http.route("/v1/jobs/<arg>/rainfall-scenario-tasks",
-                     QHttpServerRequest::Method::Post,
-                     [this](const QString &id, const QHttpServerRequest &request)
+                     HttpRequest::Method::Post,
+                     [this](const QString &id, const HttpRequest &request)
     {
         if (request.body().size() > 262144)
             return errorResponse(QStringLiteral("Rainfall request exceeds 256 KiB"), Status::BadRequest);
@@ -434,7 +485,7 @@ void Server::setupRoutes()
     });
 
     this->http.route("/v1/jobs/<arg>/rainfall-scenario-tasks/<arg>",
-                     QHttpServerRequest::Method::Get,
+                     HttpRequest::Method::Get,
                      [this](const QString &id, const QString &task_id)
     {
         QString error;
@@ -444,7 +495,7 @@ void Server::setupRoutes()
     });
 
     this->http.route("/v1/jobs/<arg>/rainfall-scenario-tasks/<arg>",
-                     QHttpServerRequest::Method::Delete,
+                     HttpRequest::Method::Delete,
                      [this](const QString &id, const QString &task_id)
     {
         QString error;
@@ -454,7 +505,7 @@ void Server::setupRoutes()
                             Status::Accepted);
     });
 
-    this->http.route("/v1/jobs/<arg>/rainfall-scenarios", QHttpServerRequest::Method::Get,
+    this->http.route("/v1/jobs/<arg>/rainfall-scenarios", HttpRequest::Method::Get,
                      [this](const QString &id)
     {
         if (this->service.job(id).isEmpty())
@@ -466,7 +517,7 @@ void Server::setupRoutes()
         return jsonResponse(QJsonObject{{QStringLiteral("scenarios"), items}});
     });
 
-    this->http.route("/v1/jobs/<arg>/rainfall-scenarios/<arg>", QHttpServerRequest::Method::Get,
+    this->http.route("/v1/jobs/<arg>/rainfall-scenarios/<arg>", HttpRequest::Method::Get,
                      [this](const QString &id, const QString &scenario_id)
     {
         if (this->service.job(id).isEmpty())
@@ -481,9 +532,9 @@ void Server::setupRoutes()
     });
 
     this->http.route("/v1/jobs/<arg>/rainfall-scenarios/<arg>/runoff",
-                     QHttpServerRequest::Method::Get,
+                     HttpRequest::Method::Get,
                      [this](const QString &id, const QString &scenario_id,
-                            const QHttpServerRequest &request)
+                            const HttpRequest &request)
     {
         if (this->service.job(id).isEmpty())
             return errorResponse(QStringLiteral("Unknown job"), Status::NotFound);
@@ -501,12 +552,12 @@ void Server::setupRoutes()
             return errorResponse(error, error.startsWith(QStringLiteral("Invalid"))
                 ? Status::BadRequest : error.startsWith(QStringLiteral("Unknown"))
                 ? Status::NotFound : Status::InternalServerError);
-        return QHttpServerResponse(QByteArrayLiteral("application/vnd.aowis.raster-f64le"), output);
+        return HttpResponse(QByteArrayLiteral("application/vnd.aowis.raster-f64le"), output);
     });
 
     // Nonblocking background calculation, one active task per scenario.
     this->http.route("/v1/jobs/<arg>/rainfall-scenarios/<arg>/redistribution",
-                     QHttpServerRequest::Method::Post,
+                     HttpRequest::Method::Post,
                      [this](const QString &id, const QString &scenario_id)
     {
         QString error;
@@ -522,7 +573,7 @@ void Server::setupRoutes()
     });
 
     this->http.route("/v1/jobs/<arg>/rainfall-scenarios/<arg>/redistribution/status",
-                     QHttpServerRequest::Method::Get,
+                     HttpRequest::Method::Get,
                      [this](const QString &id, const QString &scenario_id)
     {
         QString error;
@@ -536,7 +587,7 @@ void Server::setupRoutes()
     });
 
     this->http.route("/v1/jobs/<arg>/rainfall-scenarios/<arg>/redistribution",
-                     QHttpServerRequest::Method::Delete,
+                     HttpRequest::Method::Delete,
                      [this](const QString &id, const QString &scenario_id)
     {
         QString error;
@@ -549,9 +600,9 @@ void Server::setupRoutes()
     // Cache-only volume-balance result. GET never triggers computation; use
     // POST and poll the status route before retrieving paginated records.
     this->http.route("/v1/jobs/<arg>/rainfall-scenarios/<arg>/redistribution",
-                     QHttpServerRequest::Method::Get,
+                     HttpRequest::Method::Get,
                      [this](const QString &id, const QString &scenario_id,
-                            const QHttpServerRequest &request)
+                            const HttpRequest &request)
     {
         const QJsonObject job = this->service.job(id);
         if (job.isEmpty()) return errorResponse(QStringLiteral("Unknown job"), Status::NotFound);
@@ -581,7 +632,7 @@ void Server::setupRoutes()
     // reconstruction. POST queues work, GET status is nonblocking and
     // GET depth returns only fully published, checksum-checked raster windows.
     this->http.route("/v1/jobs/<arg>/rainfall-scenarios/<arg>/inundation",
-                     QHttpServerRequest::Method::Post,
+                     HttpRequest::Method::Post,
                      [this](const QString &id, const QString &scenario_id)
     {
         QString error;
@@ -597,7 +648,7 @@ void Server::setupRoutes()
     });
 
     this->http.route("/v1/jobs/<arg>/rainfall-scenarios/<arg>/inundation/status",
-                     QHttpServerRequest::Method::Get,
+                     HttpRequest::Method::Get,
                      [this](const QString &id, const QString &scenario_id)
     {
         QString error;
@@ -610,7 +661,7 @@ void Server::setupRoutes()
     });
 
     this->http.route("/v1/jobs/<arg>/rainfall-scenarios/<arg>/inundation",
-                     QHttpServerRequest::Method::Delete,
+                     HttpRequest::Method::Delete,
                      [this](const QString &id, const QString &scenario_id)
     {
         QString error;
@@ -621,9 +672,9 @@ void Server::setupRoutes()
     });
 
     this->http.route("/v1/jobs/<arg>/rainfall-scenarios/<arg>/inundation/depth",
-                     QHttpServerRequest::Method::Get,
+                     HttpRequest::Method::Get,
                      [this](const QString &id, const QString &scenario_id,
-                            const QHttpServerRequest &request)
+                            const HttpRequest &request)
     {
         const QUrlQuery query(request.url());
         int x = 0, y = 0, width = 0, height = 0;
@@ -642,14 +693,14 @@ void Server::setupRoutes()
                   error.startsWith(QStringLiteral("Inundation result not ready")) ||
                   error.startsWith(QStringLiteral("Redistribution result not ready"))
                 ? Status::Conflict : Status::InternalServerError);
-        return QHttpServerResponse(QByteArrayLiteral("application/vnd.aowis.raster-f32le"), result);
+        return HttpResponse(QByteArrayLiteral("application/vnd.aowis.raster-f32le"), result);
     });
 
     // Experimental time-dependent lumped-reservoir simulation. Inputs include
     // explicit stage-storage and calibrated controls. POST queues work; GET
     // reads only fully persisted, bounded time-series windows.
-    this->http.route("/v1/jobs/<arg>/coupled-simulations", QHttpServerRequest::Method::Post,
-                     [this](const QString &id, const QHttpServerRequest &request)
+    this->http.route("/v1/jobs/<arg>/coupled-simulations", HttpRequest::Method::Post,
+                     [this](const QString &id, const HttpRequest &request)
     {
         if (request.body().size() > 256 * 1024)
             return errorResponse(QStringLiteral("Invalid coupled simulation request size"),
@@ -670,7 +721,7 @@ void Server::setupRoutes()
     });
 
     this->http.route("/v1/jobs/<arg>/coupled-simulations/<arg>",
-                     QHttpServerRequest::Method::Get,
+                     HttpRequest::Method::Get,
                      [this](const QString &id, const QString &simulation_id)
     {
         QString error;
@@ -682,9 +733,9 @@ void Server::setupRoutes()
     });
 
     this->http.route("/v1/jobs/<arg>/coupled-simulations/<arg>/snapshots",
-                     QHttpServerRequest::Method::Get,
+                     HttpRequest::Method::Get,
                      [this](const QString &id, const QString &simulation_id,
-                            const QHttpServerRequest &request)
+                            const HttpRequest &request)
     {
         const QUrlQuery query(request.url());
         int offset = 0;
@@ -706,7 +757,7 @@ void Server::setupRoutes()
     });
 
     this->http.route("/v1/jobs/<arg>/coupled-simulations/<arg>",
-                     QHttpServerRequest::Method::Delete,
+                     HttpRequest::Method::Delete,
                      [this](const QString &id, const QString &simulation_id)
     {
         QString error;
@@ -720,8 +771,8 @@ void Server::setupRoutes()
     // a bounded service-owned pool; task masks are transient, disk-backed,
     // and entirely independent of the current HTTP adapter.
     this->http.route("/v1/jobs/<arg>/catchment-tasks",
-                     QHttpServerRequest::Method::Post,
-                     [this](const QString &id, const QHttpServerRequest &request)
+                     HttpRequest::Method::Post,
+                     [this](const QString &id, const HttpRequest &request)
     {
         if (request.body().size() > 1024)
             return errorResponse(QStringLiteral("Catchment request too large"), Status::BadRequest);
@@ -752,7 +803,7 @@ void Server::setupRoutes()
     });
 
     this->http.route("/v1/jobs/<arg>/catchment-tasks/<arg>",
-                     QHttpServerRequest::Method::Get,
+                     HttpRequest::Method::Get,
                      [this](const QString &id, const QString &task_id)
     {
         QString error;
@@ -762,7 +813,7 @@ void Server::setupRoutes()
     });
 
     this->http.route("/v1/jobs/<arg>/catchment-tasks/<arg>/mask",
-                     QHttpServerRequest::Method::Get,
+                     HttpRequest::Method::Get,
                      [this](const QString &id, const QString &task_id)
     {
         QString error;
@@ -771,11 +822,11 @@ void Server::setupRoutes()
             return errorResponse(error, error.startsWith(QStringLiteral("Unknown"))
                 ? Status::NotFound : error.startsWith(QStringLiteral("Catchment result not ready"))
                 ? Status::Conflict : Status::InternalServerError);
-        return QHttpServerResponse(QByteArrayLiteral("application/vnd.aowis.catchment-u8"), mask);
+        return HttpResponse(QByteArrayLiteral("application/vnd.aowis.catchment-u8"), mask);
     });
 
     this->http.route("/v1/jobs/<arg>/catchment-tasks/<arg>",
-                     QHttpServerRequest::Method::Delete,
+                     HttpRequest::Method::Delete,
                      [this](const QString &id, const QString &task_id)
     {
         QString error;
@@ -784,8 +835,8 @@ void Server::setupRoutes()
         return jsonResponse(this->service.catchmentTask(id, task_id, &error), Status::Accepted);
     });
 
-    this->http.route("/v1/jobs/<arg>/catchment", QHttpServerRequest::Method::Get,
-                     [this](const QString &id, const QHttpServerRequest &request)
+    this->http.route("/v1/jobs/<arg>/catchment", HttpRequest::Method::Get,
+                     [this](const QString &id, const HttpRequest &request)
     {
         const QJsonObject job = this->service.job(id);
         if (job.isEmpty()) return errorResponse(QStringLiteral("Unknown job"), Status::NotFound);
@@ -802,7 +853,7 @@ void Server::setupRoutes()
             return errorResponse(error, error.startsWith(QStringLiteral("Invalid"))
                 ? Status::BadRequest : error.startsWith(QStringLiteral("Catchment calculation busy"))
                 ? static_cast<Status>(429) : Status::InternalServerError);
-        return QHttpServerResponse(QByteArrayLiteral("application/vnd.aowis.catchment-u8"), data);
+        return HttpResponse(QByteArrayLiteral("application/vnd.aowis.catchment-u8"), data);
     });
 }
 } // namespace Aowis::Hydrology

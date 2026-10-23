@@ -44,7 +44,7 @@ terrain adapter and client transport change.
 | `AOWIS::Hydrology` | Geometry, conditioning/D8, basins, rainfall, redistribution, inundation, hydraulic routing | C++20, GeographicLib; no Qt |
 | `AOWIS::HydrologyService` | Job lifecycle, async workers, cancellation, archive and cache reads, terrain-source callbacks | Qt Core and Network, core |
 | `AOWIS::HydrologyRaster` (optional) | Read-only GeoTIFF development/test input | GDAL, core |
-| `aowis-server-hydrology` | CLI configuration and HTTP route presentation | Qt HttpServer, service |
+| `aowis-server-hydrology` | CLI configuration and HTTP route presentation | cpp-httplib, service |
 
 Set `AOWIS_HYDROLOGY_BUILD_SERVER=OFF` and
 `AOWIS_HYDROLOGY_BUILD_SERVICE=ON` when embedding the job service. A parent
@@ -152,3 +152,25 @@ validation tools and [findings](BENCHMARK_FINDINGS.md) record observed limits.
 GUI and Standalone integration remains a distinct repository-level activity;
 this module documents its interfaces but does not claim end-user GUI wiring
 exists merely because these libraries are linkable.
+
+### HTTP transport and worker ownership
+
+The standalone executable uses the pinned cpp-httplib HTTP/1.1 adapter (not
+Qt HttpServer). The `AOWIS::HydrologyService` target remains an independent
+Qt Core/Network C++ library for embedded AOWIS. No local HTTP listener is
+required when linking the library into Standalone or GUI.
+
+The HTTP listener runs on its own thread, accepts connections into a bounded
+cpp-httplib worker queue and invokes `AnalysisService` methods concurrently.
+Asynchronous terrain, rainfall, catchment and simulation calculations use
+service-owned scheduling rather than occupying request workers. Legacy
+synchronous catchment/rainfall endpoints are retained for API compatibility,
+so callers should prefer the corresponding task endpoints for expensive work.
+Outbound Map REST requests continue to use Qt Network inside Hydrology's
+terrain workers. Callers using borrowed in-process Map instances remain
+responsible for that instance's thread-safety and lifetime.
+
+The server enforces an overall 256 KiB inbound body limit; endpoint-specific
+smaller limits remain in effect. Large binary results use a streaming HTTP
+content provider; their *generation* can still require bounded raster buffers,
+which is addressed separately by the resource/large-raster improvements.

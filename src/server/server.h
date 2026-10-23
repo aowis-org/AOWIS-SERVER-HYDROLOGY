@@ -2,11 +2,11 @@
 #define AOWIS_HYDROLOGY_SERVER_H
 
 #include <aowis/hydrology/service.h>
+#include "http_adapter.h"
 
 #include <QHostAddress>
-#include <QHttpServer>
 #include <QString>
-#include <QTcpServer>
+#include <thread>
 
 namespace Aowis::Hydrology
 {
@@ -20,13 +20,21 @@ struct ServerConfig
     std::uint64_t maximum_cells = 10000000;
     int max_concurrent_analyses = 1;
     int max_outstanding_analyses = 8;
+    int http_workers = 8;
+    int http_max_queued_requests = 32;
+    int http_read_timeout_s = 15;
+    int http_write_timeout_s = 30;
+    int http_keep_alive_timeout_s = 5;
 };
 
-// Thin HTTP adapter. All analysis/jobs/results are owned by AnalysisService.
-class Server final : public QObject
+// Transport adapter; application and numerical state belong to AnalysisService.
+class Server final
 {
 public:
-    explicit Server(const ServerConfig &config, QObject *parent = nullptr);
+    explicit Server(const ServerConfig &config);
+    ~Server();
+    Server(const Server &) = delete;
+    Server &operator=(const Server &) = delete;
     bool start(QString *error_message);
 
 private:
@@ -34,8 +42,8 @@ private:
 
     ServerConfig config;
     AnalysisService service;
-    QHttpServer http;
-    QTcpServer tcp;
+    HttpAdapter http;
+    std::thread listener;
 };
 
 } // namespace Aowis::Hydrology
