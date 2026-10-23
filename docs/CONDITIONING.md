@@ -90,8 +90,8 @@ volume to raise all depressions to a boundary-connected surface under the
 current domain assumptions. Real stormwater capacity depends on *nested*
 basin topology, existing water, outlet elevations, rainfall polygon,
 infiltration and additional hydraulic connectivity. The separate depression
-hierarchy, storage curves and Fill–Spill–Merge engine in roadmap stages 6–8
-will provide the proper basis for rainfall-volume scenarios.
+hierarchy, storage curves and static Fill–Spill–Merge-style redistribution
+provide the topographic accounting used by rainfall-volume scenarios.
 
 ## Numerical and domain assumptions
 

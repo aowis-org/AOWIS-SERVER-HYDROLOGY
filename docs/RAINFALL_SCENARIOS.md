@@ -58,9 +58,8 @@ input geometry/parameters, the covered area and wet-cell count, and:
   edge, or extends beyond the analysis window; results may be incomplete.
 
 **The rainfall-scenario output itself does not simulate ponding, pipe drainage,
-travel time, velocity, peak discharge or infiltration timing.** Stage 8 adds a
-separate on-demand static volume redistribution query using the saved runoff
-raster and original-DEM basin hierarchy. See
+travel time, velocity, peak discharge or infiltration timing.** A separate static volume redistribution operation uses the saved runoff
+raster and original-DEM basin hierarchy to calculate basin storage and outflow. See
 [RUNOFF_REDISTRIBUTION.md](RUNOFF_REDISTRIBUTION.md). The sum of the saved
 runoff cells is the generated runoff volume.
 
@@ -114,7 +113,7 @@ have an additional geometric edge budget.
 
 ## Future model integration
 
-Stage 8's initial static solver is implemented. It starts from the saved
+The static redistribution solver is available. It starts from the saved
 `runoff.f64` raster and uses **original DEM** dry-D8 paths plus the source-DEM
 depression hierarchy to determine retained volumes, spill transfers and
 out-of-domain discharge. It does **not** infer timing or a flood-depth map.

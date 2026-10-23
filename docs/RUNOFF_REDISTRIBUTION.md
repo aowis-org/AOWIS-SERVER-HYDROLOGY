@@ -1,6 +1,6 @@
 # Runoff redistribution and basin overflow
 
-**Status:** first Stage 8 implementation (static, volume-only Fill–Spill–Merge-style approximation). Implemented in `include/aowis/hydrology/redistribution.h`, `src/core/redistribution.cpp`, the reusable Qt service, and the REST adapter. This is **not** a hydrodynamic flood model.
+**Status:** available static, volume-only Fill–Spill–Merge-style approximation. Implemented in `include/aowis/hydrology/redistribution.h`, `src/core/redistribution.cpp`, the reusable Qt service, and the REST adapter. This is **not** a hydrodynamic flood model.
 
 ## 1. What problem this answers
 
@@ -20,24 +20,24 @@ It intentionally does **not** calculate storm arrival times, flow velocities, di
 | --- | --- | --- |
 | Elevations and grid geometry | Completed job, `elevation.f32` | Original, unmodified source DEM from Map |
 | Basin topology and capacities | Completed job, `basins.aowbin` | Calculated from original DEM; persisted with checksummed archive |
-| Runoff volume per cell | Scenario, `runoff.f64` | Derived in Stage 7 from clipped rainfall polygons, depth, and runoff fraction |
+| Runoff volume per cell | Scenario, `runoff.f64` | Derived from saved clipped rainfall polygons, depth, and runoff fraction |
 | Flow graph | Calculated from original DEM on first scenario redistribution | Unfilled, unbreached D8: a real closed depression stays a sink; later queries reuse cached results |
 
 The persisted job's conditioned D8 flow graph is **not** reused here, because a filled routing surface deliberately gives a sink an artificial drainage connection. Such a link is useful for watershed tracing but must not magically empty a basin before reaching its saddle.
 
 **Map remains the only terrain provider**. Queries use saved data and do not download Copernicus data again. No new GUI, Map, Standalone, or SWMM dependency is introduced.
 
-All DEM cells must contain finite elevations for this increment. Missing cells are rejected: interpreting a hole as an outflow could understate storage catastrophically. Basin archives with unresolved spill elevations are also rejected. A clipped DEM boundary is always a model boundary, **not proof that a real outlet exists there**.
+All DEM cells must contain finite elevations for this operation. Missing cells are rejected: interpreting a hole as an outflow could understate storage catastrophically. Basin archives with unresolved spill elevations are also rejected. A clipped DEM boundary is always a model boundary, **not proof that a real outlet exists there**.
 
 ## 3. Calculation, in order
 
-### A. Generate surface runoff (Stage 7)
+### A. Generate surface runoff from the rainfall scenario
 
 For a DEM cell with rainfall polygon coverage fraction `f`, physical area `A` in m², event depth `P` in mm, and effective runoff fraction `r`:
 
 `generated_runoff_m3 = A * f * (P / 1000) * r`
 
-Overlapping polygons are unioned (not counted twice). Water in the complement `1-r` is reported by Stage 7 as *retained or lost* before this redistribution starts. It does **not** enter Stage 8's conservation equation. See [RAINFALL_SCENARIOS.md](RAINFALL_SCENARIOS.md).
+Overlapping polygons are unioned (not counted twice). Water in the complement `1-r` is reported by the rainfall scenario as *retained or lost* before this redistribution starts. It does **not** enter the redistribution conservation equation. See [RAINFALL_SCENARIOS.md](RAINFALL_SCENARIOS.md).
 
 ### B. Dry-surface D8 transport
 
@@ -97,7 +97,7 @@ and
 
 ## 4. REST API
 
-All IDs are UUIDs. A terrain job must be `completed` and contain its basin hierarchy. The scenario must already exist (Stage 7).
+All IDs are UUIDs. A terrain job must be `completed` and contain its basin hierarchy. The scenario must already have been saved.
 
 ```http
 POST /v1/jobs/{job-uuid}/rainfall-scenarios/{scenario-uuid}/redistribution
@@ -167,7 +167,7 @@ These requests require a configured Map server for the *initial* terrain-analysi
 ### Errors and missing features
 
 - Invalid UUID, noncompleted analysis, invalid pagination, corrupt or missing raster/archive: the query fails rather than returning fabricated zeros.
-- DEM with any missing elevation: query fails in this increment, including missing boundary pixels.
+- DEM with any missing elevation: redistribution fails, including missing boundary pixels.
 - Large valid DEMs currently need in-memory source, dry-flow graph, routing accumulators and hierarchy; this operation is **not out-of-core**.
 - Asynchronous redistribution tasks have UUID task IDs and bounded background execution. The result is persisted as a derived, disposable binary cache separate from authoritative rainfall input and terrain source. REST GET never initiates a new long-running solve.
 - Static inundation REST depth windows now exist through a separate asynchronous task and derived depth cache. They represent standing-water estimates subject to the redistribution allocation assumption, not a hydraulic forecast. See [INUNDATION_SERVICE.md](INUNDATION_SERVICE.md), [STATIC_INUNDATION.md](STATIC_INUNDATION.md) and [SIBLING_ALLOCATION_SENSITIVITY.md](SIBLING_ALLOCATION_SENSITIVITY.md).
@@ -198,7 +198,7 @@ The pure C++ function accepts an optional cancellation flag (`const std::atomic<
 
 **Boundary choice matters.** Water leaving the chosen DEM bounding box is counted as *out of domain*, not lost from the physical watershed. For meaningful watershed decisions, expand the analysis domain to include the contributing area and downstream terrain. The model does not automatically fetch or grow the area.
 
-**Model comparison matters.** This initial solver is an AOWIS approximation inspired by Fill–Spill–Merge, *not* a claim of numerical equivalence with a published Fill–Spill–Merge implementation. The tests exercise volume conservation and analytic pits, but large reference DEM comparisons and observed flood validation remain work in [ROADMAP.md](ROADMAP.md).
+**Model comparison matters.** This initial solver is an AOWIS approximation inspired by Fill–Spill–Merge, *not* a claim of numerical equivalence with a published Fill–Spill–Merge implementation. The tests exercise volume conservation and analytic pits, but large reference DEM comparisons and observed flood validation remain open questions in [product scope](ROADMAP.md).
 
 ## 7. Verification and next improvements
 

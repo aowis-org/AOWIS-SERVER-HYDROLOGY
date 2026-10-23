@@ -77,9 +77,8 @@ longitude/latitude even if the analysis is performed on a UTM raster.
 The service limits extracted channels to **25,000 selected cells** and
 **2,000 segments** per request; too-small contributing-area thresholds are
 rejected rather than creating enormous HTTP responses. Raise the threshold
-or use a smaller analysis domain to reduce the requested network. A future
-stage may add indexed spatial subset queries, caching and asynchronous
-network extraction to improve performance for repeated large-area requests.
+or use a smaller analysis domain to reduce the requested network. Additional spatial indexing, caching and asynchronous network extraction
+may improve repeated large-area requests.
 
 ## Tests and limitations
 
@@ -89,12 +88,13 @@ Strahler orders, topology, invalid links, cycles, and resource caps.
 `aowis-hydrology-service` additionally checks queries before and after
 restarting the job service.
 
-This stage **does not** calculate rainfall runoff, polygon-to-network
-intersection, flow arrival times, basin filling/overflow, or watershed
-polygon boundaries. Those are separate roadmap stages. No changes to Map,
-GUI, Standalone or SWMM are required for these queries.
+The basic flow-graph query itself does not calculate rainfall runoff,
+flow arrival times, or basin overflow. Watershed polygon boundaries and
+polygon-selected downstream networks are **available as separate spatial
+queries** described below. No changes to Map, GUI, Standalone or SWMM are
+required for these library and REST queries.
 
-## Watershed polygons and geographically selected drainage (Stage 5 continuation)
+## Watershed polygons and geographically selected drainage
 
 The C++ core additionally provides `polygonizeCatchment()`,
 `extractWindowChannelNetwork()`, and `downstreamNetworkFromPolygon()` in
@@ -130,8 +130,8 @@ Content-Type: application/json
 `geometry` accepts a WGS84 `Polygon` or `MultiPolygon`, including inner
 rings (holes). Input coordinate sequences must explicitly close. A polygon
 selects **DEM cell centres**; this is a topological D8 influence query, *not*
-a spatially integrated rainfall volume. Partial-cell weighting belongs to
-the upcoming rainfall stage. Values outside the DEM are not fetched by the
+a spatially integrated rainfall volume. Partial-cell weighting belongs to the separate implemented rainfall-scenario
+geometry model; this drainage query deliberately selects cell centres. Values outside the DEM are not fetched by the
 query, and incomplete drainage beyond the analysis boundary is reported.
 
 The watershed endpoint returns a GeoJSON `Feature` whose geometry is a

@@ -170,7 +170,7 @@ any borrowed Map instance must outlive `AnalysisService`.
   status will say `completed` with `id: null` if the cache is valid,
   otherwise `not_started`; the client can submit again.
 
-No progress percentage or ETA is exposed in this increment. Task state is
+No progress percentage or ETA is exposed by this API. Task state is
 not yet a durable event/history record; persistent result files are the
 source of truth after restart. Multi-process/distributed writer coordination,
 timeouts, explicit prioritization, and metropolitan-scale performance

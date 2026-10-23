@@ -2,7 +2,7 @@
 
 ## Purpose and present status
 
-`routeCoupledReservoirs()` solves a **time-dependent, zero-dimensional finite-volume reservoir network**. It is a new, opt-in core API. It uses independently specified basin stage–storage curves, externally parameterized hydraulic connections, and per-reservoir, time-interval inflow volumes. Every connection is evaluated from the **same instantaneous set of water levels** and all calculated transfers are applied simultaneously.
+`routeCoupledReservoirs()` solves a **time-dependent, zero-dimensional finite-volume reservoir network**. It is an opt-in core API. It uses independently specified basin stage–storage curves, externally parameterized hydraulic connections, and per-reservoir, time-interval inflow volumes. Every connection is evaluated from the **same instantaneous set of water levels** and all calculated transfers are applied simultaneously.
 
 This is a foundation for timed, hydraulically informed flow redistribution. It is **not** the same as the existing static Fill–Spill–Merge rainfall redistributor, and it does not silently replace any saved scenarios, redistribution caches, inundation files, or REST endpoints. A caller has to construct and validate a reservoir network and its inflow history explicitly.
 
@@ -137,7 +137,7 @@ The reported water levels belong to **lumped reservoir approximations**. A snaps
 
 - **Map** continues to own DEM acquisition and cached source tiles. It does not own this hydraulic solver.
 - **Hydrology** already produces static basin topology, storage relationships, and total runoff volumes. This new core is deliberately separate from scenario persistence and REST: event-duration and total rainfall depth alone do **not** determine an inflow hydrograph.
-- The opt-in [timed-runoff forcing adapter](TEMPORAL_RUNOFF_FORCING.md) now distributes Stage 7 event runoff totals into **externally specified time fractions** and maps the original DEM's dry-D8 leaf inflow volumes into per-reservoir intervals. This is not a travel-time calculation: all dry-D8 arrivals are assumed immediate, and the caller must separately provide physically disjoint reservoir curves and calibrated controls.
+- The opt-in [timed-runoff forcing adapter](TEMPORAL_RUNOFF_FORCING.md) now distributes saved scenario event runoff totals into **externally specified time fractions** and maps the original DEM's dry-D8 leaf inflow volumes into per-reservoir intervals. This is not a travel-time calculation: all dry-D8 arrivals are assumed immediate, and the caller must separately provide physically disjoint reservoir curves and calibrated controls.
 - The opt-in coupled simulation service now has separate job UUIDs, explicit input manifests, versioned cache files, cancellation and status APIs. It never overwrites static redistribution results or reuses their cache keys. It does not yet automatically build inflow histories from saved rainfall scenarios.
 - The opt-in [free-overflow boundary outlet](BOUNDARY_OUTLETS.md) now accounts for discharge leaving modeled reservoirs while preserving simultaneous update and per-snapshot conservation. It is not an inferred DEM feature or backwater calculation; it can now be configured explicitly through the separate persisted coupled simulation service. Physically defensible time-varying infiltration and connections to SWMM remain future capabilities.
 

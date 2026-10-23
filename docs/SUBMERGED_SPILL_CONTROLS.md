@@ -116,7 +116,7 @@ with discharge direction given by the higher surface. `C_d` must be a defensible
 - Otherwise, at least one surface does not completely submerge the aperture: `PartiallySubmergedUnsupported` and **NaN discharge**. This includes potentially free-discharging openings. No guess is made using the submerged-orifice law.
 - The junction must contain exactly the two specified components; unlike the **surface weir**, a culvert may be below the DEM saddle and cannot be required to have the same side-contact geometry.
 
-For example, width `2 m`, height `0.5 m`, `C_d=0.6`, levels `12 m` and `11 m`, a **completely drowned** opening gives about `2.658 m³/s` in the positive direction. This idealized law neglects entrance/exit losses beyond the coefficient, conduit friction, barrel length, air entrainment, valve operation, partial-flow regimes and velocity-head corrections. **It is not a culvert-network solver**; there is no time-stepping method for engineered openings in this increment.
+For example, width `2 m`, height `0.5 m`, `C_d=0.6`, levels `12 m` and `11 m`, a **completely drowned** opening gives about `2.658 m³/s` in the positive direction. This idealized law neglects entrance/exit losses beyond the coefficient, conduit friction, barrel length, air entrainment, valve operation, partial-flow regimes and velocity-head corrections. **It is not a culvert-network solver**; the standalone rating method is not a complete culvert-network simulation. The separately available coupled reservoir model can use calibrated, fully submerged opening controls.
 
 ```cpp
 RectangularOrificeControl opening;

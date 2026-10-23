@@ -13,7 +13,7 @@ The current core does not support rotated/sheared GeoTIFF transforms, antimeridi
 
 ## Distances and areas
 
-The core now calculates geographic D8 edge lengths using GeographicLib's **WGS84 ellipsoidal geodesics**. Geographic raster cell area is calculated from a WGS84 geodesic polygon bounded by the four cell corners. Because geographic cells are north-up rectangles, per-row metrics can be reused across columns without changing the result. This replaces the earlier spherical Earth radius and planar cosine approximations.
+The core now calculates geographic D8 edge lengths using GeographicLib's **WGS84 ellipsoidal geodesics**. Geographic raster cell area is calculated from a WGS84 geodesic polygon bounded by the four cell corners. Because geographic cells are north-up rectangles, per-row metrics can be reused across columns without changing the result. Metric calculations intentionally use GeographicLib rather than a fixed Earth radius or planar cosine approximation.
 
 For a north-up UTM raster, physical edge lengths and area are approximated as projected lengths divided by the **local GeographicLib projection scale**, and projected area divided by scale squared. The current implementation evaluates scale once per row at a representative longitude, which is appropriate for small-to-moderate UTM grids but may create small biases across wide projected rasters. Future large/high-accuracy LiDAR analysis may require per-cell scale evaluation or native ellipsoidal polygon/edge calculations.
 
@@ -27,10 +27,10 @@ For a north-up UTM raster, physical edge lengths and area are approximated as pr
 
 Routing stays in the DEM's native grid, avoiding resampling. The grid boundary is a potential outlet; cropped analyses lack upstream or downstream context outside their bounds. The service must disclose that limitation; it is not equivalent to the user's selected rainfall polygon or desired downstream trace length.
 
-The default REST job interface currently accepts geographic WGS84 bounds and requests native elevations from Map. **Only the pure C++ analysis library can accept UTM elevation grids at this stage.** Projected GeoTIFF ingestion and an independent rainfall polygon / processing domain are later roadmap stages.
+The default REST job interface currently accepts geographic WGS84 bounds and requests native elevations from Map. **The HTTP job request remains geographic WGS84; the pure C++ analysis core also accepts UTM grids.** Arbitrary projected GeoTIFF inputs and independent analysis-domain policies are outside the present server contract.
 
 ## Build and submodule integration
 
-`tools/setup_geographiclib.sh` adds/pins GeographicLib 2.7 as a real Git submodule at `external/GeographicLib` inside the Hydrology repository. This cannot be represented by a changed-files-only ZIP alone: Git must create and commit its submodule gitlink. Run the setup script once after applying this patch. It is a conscious, user-invoked dependency setup, never a CMake download.
+`tools/setup_geographiclib.sh` adds/pins GeographicLib 2.7 as a real Git submodule at `external/GeographicLib` inside the Hydrology repository. This is a Git-tracked dependency: initialize it after cloning with `git submodule update --init --recursive`. The setup helper is used when first registering the submodule in a new checkout; CMake never downloads it implicitly.
 
-CMake looks for an existing `GeographicLib::GeographicLib` target before adding a subdirectory, so a parent standalone meta-build can provide an already-built GeographicLib target. If no parent target exists, Hydrology builds against its own submodule source. No GUI, Map or Standalone repository modifications are part of this stage.
+CMake looks for an existing `GeographicLib::GeographicLib` target before adding a subdirectory, so a parent standalone meta-build can provide an already-built GeographicLib target. If no parent target exists, Hydrology builds against its own submodule source. The library does not modify the GUI, Map or Standalone source trees.

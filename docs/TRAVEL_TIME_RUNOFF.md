@@ -2,7 +2,7 @@
 
 ## Purpose and scope
 
-`travelTimeInflowsFromRaster()` adds **travel delays** to the Stage 7 rainfall-runoff volume raster before feeding the coupled reservoir solver. Instead of placing water at its receiving depression or at the DEM edge immediately, the adapter traces each source cell along the **original, unfilled, unbreached D8 flow graph**, computes its path length, and shifts its explicitly prescribed runoff-time profile by a travel-time estimate.
+`travelTimeInflowsFromRaster()` adds **travel delays** to a saved rainfall-scenario runoff-volume raster before feeding the coupled reservoir solver. Instead of placing water at its receiving depression or at the DEM edge immediately, the adapter traces each source cell along the **original, unfilled, unbreached D8 flow graph**, computes its path length, and shifts its explicitly prescribed runoff-time profile by a travel-time estimate.
 
 This is an **opt-in screening model**. It does **not** update the existing static Fill–Spill–Merge service, scenario caches, HTTP endpoints, or inundation results. The [zero-travel-time temporal adapter](TEMPORAL_RUNOFF_FORCING.md) remains available and unchanged. The feature is Qt-independent and requires no additional GIS libraries beyond the Hydrology core's existing GeographicLib dependency.
 
@@ -14,7 +14,7 @@ This is an **opt-in screening model**. It does **not** update the existing stati
 |---|---|---|
 | `original_dem` | metres for elevation | Map-provided DEM, untouched by fill/breach; WGS84 geographic or WGS84 UTM raster |
 | `hierarchy` | basin indices, metres, m³ | Depression hierarchy from **the same original raster** |
-| `runoff_volume_m3` | m³ per cell | Stage 7 effective-runoff raster for the same grid and scenario |
+| `runoff_volume_m3` | m³ per cell | saved scenario effective-runoff raster for the same grid and scenario |
 | `reservoirs` | component indices, stage-storage curves | Exactly one independent reservoir for each depression **leaf**; in any input order |
 | `time_profile` | seconds and unitless shares | Explicit user-specified event fractions and positive durations summing to the event |
 | `event_duration_seconds` | seconds | Total duration of the prescribed runoff-generation profile |

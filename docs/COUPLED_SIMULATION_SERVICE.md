@@ -4,10 +4,10 @@
 
 The Hydrology server supports two **independent** families of results:
 
-1. **Static rainfall redistribution / standing-water inundation:** terrain-driven Fill–Spill–Merge estimates based on the persisted original DEM and Stage 7 event-total runoff. These have their own scenario UUID, binary cache and REST lifecycle.
+1. **Static rainfall redistribution / standing-water inundation:** terrain-driven Fill–Spill–Merge estimates based on the persisted original DEM and saved event-total runoff. These have their own scenario UUID, binary cache and REST lifecycle.
 2. **Time-dependent coupled reservoir simulations:** a prescribed, lumped-reservoir hydraulic model driven by **explicit or scenario-derived per-reservoir inflow intervals** and **externally characterized** storage curves and control sections. Each run has a **separate simulation UUID** under an already completed terrain-analysis job. It uses `routeCoupledReservoirsWithOutlets()` and never changes the static result or assumes rain-depth and duration constitute a hydrograph.
 
-The client is responsible for defensible stage–storage models and calibrated controls. An inflow history may be supplied directly through `inflows`, or generated from a saved Stage 7 scenario using an explicit `scenario_forcing` configuration. The latter uses the [temporal](TEMPORAL_RUNOFF_FORCING.md) or [travel-time](TRAVEL_TIME_RUNOFF.md) core adapter but **never infers rainfall timing, travel speed, or a calibrated hydrograph from event-total rainfall**. See [Scenario-driven forcing](SCENARIO_COUPLED_FORCING.md) for the full schema, accounting, provenance, and assumptions.
+The client is responsible for defensible stage–storage models and calibrated controls. An inflow history may be supplied directly through `inflows`, or generated from a saved rainfall scenario using an explicit `scenario_forcing` configuration. The latter uses the [temporal](TEMPORAL_RUNOFF_FORCING.md) or [travel-time](TRAVEL_TIME_RUNOFF.md) core adapter but **never infers rainfall timing, travel speed, or a calibrated hydrograph from event-total rainfall**. See [Scenario-driven forcing](SCENARIO_COUPLED_FORCING.md) for the full schema, accounting, provenance, and assumptions.
 
 ## REST lifecycle
 

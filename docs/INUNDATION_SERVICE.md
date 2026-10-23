@@ -145,7 +145,7 @@ Valid derived outputs survive a service restart. Transient worker UUIDs and queu
 
 The standing-water reconstruction is a stationary hydrostatic model for connected depressions. For partially formed merges, the service now draws **independent conditional child-pond surfaces** and reports `allocation_assumed: true`. This is different from claiming a unique long-term hydraulic equilibrium. `unresolved_partial_merge` remains the safe fallback for storage that cannot consistently be accounted for. Do not substitute zero depths for unavailable reconstructions.
 
-Outstanding improvements include more physically justified inter-basin connectivity, out-of-core reconstruction for very large DEMs, consistent source revision IDs from Map, reference-solver comparisons, and integration with GUI layers. See [STATIC_INUNDATION.md](STATIC_INUNDATION.md), [RUNOFF_REDISTRIBUTION.md](RUNOFF_REDISTRIBUTION.md), and [ROADMAP.md](ROADMAP.md).
+Outstanding improvements include more physically justified inter-basin connectivity, out-of-core reconstruction for very large DEMs, consistent source revision IDs from Map, reference-solver comparisons, and integration with GUI layers. See [STATIC_INUNDATION.md](STATIC_INUNDATION.md), [RUNOFF_REDISTRIBUTION.md](RUNOFF_REDISTRIBUTION.md), and [product scope](ROADMAP.md).
 
 ### Model-version and cache transition
 

@@ -118,7 +118,7 @@ The original APIs remain exactly as before:
   modification of that diagnostic.
 - No additional server configuration, HTTP endpoint, task type, cache field,
   binary-format version, database migration or new runtime dependency is
-  introduced by this increment.
+  introduced by this optional policy.
 
 **Do not persist or display a weighted result as an ordinary scenario result**
 without recording which allocation policy generated it. That would make
@@ -169,7 +169,7 @@ The next physics-oriented work should locate actual saddle transfer paths,
 represent spill widths and local slopes and define a defensible conveyance
 model, then introduce time-varying inflows/flow rates if required. The SWMM
 service and higher-resolution terrain can provide additional information, but
-that integration is not part of this incremental core API.
+that integration is not provided by this optional core API.
 
 ## Tests and verification
 
@@ -185,4 +185,4 @@ persistence tests must continue passing without changing cached outputs.
 ```
 
 See also [STATIC_INUNDATION.md](STATIC_INUNDATION.md) for the meaning of
-conditional ponding rasters and [ROADMAP.md](ROADMAP.md) for subsequent stages.
+conditional ponding rasters and [product scope](ROADMAP.md) for outstanding scientific questions.

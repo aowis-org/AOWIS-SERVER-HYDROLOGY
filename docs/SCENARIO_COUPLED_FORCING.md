@@ -2,7 +2,7 @@
 
 ## Purpose and boundaries
 
-A completed Hydrology terrain-analysis job can store several **Stage 7 rainfall scenarios**. Each scenario contains the total effective runoff volume per raster cell (`runoff.f64`) and an event duration. The coupled reservoir solver accepts a time series of per-reservoir inflow volumes. The **scenario-forcing adapter** connects these two subsystems without modifying the rainfall scenario, the static redistribution cache, or existing simulations.
+A completed Hydrology terrain-analysis job can store several **saved rainfall scenarios**. Each scenario contains the total effective runoff volume per raster cell (`runoff.f64`) and an event duration. The coupled reservoir solver accepts a time series of per-reservoir inflow volumes. The **scenario-forcing adapter** connects these two subsystems without modifying the rainfall scenario, the static redistribution cache, or existing simulations.
 
 This is an **opt-in experimental screening model**. A scenario duration and total depth do **not** determine rainfall timing, infiltration dynamics, catchment velocities, culvert dimensions, stage–storage curves or physically calibrated discharge. Supply the missing timing and hydraulic parameters explicitly. No connection widths are inferred from 30 m DEM pixels.
 
@@ -122,4 +122,4 @@ The service retains the **exact submitted JSON request** in `simulation.json`. T
 
 `tests/test_service.cpp` exercises both forcing variants on a saved single-depression scenario, a consistent runoff-to-basin balance, malformed/ambiguous input rejection, scenario source digests, status, and paginated results. The Qt-independent [temporal](TEMPORAL_RUNOFF_FORCING.md) and [D8 travel-time](TRAVEL_TIME_RUNOFF.md) test suites verify conservation, distances, tails, cancellation, and leaf mapping independently.
 
-To validate a real project, first run `./compile_linux_tests.sh --both`; then submit a small scenario and inspect `scenario_forcing_result`, compare basin inflow totals against the saved Stage 7 runoff, inspect delayed tail bins, and confirm hydraulic outflow/basin storage balance. Finally, rerun at half `maximum_substep_seconds` and with alternative physically plausible velocities/profile shapes to assess sensitivity. **Conservative volume balance and passing tests do not demonstrate calibrated flood prediction.**
+To validate a real project, first run `./compile_linux_tests.sh --both`; then submit a small scenario and inspect `scenario_forcing_result`, compare basin inflow totals against the saved scenario runoff, inspect delayed tail bins, and confirm hydraulic outflow/basin storage balance. Finally, rerun at half `maximum_substep_seconds` and with alternative physically plausible velocities/profile shapes to assess sensitivity. **Conservative volume balance and passing tests do not demonstrate calibrated flood prediction.**

@@ -1,4 +1,4 @@
-# Depression hierarchy and basin storage — Stage 6 foundation
+# Depression hierarchy and basin storage
 
 The hydrology core includes `depression_hierarchy.h` with a **raster-centre bathtub** model derived from the **original, immutable elevation grid**. It does not use the Priority-Flood-conditioned D8 surface, breach cuts, or invented flat gradients. Consequently, potential fill-depth diagnostics from the routing engine and actual *connected-basin storage* calculations must not be conflated.
 
@@ -31,13 +31,13 @@ The hydrology core includes `depression_hierarchy.h` with a **raster-centre bath
   plateau grouping and stable root ordering are retained. Reusable neighbor
   and closed-component vectors reduce repeated allocations. This changes no
   basin serial format, float arithmetic, boundary treatment, or API.
-  Synthetic mixed/near-unique elevations produced identical basin records
-  when compared with the preceding implementation; speedup on live GLO-30
-  is to be measured independently rather than inferred from synthetic tests.
+  Synthetic mixed/near-unique elevations retain matching basin records;
+  measured GLO-30 performance and its limitations are documented in
+  [benchmark findings](BENCHMARK_FINDINGS.md).
 
 `basinStorageAtLevel(source, hierarchy, index, water_level_m, max_visited_cells, cancel)` estimates the connected area and stored volume at a queried water level. Its accepted interval is **from the basin's formation elevation through its spill elevation**. At exactly the spill level, it returns the stable pre-spill statistics produced by the elevation sweep (saddle-height cells add no capacity). Levels above spill are rejected; the caller must later apply the Fill–Spill–Merge distribution algorithm rather than ignoring the spill.
 
-The on-demand query intentionally bounds the number of visited cells and does not precompute large volume/area tables for every nested basin. A future service increment will add persistent summaries and sampled storage curves for REST and library consumers, without rerunning the full terrain analysis for each rainfall scenario.
+The on-demand query intentionally bounds the number of visited cells and does not precompute large volume/area tables for every nested basin. Completed analysis jobs already persist basin summaries and expose bounded, sampled storage curves through the service and REST APIs, without rerunning terrain analysis for each rainfall scenario.
 
 ## What this represents—and what it does not
 
@@ -63,8 +63,7 @@ capacity; parent relations reconstruct child lists on load. Source elevations
 remain stored independently as `elevation.f32` and are loaded for explicit
 water-level sampling. The original DEM is never recomputed from the
 conditioned or breached routing surface. Corrupt, oversized, missing or
-mismatched hierarchy artifacts cause explicit errors. Pre-release completed
-jobs from before this stage need to be rerun.
+mismatched hierarchy artifacts cause explicit errors. Older completed jobs without a basin archive need to be rerun.
 
 All basin entities exposed to a client use deterministic, job-scoped UUIDs.
 The library `AnalysisService` exposes `basins(job, offset, limit)`,
@@ -77,21 +76,22 @@ spill. Storage queries use a bounded 2-million-cell flood traversal.
 Hierarchy construction occurs before marking the terrain job complete, and
 its results remain available following a service restart.
 
-## Next work
+## Limits and open questions
 
-Benchmark hierarchy build/serialization, large basin memory consumption and
-reference comparisons on real GLO-30 areas. Add spill-network queries, source terrain fingerprints, and optimized storage
-curves for large connected basins. Stage 8 now supplies an initial static
-volume-only redistribution query; dynamic hydraulics and water-depth rasters
-remain future work, not part of these storage curves.
+Hierarchy construction and persistence have been benchmarked on real GLO-30
+regions; further profiling on larger or different terrain remains useful.
+Independent reference comparisons, scalable queries for very large connected
+basins and source-revision provenance still need work. Static redistribution
+and conditional static depth reconstruction are separate available operations;
+these storage curves themselves do not predict flood timing or discharge.
 
 ## Relationship to rainfall redistribution
 
-Stage 8 uses this same saved **original-elevation** hierarchy, not the filled
+Static redistribution uses this same saved **original-elevation** hierarchy, not the filled
 routing terrain. Each leaf's `capacity_at_spill_m3` acts as its maximum
 independent storage before water can cross the saddle to sibling basins or to
 its parent. An internal parent capacity **includes** its children: summing
 all individual capacities or stored-subtree results would double-count water.
-Only root basins are summed in the Stage 8 total. The actual scenario endpoint
+Only root basins are summed in the static redistribution total. The actual scenario endpoint
 is described in [RUNOFF_REDISTRIBUTION.md](RUNOFF_REDISTRIBUTION.md); these
 static storage curves alone are not evidence of stormwater inundation.
