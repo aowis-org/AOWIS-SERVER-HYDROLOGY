@@ -18,6 +18,7 @@ ctest --test-dir build --output-on-failure -R aowis-hydrology-http-contract
 
 # ZIP tooling uses disposable local Git fixtures, including nested submodules.
 python3 tests/test_zip_hydrology.py
+python3 tests/test_prune_hydrology.py
 ```
 
 Full-suite validation should use the documented project build scripts on each
@@ -41,7 +42,12 @@ The test exercises:
 - deterministic flow-related raster products between independent analyses;
 - basin listing, drainage network, downstream tracing and catchment masks;
 - a persisted rainfall scenario and raw `float64` runoff window;
-- discovering and reading jobs, rasters and the scenario after process restart.
+- discovering and reading jobs, rasters and the scenario after process restart;
+- bounded terrain-job admission (429 without disk artifacts), queued-job
+  cancellation, immediate slot reuse, and canceled-job persistence on restart.
+The separate offline pruning test checks that deletion is opt-in, restricted
+to terminal UUID manifests older than the minimum age, and does not traverse
+symlinked job directories or remove unrecognized data.
 
 This is a **black-box protocol regression** and must run unchanged against a
 replacement HTTP adapter. A change in response status, body, MIME or binary

@@ -91,7 +91,25 @@ uses Map REST; optional GDAL GeoTIFF readers are for testing/development.
 - The analysis service owns UUID jobs, bounded requests, stage status,
   cancellation, manifests, raster and basin archives, scenario caches and
   checksum-based recovery/read validation.
-- Analysis queue concurrency is configured independently from asynchronous
+- Terrain workers (`max_concurrent_analyses`, 1–4) are separate from admission
+  (`max_outstanding_analyses`, 1–64, >= worker count). Admission counts queued
+  plus running terrain jobs and in-progress submission reservations. The
+  service reserves space before creating output paths, and concurrent API
+  callers cannot overfill the queue. The returned error begins with
+  `Terrain analysis capacity reached`; HTTP responds with JSON and 429.
+- A service-managed pending queue holds jobs not yet given a worker. Canceling
+  a queued job marks it `canceled`, persists its manifest, frees admission
+  immediately and prevents terrain acquisition. Canceling running jobs signals
+  cooperative cancellation. Completed/failed/canceled results do not occupy
+  admission slots, and saved artifacts are retained by default; DELETE of a
+  job UUID requests cancellation, not artifact deletion. An opt-in,
+  dry-run-first offline retention tool (`tools/prune_hydrology_analyses.py`)
+  can delete terminal analysis folders older than a chosen threshold only
+  after the server has been stopped. This also removes dependent scenario
+  artifacts; no automatic retention deletion occurs.
+- `AnalysisService::terrainJobCapacity()` and the `terrain_jobs` object in
+  `/status` expose `queued`, `running`, `outstanding` and `limit` for operations
+  and benchmarks. Analysis admission is separate from asynchronous
   redistribution, inundation and coupled-simulation task scheduling.
 - HTTP Map retrieval supports 1–4 parallel patch calls per active analysis;
   the in-process borrowed Map path is sequential. There is no service-wide

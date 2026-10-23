@@ -46,6 +46,7 @@ ServiceConfig serviceConfig(const ServerConfig &config)
     result.dataset = config.dataset;
     result.maximum_cells = config.maximum_cells;
     result.max_concurrent_analyses = config.max_concurrent_analyses;
+    result.max_outstanding_analyses = config.max_outstanding_analyses;
     return result;
 }
 } // namespace
@@ -77,6 +78,8 @@ void Server::setupRoutes()
             {QStringLiteral("service"), QStringLiteral("aowis-server-hydrology")},
             {QStringLiteral("status"), QStringLiteral("ok")},
             {QStringLiteral("max_concurrent_analyses"), this->config.max_concurrent_analyses},
+            {QStringLiteral("max_outstanding_analyses"), this->config.max_outstanding_analyses},
+            {QStringLiteral("terrain_jobs"), this->service.terrainJobCapacity()},
             {QStringLiteral("map_requests_per_analysis"), this->config.source.max_concurrent_requests}});
     });
 
@@ -129,7 +132,9 @@ void Server::setupRoutes()
         QString error;
         const QString id = this->service.submit(analysis, &error);
         if (id.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Cannot"))
+            return errorResponse(error, error.startsWith(QStringLiteral("Terrain analysis capacity"))
+                ? static_cast<Status>(429) // Too Many Requests (all supported Qt 6 releases)
+                : error.startsWith(QStringLiteral("Cannot"))
                 ? Status::InternalServerError : Status::BadRequest);
         return jsonResponse(this->service.job(id), Status::Accepted);
     });

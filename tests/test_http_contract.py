@@ -40,6 +40,10 @@ class MapFixture(http.server.BaseHTTPRequestHandler):
         except (KeyError, ValueError, AssertionError):
             self.send_error(400)
             return
+        release = getattr(self.server, "terrain_release", None)
+        if release is not None and not release.wait(timeout=15):
+            self.send_error(503, "Mock terrain request timed out")
+            return
         values = [float(1000 - 10 * y - x)
                   for y in range(rows) for x in range(columns)]
         data = struct.pack("<" + "f" * len(values), *values)
@@ -198,6 +202,8 @@ class HttpContractTests(unittest.TestCase):
         status = self.expect_json(200, "GET", "/status")
         self.assertEqual(status["service"], "aowis-server-hydrology")
         self.assertEqual(status["max_concurrent_analyses"], 1)
+        self.assertEqual(status["max_outstanding_analyses"], 8)
+        self.assertEqual(status["terrain_jobs"]["outstanding"], 0)
         self.assertEqual(status["map_requests_per_analysis"], 1)
         self.assertEqual(self.expect_json(200, "GET", "/v1/jobs")["jobs"], [])
         self.assertEqual(self.expect_json(404, "GET", "/v1/jobs/not-a-job")["error"], "Unknown job")
@@ -208,6 +214,54 @@ class HttpContractTests(unittest.TestCase):
         oversized = self.expect_json(400, "POST", "/v1/jobs", b" " * 16385)
         self.assertEqual(oversized["error"], "Job request too large")
         self.assertEqual(self.expect_json(200, "GET", "/v1/jobs")["jobs"], [])
+
+    def test_bounded_admission_queued_cancel_and_restart(self):
+        # Hold the worker in a terrain request, so the next job is definitely
+        # queued. The third submission must not create any job directory.
+        self.stop_server()
+        # Append to the *server* group (before [terrain]), not after it.
+        content = self.config.read_text(encoding="utf-8")
+        content = content.replace("max_concurrent_analyses=1\n",
+                                  "max_concurrent_analyses=1\n"
+                                  "max_outstanding_analyses=2\n")
+        self.config.write_text(content, encoding="utf-8")
+        release = threading.Event()
+        self.map_server.terrain_release = release
+        try:
+            self.start_server()
+            request = {"west": 8.0, "south": 50.0, "east": 8.004,
+                       "north": 50.004, "resolution_m": 30.0,
+                       "fill_depressions": False}
+            first = self.expect_json(202, "POST", "/v1/jobs", request)["id"]
+            second = self.expect_json(202, "POST", "/v1/jobs", request)["id"]
+            self.assertEqual(self.expect_json(200, "GET", "/status")
+                             ["terrain_jobs"]["outstanding"], 2)
+            rejected = self.expect_json(429, "POST", "/v1/jobs", request)
+            self.assertIn("capacity", rejected["error"])
+            self.assertEqual(len(list((self.root / "analyses").iterdir())), 2)
+            self.assertEqual(self.expect_json(202, "DELETE", f"/v1/jobs/{second}")
+                             ["state"], "canceled")
+            self.assertEqual(self.expect_json(200, "GET", "/status")
+                             ["terrain_jobs"]["outstanding"], 1)
+            replacement = self.expect_json(202, "POST", "/v1/jobs", request)["id"]
+            self.assertEqual(self.expect_json(200, "GET", "/status")
+                             ["terrain_jobs"]["outstanding"], 2)
+            release.set()
+            self.await_completed(first)
+            self.await_completed(replacement)
+            self.assertEqual(self.expect_json(200, "GET", f"/v1/jobs/{second}")
+                             ["state"], "canceled")
+            self.assertEqual(self.expect_json(200, "GET", "/status")
+                             ["terrain_jobs"]["outstanding"], 0)
+            self.stop_server()
+            self.start_server()
+            self.assertEqual(self.expect_json(200, "GET", f"/v1/jobs/{second}")
+                             ["state"], "canceled")
+            self.assertEqual(self.expect_json(200, "GET", "/status")
+                             ["terrain_jobs"]["outstanding"], 0)
+        finally:
+            release.set()
+            del self.map_server.terrain_release
 
     def test_analysis_products_rainfall_and_restart(self):
         first = self.submit()

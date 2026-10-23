@@ -172,6 +172,7 @@ port=8123
 output_directory=
 max_cells=10000000
 max_concurrent_analyses=1
+max_outstanding_analyses=8
 
 [terrain]
 dataset=copernicus-glo30
@@ -185,7 +186,16 @@ max_concurrent_requests=4
 
 `max_cells` limits **one analysis**, not the total cell count in flight.
 `max_concurrent_analyses` accepts 1–4 (default 1) and controls whole-job
-parallelism. `max_concurrent_requests` accepts 1–4 (default 4) and controls
+parallelism. `max_outstanding_analyses` accepts 1–64 (default 8) and must
+be at least `max_concurrent_analyses`. It caps the **combined queued and
+running** terrain jobs; completed, failed and canceled jobs do not occupy
+admission slots. Submissions beyond the cap return HTTP `429` with a JSON
+error and do not create job directories. Canceled queued jobs free their slot
+immediately and never perform terrain fetches. The service uses its own
+cancelable queue rather than accumulating arbitrary pending thread-pool tasks.
+`GET /status` exposes `terrain_jobs` with queued, running, outstanding and
+limit counts; the same metrics are available through the C++ service.
+`max_concurrent_requests` accepts 1–4 (default 4) and controls
 **Map HTTP patches per active analysis**, not a global Map limit. Four workers
 with four requests per worker may have 16 Map requests outstanding. The
 borrowed in-process Map interface remains sequential. Increasing workers can
@@ -217,6 +227,17 @@ Job submission returns a UUID. Statuses include queued, terrain fetch,
 analysis, basin processing, saving, completion, cancellation and failure.
 Results persist across restarts; interrupted jobs are marked failed.
 `DELETE /v1/jobs/{id}` requests cancellation, **not removal** of saved files.
+A queued cancellation is persisted immediately and remains canceled on restart;
+a running job is requested to stop cooperatively. Finished job archives and
+scenarios are **retained indefinitely by default**, even after cancellation.
+For explicitly requested offline retention cleanup, stop the Hydrology server
+and use `tools/prune_hydrology_analyses.py --output-directory PATH` to preview
+terminal-job archives older than 30 days (adjust with `--older-than-days`).
+Only `--delete --confirm-server-stopped` actually removes eligible UUID job
+folders **including all derived scenarios and simulations**. Nonterminal jobs,
+unknown directories and malformed manifests are preserved. There is no automatic
+age-based deletion or public purge operation: result deletion must not race
+running analysis or reads from GUI clients.
 Optional locally constrained breaching uses explicit maximum cut depth, path
 length, excavation volume and candidate budgets; fill is the default.
 

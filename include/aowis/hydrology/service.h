@@ -12,6 +12,7 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QMutex>
+#include <QQueue>
 #include <QSharedPointer>
 #include <QString>
 #include <QThreadPool>
@@ -54,6 +55,10 @@ struct ServiceConfig
     // REST job can also issue source.max_concurrent_requests Map requests.
     // Keep the default at one for embedded integrations and large rasters.
     int max_concurrent_analyses = 1;
+    // Maximum accepted terrain analyses that are queued or running together.
+    // Independent from completed/failed/canceled results, which stay on disk.
+    // Must be >= max_concurrent_analyses (1..64).
+    int max_outstanding_analyses = 8;
     TerrainReader terrain_reader; // optional; defaults to Map HTTP/in-process adapter
 };
 
@@ -72,6 +77,9 @@ public:
     QString submit(const AnalysisRequest &request, QString *error);
     QJsonObject job(const QString &id) const;
     QJsonArray jobs() const;
+    // Admission and queue state for status reporting, including in-flight
+    // submissions that have reserved capacity but not yet published a job.
+    QJsonObject terrainJobCapacity() const;
     bool cancel(const QString &id);
     QByteArray rasterWindow(const QString &id, const QString &layer,
                             int x, int y, int width, int height, QString *error) const;
@@ -186,6 +194,7 @@ private:
     QJsonObject jobJson(const QSharedPointer<Job> &job) const;
     void restoreJobs();
     void runJob(const QSharedPointer<Job> &job);
+    void scheduleTerrainJobs();
     bool writeManifest(const QSharedPointer<Job> &job) const;
     QString jobDirectory(const QString &id) const;
 
@@ -200,6 +209,11 @@ private:
     QHash<QString, QSharedPointer<CoupledTask>> coupled_tasks;
     QThreadPool coupled_workers;
     QHash<QString, QSharedPointer<Job>> job_map;
+    QQueue<QSharedPointer<Job>> terrain_queue; // cancelable before worker dispatch
+    int terrain_worker_slots = 0; // active runnable slots, guarded by jobs_mutex
+    // Protected by jobs_mutex. Reserve a slot before touching the filesystem
+    // to make admission atomic even with concurrent library API callers.
+    int terrain_admission_reservations = 0;
     QThreadPool workers;
 };
 

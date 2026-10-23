@@ -25,6 +25,8 @@ output_directory=
 max_cells=10000000
 ; Independent analysis workers (1..4). Default 1 to limit memory use.
 max_concurrent_analyses=1
+; Maximum queued plus active terrain jobs (1..64, at least worker count).
+max_outstanding_analyses=8
 
 [terrain]
 dataset=copernicus-glo30
@@ -92,6 +94,14 @@ bool loadConfig(const QString &file_path, bool explicitly_requested,
         config->max_concurrent_analyses > 4)
     {
         *error = QStringLiteral("server/max_concurrent_analyses must be between 1 and 4");
+        return false;
+    }
+    config->max_outstanding_analyses = settings.value(
+        QStringLiteral("server/max_outstanding_analyses"), 8).toString().toInt(&valid);
+    if (!valid || config->max_outstanding_analyses < config->max_concurrent_analyses ||
+        config->max_outstanding_analyses > 64)
+    {
+        *error = QStringLiteral("server/max_outstanding_analyses must be between max_concurrent_analyses and 64");
         return false;
     }
     const QString output_path = settings.value(QStringLiteral("server/output_directory")).toString().trimmed();

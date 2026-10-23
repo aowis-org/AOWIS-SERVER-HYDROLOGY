@@ -44,6 +44,7 @@ class ServerConfigurationCliTests(unittest.TestCase):
         target = self.root / "custom" / "nested" / "server.ini"
         self.assertIn(str(target), self.run_cli("--write-default-config", target).stdout)
         self.assertIn("max_concurrent_analyses=1", target.read_text(encoding="utf-8"))
+        self.assertIn("max_outstanding_analyses=8", target.read_text(encoding="utf-8"))
         content = target.read_bytes()
         self.run_cli("--write-default-config", target, success=False)
         self.assertEqual(target.read_bytes(), content)
@@ -74,6 +75,25 @@ class ServerConfigurationCliTests(unittest.TestCase):
         self.assertFalse(any(line.lstrip().startswith("#") for line in example.splitlines()))
         target = self.root / "from-print-default.ini"
         target.write_text(example, encoding="utf-8")
+        self.run_cli("--config", target, "--check-config")
+
+    def test_terrain_job_capacity_config_validation(self):
+        target = self.root / "capacity.ini"
+        invalid = (
+            ("max_outstanding_analyses=0", "max_outstanding_analyses"),
+            ("max_outstanding_analyses=65", "max_outstanding_analyses"),
+            ("max_outstanding_analyses=abc", "max_outstanding_analyses"),
+            ("max_concurrent_analyses=3\nmax_outstanding_analyses=2",
+             "max_outstanding_analyses"),
+        )
+        for setting, expected_error in invalid:
+            with self.subTest(setting=setting):
+                target.write_text("[server]\n" + setting + "\n", encoding="utf-8")
+                self.assertIn(expected_error,
+                              self.run_cli("--config", target, "--check-config",
+                                           success=False).stderr)
+        target.write_text("[server]\nmax_concurrent_analyses=2\n"
+                          "max_outstanding_analyses=2\n", encoding="utf-8")
         self.run_cli("--config", target, "--check-config")
 
     def test_equals_form_is_compatible(self):

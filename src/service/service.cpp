@@ -512,6 +512,13 @@ bool AnalysisService::initialize(QString *error)
             *error = QStringLiteral("max_concurrent_analyses must be between 1 and 4");
         return false;
     }
+    if (this->config.max_outstanding_analyses < this->config.max_concurrent_analyses ||
+        this->config.max_outstanding_analyses > 64)
+    {
+        if (error != nullptr)
+            *error = QStringLiteral("max_outstanding_analyses must be between max_concurrent_analyses and 64");
+        return false;
+    }
     this->workers.setMaxThreadCount(this->config.max_concurrent_analyses);
     if (this->config.output_directory.isEmpty() ||
         !QDir().mkpath(this->config.output_directory))
@@ -685,10 +692,13 @@ void AnalysisService::runJob(const QSharedPointer<Job> &job)
         };
     try
     {
-        if (job->cancelled.load())
-            throw std::runtime_error("Job canceled");
         {
             QMutexLocker locker(&this->jobs_mutex);
+            // A queued cancellation is already terminal and persisted; do not
+            // run or overwrite it once its turn in QThreadPool arrives.
+            if (job->state == QStringLiteral("canceled")) return;
+            if (job->cancelled.load())
+                throw std::runtime_error("Job canceled");
             job->state = QStringLiteral("fetching-terrain");
         }
         writeManifest(job);
@@ -875,6 +885,27 @@ QString AnalysisService::submit(const AnalysisRequest &request, QString *error)
         if (error != nullptr) *error = QStringLiteral("Analysis exceeds configured cell limit or is too small");
         return {};
     }
+    // Admission covers not only jobs already published in job_map but also
+    // other submit() calls preparing manifests. It must be reserved before
+    // UUID/directory creation so rejected requests leave no disk artifacts.
+    {
+        QMutexLocker locker(&this->jobs_mutex);
+        int outstanding = this->terrain_admission_reservations;
+        for (const QSharedPointer<Job> &entry : std::as_const(this->job_map))
+        {
+            if (entry->state != QStringLiteral("completed") &&
+                entry->state != QStringLiteral("failed") &&
+                entry->state != QStringLiteral("canceled")) ++outstanding;
+        }
+        if (outstanding >= this->config.max_outstanding_analyses)
+        {
+            if (error != nullptr)
+                *error = QStringLiteral("Terrain analysis capacity reached (%1 active/queued jobs)")
+                             .arg(this->config.max_outstanding_analyses);
+            return {};
+        }
+        ++this->terrain_admission_reservations;
+    }
     const QString id = QUuid::createUuid().toString(QUuid::WithoutBraces);
     const QSharedPointer<Job> job = QSharedPointer<Job>::create();
     job->id = id;
@@ -896,30 +927,53 @@ QString AnalysisService::submit(const AnalysisRequest &request, QString *error)
     job->options.maximum_breach_candidates = request.maximum_breach_candidates;
     if (!QDir().mkpath(jobDirectory(id)))
     {
+        QMutexLocker locker(&this->jobs_mutex);
+        --this->terrain_admission_reservations;
         if (error != nullptr) *error = QStringLiteral("Cannot create job directory");
         return {};
     }
-    {
-        QMutexLocker locker(&this->jobs_mutex);
-        this->job_map.insert(id, job);
-    }
     if (!writeManifest(job))
     {
-        {
-            QMutexLocker locker(&this->jobs_mutex);
-            this->job_map.remove(id);
-        }
+        // The job was never visible to other callers or workers.
         QDir(jobDirectory(id)).removeRecursively();
+        QMutexLocker locker(&this->jobs_mutex);
+        --this->terrain_admission_reservations;
         if (error != nullptr) *error = QStringLiteral("Cannot persist job metadata");
         return {};
     }
-    // Queue time begins after the manifest is safely persisted. Pool size is
-    // configured once on initialize(), so pending jobs remain bounded by the
-    // accepted service requests rather than spawning arbitrary threads.
     job->queued_at = std::chrono::steady_clock::now();
-    // Unlike QtConcurrent::run, QThreadPool::start is a fire-and-forget API.
-    this->workers.start([this, job]() { runJob(job); });
+    {
+        QMutexLocker locker(&this->jobs_mutex);
+        this->job_map.insert(id, job);
+        this->terrain_queue.enqueue(job);
+        --this->terrain_admission_reservations;
+    }
+    // Unlike QThreadPool::start for every accepted request, an explicit queue
+    // bounds the number of pending closures and permits immediate removal of
+    // canceled jobs even when all worker threads are busy.
+    scheduleTerrainJobs();
     return id;
+}
+
+void AnalysisService::scheduleTerrainJobs()
+{
+    QMutexLocker locker(&this->jobs_mutex);
+    while (this->terrain_worker_slots < this->config.max_concurrent_analyses &&
+           !this->terrain_queue.isEmpty())
+    {
+        const QSharedPointer<Job> next = this->terrain_queue.dequeue();
+        if (next->cancelled.load()) continue;
+        ++this->terrain_worker_slots;
+        this->workers.start([this, next]()
+        {
+            runJob(next);
+            {
+                QMutexLocker locker(&this->jobs_mutex);
+                --this->terrain_worker_slots;
+            }
+            scheduleTerrainJobs();
+        });
+    }
 }
 
 QJsonObject AnalysisService::job(const QString &id) const
@@ -945,15 +999,49 @@ QJsonArray AnalysisService::jobs() const
     return response;
 }
 
+QJsonObject AnalysisService::terrainJobCapacity() const
+{
+    QMutexLocker locker(&this->jobs_mutex);
+    int queued = this->terrain_admission_reservations;
+    int running = 0;
+    for (const QSharedPointer<Job> &entry : std::as_const(this->job_map))
+    {
+        if (entry->state == QStringLiteral("queued")) ++queued;
+        else if (entry->state != QStringLiteral("completed") &&
+                 entry->state != QStringLiteral("failed") &&
+                 entry->state != QStringLiteral("canceled")) ++running;
+    }
+    return QJsonObject{
+        {QStringLiteral("queued"), queued},
+        {QStringLiteral("running"), running},
+        {QStringLiteral("outstanding"), queued + running},
+        {QStringLiteral("limit"), this->config.max_outstanding_analyses}
+    };
+}
+
 bool AnalysisService::cancel(const QString &id)
 {
     const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
     if (!item) return false;
-    QMutexLocker locker(&this->jobs_mutex);
-    if (item->state != QStringLiteral("completed") &&
-        item->state != QStringLiteral("failed") &&
-        item->state != QStringLiteral("canceled"))
-        item->cancelled.store(true);
+    bool persist = false;
+    {
+        QMutexLocker locker(&this->jobs_mutex);
+        if (item->state == QStringLiteral("queued"))
+        {
+            // Remove any unscheduled job from the service's bounded queue.
+            // If already dispatched, runJob() will skip the canceled job.
+            item->cancelled.store(true);
+            item->state = QStringLiteral("canceled");
+            item->error = QStringLiteral("Job canceled");
+            this->terrain_queue.removeAll(item);
+            persist = true;
+        }
+        else if (item->state != QStringLiteral("completed") &&
+                 item->state != QStringLiteral("failed") &&
+                 item->state != QStringLiteral("canceled"))
+            item->cancelled.store(true);
+    }
+    if (persist) writeManifest(item);
     return true;
 }
 

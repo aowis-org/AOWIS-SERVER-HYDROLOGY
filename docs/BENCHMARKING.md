@@ -82,6 +82,7 @@ Start the Map service at its configured address (commonly
 ```ini
 [server]
 max_concurrent_analyses=4
+max_outstanding_analyses=8
 
 [terrain]
 dataset=copernicus-glo30
@@ -190,7 +191,9 @@ hydrology_pid="$(pidof aowis-server-hydrology)"
 and `--warmup-rounds` is 0–2. The client checks per-job,
 per-wave and combined cell budgets **before** submitting jobs. Server-side
 `max_cells` is a separate per-job limit; it may reject a test despite
-permitted client budgets. Per-job queue wait excludes worker execution;
+permitted client budgets. The independent `max_outstanding_analyses` cap also
+rejects new work at capacity with HTTP 429; benchmark concurrency waves must
+fit this limit or report those rejections explicitly. Per-job queue wait excludes worker execution;
 submit/poll and processing delays are distinct. Wave time stops when the
 last job finishes, **before** post-wave RSS settling, saved-raster checks or
 optional Map parity checks. The reported throughput is **batch throughput**

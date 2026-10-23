@@ -183,6 +183,17 @@ if(AOWIS_HYDROLOGY_BUILD_SERVER)
 endif()
 
 if(BUILD_TESTING)
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME aowis-hydrology-prune-safety
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_prune_hydrology.py")
+        set_tests_properties(aowis-hydrology-prune-safety PROPERTIES
+            LABELS "hydrology;aowis")
+    endif()
+endif()
+
+if(BUILD_TESTING)
     add_executable(aowis-hydrology-core-test tests/test_analysis.cpp)
     target_link_libraries(aowis-hydrology-core-test PRIVATE AOWIS::Hydrology)
     add_test(NAME aowis-hydrology-core COMMAND aowis-hydrology-core-test)

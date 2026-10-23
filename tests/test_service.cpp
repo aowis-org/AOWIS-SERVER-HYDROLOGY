@@ -93,6 +93,7 @@ int main(int argc, char **argv)
         ServiceConfig parallel = configuration;
         parallel.output_directory = concurrent_directory.path();
         parallel.max_concurrent_analyses = 2;
+        parallel.max_outstanding_analyses = 3;
         const TerrainReader base_reader = configuration.terrain_reader;
         std::mutex gate_mutex;
         std::condition_variable gate_condition;
@@ -130,22 +131,43 @@ int main(int argc, char **argv)
         }
         const QString third = service.submit(smallRequest(), &error);
         assert(!third.isEmpty() && error.isEmpty());
+        const QJsonObject full_capacity = service.terrainJobCapacity();
+        assert(full_capacity.value(QStringLiteral("running")).toInt() == 2);
+        assert(full_capacity.value(QStringLiteral("queued")).toInt() == 1);
+        assert(full_capacity.value(QStringLiteral("outstanding")).toInt() == 3);
+        assert(service.submit(smallRequest(), &error).isEmpty());
+        assert(error.contains(QStringLiteral("capacity reached")));
         QThread::msleep(35);
         {
             std::lock_guard<std::mutex> lock(gate_mutex);
             assert(entered == 2); // bounded pool, no third terrain reader
         }
         assert(service.cancel(third));
+        waitForState(service, third, QStringLiteral("canceled"));
+        // A job canceled before dispatch never starts a worker, so it has no
+        // queue_wait timing (that field measures time until worker start).
+        const QJsonObject canceled_timings = service.job(third)
+            .value(QStringLiteral("stage_timings_ms")).toObject();
+        assert(!canceled_timings.contains(QStringLiteral("queue_wait")));
+        assert(service.terrainJobCapacity().value(QStringLiteral("outstanding")).toInt() == 2);
+
+        // Canceling a pending job immediately frees admission. Keep this
+        // replacement queued long enough to measure its actual wait time.
+        const QString fourth = service.submit(smallRequest(), &error);
+        assert(!fourth.isEmpty() && error.isEmpty());
+        assert(service.job(fourth).value(QStringLiteral("state")) == QStringLiteral("queued"));
+        QThread::msleep(35);
         {
             std::lock_guard<std::mutex> lock(gate_mutex);
+            assert(entered == 2);
             release = true;
         }
         gate_condition.notify_all();
         waitForState(service, first, QStringLiteral("completed"));
         waitForState(service, second, QStringLiteral("completed"));
-        waitForState(service, third, QStringLiteral("canceled"));
+        waitForState(service, fourth, QStringLiteral("completed"));
         assert(peak == 2);
-        const QJsonObject timings = service.job(third)
+        const QJsonObject timings = service.job(fourth)
             .value(QStringLiteral("stage_timings_ms")).toObject();
         assert(timings.value(QStringLiteral("queue_wait")).toDouble(-1) >= 15.0);
         const QByteArray a = service.rasterWindow(first, QStringLiteral("elevation"),
@@ -154,6 +176,9 @@ int main(int argc, char **argv)
         const QByteArray b = service.rasterWindow(second, QStringLiteral("elevation"),
                                                   0, 0, 3, 3, &error);
         assert(error.isEmpty() && a == b);
+        const QByteArray c = service.rasterWindow(fourth, QStringLiteral("elevation"),
+                                                  0, 0, 3, 3, &error);
+        assert(error.isEmpty() && a == c);
     }
     QString successful_id;
     QJsonObject saved_job_timings;
