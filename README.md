@@ -102,6 +102,14 @@ Initialize the GeographicLib submodule after cloning:
 git submodule update --init --recursive
 ```
 
+`./tools/zip_hydrology.sh` packages the current worktree **including all
+initialized Git submodules recursively** (such as `external/GeographicLib`),
+plus non-ignored uncommitted and untracked source files within them. Git metadata
+and ignored build products are excluded. Packaging fails with an initialization
+command if any tracked submodule is missing; a handoff ZIP must never silently
+omit required build dependencies. The resulting ZIP contains ordinary source
+files and can be reviewed or built without separately cloning submodules.
+
 The project reuses a `GeographicLib::GeographicLib` target supplied by a parent
 build when present. `tools/setup_geographiclib.sh` is available for initial
 submodule setup. No dependency is downloaded implicitly by CMake.
