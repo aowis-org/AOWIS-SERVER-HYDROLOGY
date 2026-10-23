@@ -63,6 +63,41 @@ raster and original-DEM basin hierarchy to calculate basin storage and outflow. 
 [RUNOFF_REDISTRIBUTION.md](RUNOFF_REDISTRIBUTION.md). The sum of the saved
 runoff cells is the generated runoff volume.
 
+## Asynchronous scenario creation
+
+For larger events, prefer the transport-independent asynchronous task API:
+
+```http
+POST /v1/jobs/{analysis-uuid}/rainfall-scenario-tasks
+GET /v1/jobs/{analysis-uuid}/rainfall-scenario-tasks/{task-uuid}
+DELETE /v1/jobs/{analysis-uuid}/rainfall-scenario-tasks/{task-uuid}
+```
+
+POST accepts the same rainfall JSON as synchronous scenario creation, and
+returns HTTP `202` with `task_id`, `job_id`, and `state` (`queued` or `running`).
+Poll GET until `state` is `completed`, `failed` or `canceled`;
+`cancel_requested` means cooperative cancellation is still in progress. A completed task
+contains the normal persisted scenario summary in `scenario`. A failed task
+contains `error`. DELETE requests cancellation; a finished task cannot be
+undone, and cancellation arriving after the scenario manifest has committed
+may return a completed task. Invalid JSON is rejected before admission.
+
+The service maintains a **bounded queue of eight queued/running tasks** and
+executes at most two scenario workers concurrently. Queued cancellation
+removes the task from that queue immediately. Running calculations support
+cooperative cancellation during DEM loading and polygon intersection.
+Results are immutable and survive restart, but task states are transient and
+may be pruned after 256 records (or on restart); retrieve saved results through
+the existing scenario list/detail endpoints. Exceeding the active queue returns
+HTTP `429` rather than creating unbounded thread-pool work. The limit of
+64 persisted/in-progress scenarios per terrain job is checked atomically
+across synchronous and asynchronous calls from different service threads.
+
+The original `POST /rainfall-scenarios` remains synchronous for existing clients.
+New applications should use task submission to avoid blocking the HTTP event
+loop while raster work executes. The async API is also available directly
+from `AOWIS::HydrologyService` for in-process Standalone integrations.
+
 ## Geometric coverage and accuracy
 
 Coverage is calculated by clipping each polygon ring to each intersected DEM
@@ -108,8 +143,9 @@ are not discoverable through the list/detail APIs. Saved results remain
 available after a service restart, subject to the parent analysis job
 remaining present. The current service bounds requests to 32 polygons,
 30,000 vertices overall, 500,000 raster cells in the selection's bounding
-box, and 64 scenario directories per terrain job. Complex clipped cells
-have an additional geometric edge budget.
+box, and 64 committed or in-progress scenarios per terrain job. Incomplete
+scenario directories without a published manifest do not consume quota.
+Complex clipped cells have an additional geometric edge budget.
 
 ## Future model integration
 

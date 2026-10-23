@@ -16,11 +16,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cstdio>
 #include <cmath>
 #include <cstdint>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <thread>
 #include <stdexcept>
 #include <limits>
 
@@ -1022,6 +1024,121 @@ int main(int argc, char **argv)
         waitForState(service, id, QStringLiteral("failed"));
         assert(service.job(id).value(QStringLiteral("error")).toString()
                .contains(QStringLiteral("DEM coverage incomplete")));
+    }
+
+    // Asynchronous rainfall workers are bounded, share the same persistent
+    // output format as synchronous callers, and do not race the 64-scenario
+    // cap when several standalone threads create scenarios simultaneously.
+    {
+        QTemporaryDir rainfall_dir;
+        assert(rainfall_dir.isValid());
+        ServiceConfig rainfall_config = configuration;
+        rainfall_config.output_directory = rainfall_dir.path();
+        rainfall_config.terrain_reader = [](const ElevationGrid &geometry, const QString &,
+                                            const std::atomic<bool> &)
+        {
+            ElevationGrid grid = geometry;
+            grid.elevations_m.assign(std::size_t(grid.columns) * grid.rows, 100.0f);
+            return grid;
+        };
+        AnalysisService service(rainfall_config);
+        QString error;
+        assert(service.initialize(&error));
+        const QString id = service.submit(smallRequest(), &error);
+        assert(!id.isEmpty());
+        waitForState(service, id, QStringLiteral("completed"));
+        const QJsonObject job = service.job(id);
+        const double west = job.value(QStringLiteral("west")).toDouble();
+        const double north = job.value(QStringLiteral("north")).toDouble();
+        const double step_x = job.value(QStringLiteral("step_lon_deg")).toDouble();
+        const double step_y = job.value(QStringLiteral("step_lat_deg")).toDouble();
+        const QJsonArray ring{
+            QJsonArray{west + step_x, north - 2 * step_y},
+            QJsonArray{west + 2 * step_x, north - 2 * step_y},
+            QJsonArray{west + 2 * step_x, north - step_y},
+            QJsonArray{west + step_x, north - step_y},
+            QJsonArray{west + step_x, north - 2 * step_y}
+        };
+        const QJsonObject input{
+            {QStringLiteral("geometry"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("Polygon")},
+                {QStringLiteral("coordinates"), QJsonArray{ring}}
+            }},
+            {QStringLiteral("depth_mm"), 30.0},
+            {QStringLiteral("duration_seconds"), 600.0},
+            {QStringLiteral("effective_runoff_fraction"), 0.75}
+        };
+        assert(service.startRainfallScenario(id, QJsonObject{}, &error).isEmpty());
+        assert(error.startsWith(QStringLiteral("Invalid")));
+        const QJsonObject accepted = service.startRainfallScenario(id, input, &error);
+        assert(error.isEmpty());
+        const QString task_id = accepted.value(QStringLiteral("task_id")).toString();
+        assert(!task_id.isEmpty());
+        assert(accepted.value(QStringLiteral("state")) == QStringLiteral("queued"));
+        QElapsedTimer timer;
+        timer.start();
+        QJsonObject final_task;
+        while (timer.elapsed() < 10000)
+        {
+            final_task = service.rainfallScenarioTask(id, task_id, &error);
+            assert(error.isEmpty());
+            if (final_task.value(QStringLiteral("state")) == QStringLiteral("completed")) break;
+            assert(final_task.value(QStringLiteral("state")) != QStringLiteral("failed"));
+            QThread::msleep(5);
+        }
+        assert(final_task.value(QStringLiteral("state")) == QStringLiteral("completed"));
+        const QString scenario_id = final_task.value(QStringLiteral("scenario")).toObject()
+            .value(QStringLiteral("id")).toString();
+        assert(!scenario_id.isEmpty());
+        assert(service.rainfallScenario(id, scenario_id, &error)
+            .value(QStringLiteral("id")) == scenario_id);
+        assert(service.cancelRainfallScenarioTask(id, task_id, &error));
+        assert(service.rainfallScenarioTask(id, task_id, &error)
+            .value(QStringLiteral("state")) == QStringLiteral("completed"));
+        assert(service.rainfallScenarioTask(QStringLiteral("other"), task_id, &error).isEmpty());
+        assert(error.contains(QStringLiteral("Unknown rainfall scenario task")));
+        // An interrupted creation can leave a UUID directory without its
+        // final manifest. It is not a committed scenario and must not consume
+        // a quota slot on top of reservations held by active writers.
+        const QString incomplete = QDir(rainfall_dir.path()).filePath(
+            id + QStringLiteral("/rainfall-scenarios/") +
+            QStringLiteral("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"));
+        assert(QDir().mkpath(incomplete));
+        assert(service.rainfallScenarios(id, &error).size() == 1 && error.isEmpty());
+        std::atomic<int> succeeded {0};
+        std::atomic<int> refused {0};
+        std::vector<std::thread> clients;
+        for (int client = 0; client < 12; ++client)
+            clients.emplace_back([&]()
+            {
+                for (int attempt = 0; attempt < 6; ++attempt)
+                {
+                    QString local_error;
+                    const QJsonObject scenario = service.createRainfallScenario(
+                        id, input, &local_error);
+                    if (!scenario.isEmpty())
+                    {
+                        assert(local_error.isEmpty());
+                        ++succeeded;
+                    }
+                    else
+                    {
+                        assert(local_error.startsWith(QStringLiteral("Too many")));
+                        ++refused;
+                    }
+                }
+            });
+        for (std::thread &client : clients) client.join();
+        if (succeeded.load() != 63 || refused.load() != 9)
+            fprintf(stderr, "Rainfall quota: succeeded=%d refused=%d (expected 63/9)\n",
+                    succeeded.load(), refused.load());
+        assert(succeeded == 63 && refused == 9);
+        assert(service.rainfallScenarios(id, &error).size() == 64);
+        assert(error.isEmpty());
+        // The persisted ceiling applies to synchronous and asynchronous
+        // callers alike, including after previously accepted workers finish.
+        assert(service.createRainfallScenario(id, input, &error).isEmpty());
+        assert(error.startsWith(QStringLiteral("Too many")));
     }
 
     // Inject a provider that can be canceled while the worker is executing.

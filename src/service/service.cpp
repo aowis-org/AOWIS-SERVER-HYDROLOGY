@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -51,6 +52,17 @@ struct AnalysisService::Job
     QJsonObject stage_timings_ms;
     QJsonObject terrain_fetch_details;
     std::chrono::steady_clock::time_point queued_at{};
+    std::atomic<bool> cancelled {false};
+};
+
+struct AnalysisService::RainfallTask
+{
+    QString id;
+    QString analysis_id;
+    QJsonObject request;
+    QString state = QStringLiteral("queued");
+    QString error;
+    QJsonObject result;
     std::atomic<bool> cancelled {false};
 };
 
@@ -465,6 +477,7 @@ AnalysisService::AnalysisService(const ServiceConfig &config)
     : config(config)
 {
     this->workers.setMaxThreadCount(1);
+    this->rainfall_workers.setMaxThreadCount(2);
     this->redistribution_workers.setMaxThreadCount(1);
     this->coupled_workers.setMaxThreadCount(1);
 }
@@ -485,6 +498,12 @@ AnalysisService::~AnalysisService()
         }
     }
     {
+        QMutexLocker locker(&this->rainfall_tasks_mutex);
+        for (const QSharedPointer<RainfallTask> &task : std::as_const(this->rainfall_tasks))
+            task->cancelled.store(true);
+        this->rainfall_queue.clear();
+    }
+    {
         QMutexLocker locker(&this->redistribution_tasks_mutex);
         for (const QSharedPointer<RedistributionTask> &task :
              std::as_const(this->redistribution_tasks))
@@ -498,6 +517,7 @@ AnalysisService::~AnalysisService()
         for (const QSharedPointer<CoupledTask> &task : std::as_const(this->coupled_tasks))
             task->cancelled.store(true);
     }
+    this->rainfall_workers.waitForDone();
     this->coupled_workers.waitForDone();
     this->redistribution_workers.waitForDone();
     this->workers.waitForDone();
@@ -1582,6 +1602,13 @@ QJsonObject loadRainfallManifest(const QString &folder, const QString &uuid)
 QJsonObject AnalysisService::createRainfallScenario(
     const QString &id, const QJsonObject &request, QString *error) const
 {
+    return createRainfallScenarioImpl(id, request, nullptr, error);
+}
+
+QJsonObject AnalysisService::createRainfallScenarioImpl(
+    const QString &id, const QJsonObject &request,
+    const std::atomic<bool> *cancel_requested, QString *error) const
+{
     if (error != nullptr) error->clear();
     const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
     if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
@@ -1609,11 +1636,46 @@ QJsonObject AnalysisService::createRainfallScenario(
             QStringLiteral("effective_runoff_fraction")).toDouble();
         const QString scenarios_folder = QDir(jobDirectory(id)).filePath(
             QStringLiteral("rainfall-scenarios"));
-        const QDir existing(scenarios_folder);
-        if (existing.exists() && existing.entryList(QDir::Dirs | QDir::NoDotAndDotDot).size() >= 64)
-            throw std::invalid_argument("Too many rainfall scenarios for one terrain job");
-        const ElevationGrid source = loadOriginalElevation(jobDirectory(id), item->grid);
-        const RainfallRunoff result = calculateRainfallRunoff(source, scenario);
+        // A scenario becomes committed only after scenario.json is published.
+        // Counting directories here is incorrect: an in-flight creation already
+        // owns a reservation and may have created its UUID directory. Count
+        // committed manifests separately, and atomically transfer a reservation
+        // into that count when the manifest is committed.
+        {
+            QMutexLocker locker(&this->rainfall_creation_mutex);
+            if (!this->rainfall_committed_scenario_counts.contains(id))
+            {
+                int committed = 0;
+                const QDir existing(scenarios_folder);
+                for (const QString &uuid : existing.entryList(
+                         QDir::Dirs | QDir::NoDotAndDotDot))
+                    if (QFileInfo::exists(existing.filePath(
+                            uuid + QStringLiteral("/scenario.json"))))
+                        ++committed;
+                this->rainfall_committed_scenario_counts.insert(id, committed);
+            }
+            if (this->rainfall_committed_scenario_counts.value(id) +
+                this->rainfall_creation_reservations.value(id) >= 64)
+                throw std::invalid_argument("Too many rainfall scenarios for one terrain job");
+            ++this->rainfall_creation_reservations[id];
+        }
+        bool reservation_active = true;
+        const auto release_reservation = [this, id, &reservation_active](
+                                             const AnalysisService *)
+        {
+            if (!reservation_active) return;
+            QMutexLocker locker(&this->rainfall_creation_mutex);
+            if (--this->rainfall_creation_reservations[id] == 0)
+                this->rainfall_creation_reservations.remove(id);
+        };
+        const std::unique_ptr<const AnalysisService, decltype(release_reservation)> reservation(
+            this, release_reservation);
+        const ElevationGrid source = loadOriginalElevation(
+            jobDirectory(id), item->grid, cancel_requested);
+        const RainfallRunoff result = calculateRainfallRunoff(source, scenario,
+            500000, cancel_requested);
+        if (cancel_requested != nullptr && cancel_requested->load())
+            throw std::runtime_error("Rainfall scenario canceled");
         if (result.contains_missing_dem_coverage)
             throw std::invalid_argument("Rainfall polygons intersect cells without elevation data");
         if (result.wet_cells == 0)
@@ -1628,6 +1690,8 @@ QJsonObject AnalysisService::createRainfallScenario(
                        result.runoff_volume_m3);
             writeArray(QDir(folder).filePath(QStringLiteral("coverage.f32")),
                        result.covered_fraction);
+            if (cancel_requested != nullptr && cancel_requested->load())
+                throw std::runtime_error("Rainfall scenario canceled");
             const QJsonObject summary{
                 {QStringLiteral("id"), uuid},
                 {QStringLiteral("job_id"), id},
@@ -1648,11 +1712,23 @@ QJsonObject AnalysisService::createRainfallScenario(
                 {QStringLiteral("runoff_raster_format"), QStringLiteral("f64le_m3_per_cell")},
                 {QStringLiteral("coverage_raster_format"), QStringLiteral("f32le_fraction")}
             };
+            if (cancel_requested != nullptr && cancel_requested->load())
+                throw std::runtime_error("Rainfall scenario canceled");
             QSaveFile file(QDir(folder).filePath(QStringLiteral("scenario.json")));
             const QByteArray json_bytes = QJsonDocument(summary).toJson(QJsonDocument::Compact);
             if (!file.open(QIODevice::WriteOnly) ||
                 file.write(json_bytes) != json_bytes.size() || !file.commit())
                 throw std::runtime_error("Cannot persist rainfall scenario manifest");
+            // Publication and quota accounting form a single logical commit:
+            // a concurrent submitter sees either the reservation or the
+            // committed result, never both (nor neither).
+            {
+                QMutexLocker locker(&this->rainfall_creation_mutex);
+                ++this->rainfall_committed_scenario_counts[id];
+                if (--this->rainfall_creation_reservations[id] == 0)
+                    this->rainfall_creation_reservations.remove(id);
+                reservation_active = false;
+            }
             return summary;
         }
         catch (...)
@@ -1666,6 +1742,201 @@ QJsonObject AnalysisService::createRainfallScenario(
         if (error != nullptr) *error = QString::fromUtf8(ex.what());
         return {};
     }
+}
+
+QJsonObject AnalysisService::rainfallTaskJson(const QSharedPointer<RainfallTask> &task) const
+{
+    // This method is called with rainfall_tasks_mutex held.
+    QJsonObject result{
+        {QStringLiteral("task_id"), task->id},
+        {QStringLiteral("job_id"), task->analysis_id},
+        {QStringLiteral("state"), task->state}
+    };
+    if (!task->error.isEmpty()) result.insert(QStringLiteral("error"), task->error);
+    if (task->state == QStringLiteral("completed"))
+        result.insert(QStringLiteral("scenario"), task->result);
+    return result;
+}
+
+QJsonObject AnalysisService::startRainfallScenario(
+    const QString &id, const QJsonObject &request, QString *error)
+{
+    if (error != nullptr) error->clear();
+    const QSharedPointer<Job> job_item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
+    if (!job_item || jobJson(job_item).value(QStringLiteral("state")) !=
+                     QStringLiteral("completed"))
+    {
+        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
+        return {};
+    }
+    // Reject structurally invalid input at submission time. All expensive
+    // raster work and geometric intersection stays on the worker thread.
+    try
+    {
+        for (const QString &field : {QStringLiteral("depth_mm"),
+                                     QStringLiteral("duration_seconds"),
+                                     QStringLiteral("effective_runoff_fraction")})
+            if (!request.value(field).isDouble() ||
+                !std::isfinite(request.value(field).toDouble()))
+                throw std::invalid_argument("Invalid rainfall scenario numeric field");
+        const QJsonValue name = request.value(QStringLiteral("name"));
+        if ((!name.isUndefined() && !name.isString()) ||
+            name.toString().size() > 128 || name.toString().contains(QChar('\n')) ||
+            name.toString().contains(QChar('\r')))
+            throw std::invalid_argument("Invalid rainfall scenario name");
+        const double depth = request.value(QStringLiteral("depth_mm")).toDouble();
+        const double duration = request.value(QStringLiteral("duration_seconds")).toDouble();
+        const double fraction = request.value(QStringLiteral("effective_runoff_fraction")).toDouble();
+        if (depth < 0.0 || depth > 100000.0 || duration <= 0.0 ||
+            duration > 31557600.0 || fraction < 0.0 || fraction > 1.0)
+            throw std::invalid_argument("Invalid rainfall scenario or DEM grid");
+        const auto polygons = parseGeoJsonPolygons(request);
+        if (polygons.empty() || polygons.size() > 32)
+            throw std::invalid_argument("Invalid rainfall scenario or DEM grid");
+    }
+    catch (const std::exception &ex)
+    {
+        if (error != nullptr) *error = QString::fromUtf8(ex.what());
+        return {};
+    }
+    QSharedPointer<RainfallTask> task = QSharedPointer<RainfallTask>::create();
+    task->id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    task->analysis_id = id;
+    task->request = request;
+    QJsonObject output;
+    {
+        QMutexLocker locker(&this->rainfall_tasks_mutex);
+        int outstanding = 0;
+        for (const QSharedPointer<RainfallTask> &entry : std::as_const(this->rainfall_tasks))
+            if (entry->state == QStringLiteral("queued") ||
+                entry->state == QStringLiteral("running") ||
+                entry->state == QStringLiteral("cancel_requested")) ++outstanding;
+        if (outstanding >= 8)
+        {
+            if (error != nullptr) *error = QStringLiteral("Rainfall scenario queue full (8 active/queued tasks)");
+            return {};
+        }
+        // Keep metadata finite, without invalidating active work. Old terminal
+        // tasks are transient; persisted scenario results are unaffected.
+        while (this->rainfall_task_order.size() >= 256)
+        {
+            bool pruned = false;
+            for (qsizetype index = 0; index < this->rainfall_task_order.size(); ++index)
+            {
+                const QString oldest = this->rainfall_task_order.at(index);
+                const QSharedPointer<RainfallTask> entry = this->rainfall_tasks.value(oldest);
+                if (entry && (entry->state == QStringLiteral("queued") ||
+                              entry->state == QStringLiteral("running") ||
+                              entry->state == QStringLiteral("cancel_requested"))) continue;
+                this->rainfall_task_order.removeAt(index);
+                this->rainfall_tasks.remove(oldest);
+                pruned = true;
+                break;
+            }
+            if (!pruned) break; // At most eight active tasks exist.
+        }
+        this->rainfall_tasks.insert(task->id, task);
+        this->rainfall_task_order.enqueue(task->id);
+        this->rainfall_queue.enqueue(task);
+        output = rainfallTaskJson(task);
+    }
+    scheduleRainfallTasks();
+    return output;
+}
+
+void AnalysisService::scheduleRainfallTasks()
+{
+    QMutexLocker locker(&this->rainfall_tasks_mutex);
+    while (this->rainfall_worker_slots < 2 && !this->rainfall_queue.isEmpty())
+    {
+        const QSharedPointer<RainfallTask> task = this->rainfall_queue.dequeue();
+        if (task->cancelled.load()) continue;
+        ++this->rainfall_worker_slots;
+        this->rainfall_workers.start([this, task]()
+        {
+            runRainfallTask(task);
+            {
+                QMutexLocker lock(&this->rainfall_tasks_mutex);
+                --this->rainfall_worker_slots;
+            }
+            scheduleRainfallTasks();
+        });
+    }
+}
+
+void AnalysisService::runRainfallTask(const QSharedPointer<RainfallTask> &task)
+{
+    {
+        QMutexLocker locker(&this->rainfall_tasks_mutex);
+        if (task->cancelled.load()) return;
+        task->state = QStringLiteral("running");
+    }
+    QString error;
+    const QJsonObject result = createRainfallScenarioImpl(
+        task->analysis_id, task->request, &task->cancelled, &error);
+    {
+        QMutexLocker locker(&this->rainfall_tasks_mutex);
+        if (!result.isEmpty())
+        {
+            // Commit wins the race with a late cancellation request.
+            task->state = QStringLiteral("completed");
+            task->result = result;
+        }
+        else if (task->cancelled.load())
+            task->state = QStringLiteral("canceled");
+        else
+        {
+            task->state = QStringLiteral("failed");
+            task->error = error.isEmpty() ? QStringLiteral("Rainfall scenario failed") : error;
+        }
+        task->request = {}; // no longer hold client geometry after completion
+    }
+}
+
+QJsonObject AnalysisService::rainfallScenarioTask(
+    const QString &id, const QString &task_id, QString *error) const
+{
+    if (error != nullptr) error->clear();
+    if (!safeJobId(id) || !safeJobId(task_id))
+    {
+        if (error != nullptr) *error = QStringLiteral("Unknown rainfall scenario task");
+        return {};
+    }
+    QMutexLocker locker(&this->rainfall_tasks_mutex);
+    const QSharedPointer<RainfallTask> task = this->rainfall_tasks.value(task_id);
+    if (!task || task->analysis_id != id)
+    {
+        if (error != nullptr) *error = QStringLiteral("Unknown rainfall scenario task");
+        return {};
+    }
+    return rainfallTaskJson(task);
+}
+
+bool AnalysisService::cancelRainfallScenarioTask(
+    const QString &id, const QString &task_id, QString *error)
+{
+    if (error != nullptr) error->clear();
+    QMutexLocker locker(&this->rainfall_tasks_mutex);
+    const QSharedPointer<RainfallTask> task = safeJobId(id) && safeJobId(task_id)
+        ? this->rainfall_tasks.value(task_id) : QSharedPointer<RainfallTask>();
+    if (!task || task->analysis_id != id)
+    {
+        if (error != nullptr) *error = QStringLiteral("Unknown rainfall scenario task");
+        return false;
+    }
+    if (task->state == QStringLiteral("queued"))
+    {
+        task->cancelled.store(true);
+        task->state = QStringLiteral("canceled");
+        task->request = {};
+        this->rainfall_queue.removeAll(task);
+    }
+    else if (task->state == QStringLiteral("running"))
+    {
+        task->cancelled.store(true);
+        task->state = QStringLiteral("cancel_requested");
+    }
+    return true;
 }
 
 QJsonArray AnalysisService::rainfallScenarios(const QString &id, QString *error) const

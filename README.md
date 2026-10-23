@@ -249,7 +249,8 @@ Useful GET/POST endpoints after job completion:
 | Basin list/detail and water-level storage | `GET /basins`, `/basins/{id}`, `/basins/{id}/storage?level_m=...`, `/basins/{id}/curve?samples=9` |
 | Catchment and drainage queries | `GET /catchment?x=...&y=...`, `/trace?x=...&y=...&distance_km=20`, `/network?min_upstream_area_km2=2`, `/watershed?x=...&y=...` |
 | Geographically selected channels | `POST /affected-network` |
-| Scenario creation and retrieval | `POST /rainfall-scenarios`, `GET /rainfall-scenarios`, `GET /rainfall-scenarios/{id}`, `GET /rainfall-scenarios/{id}/runoff?...` |
+| Scenario creation and retrieval | `POST /rainfall-scenarios` (legacy synchronous), `GET /rainfall-scenarios`, `GET /rainfall-scenarios/{id}`, `GET /rainfall-scenarios/{id}/runoff?...` |
+| Non-blocking scenario calculation | `POST /rainfall-scenario-tasks`, `GET /rainfall-scenario-tasks/{task-id}`, `DELETE /rainfall-scenario-tasks/{task-id}` |
 | Static redistribution | `POST /rainfall-scenarios/{id}/redistribution`, `GET .../redistribution/status`, `GET .../redistribution?offset=0&limit=50`, `DELETE .../redistribution` |
 | Static inundation | `POST /rainfall-scenarios/{id}/inundation`, `GET .../inundation/status`, `GET .../inundation/depth?...`, `DELETE .../inundation` |
 | Coupled simulation | `POST /coupled-simulations`, `GET /coupled-simulations/{id}`, `GET /coupled-simulations/{id}/snapshots?...`, `DELETE /coupled-simulations/{id}` |

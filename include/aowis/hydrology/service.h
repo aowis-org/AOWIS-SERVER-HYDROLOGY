@@ -117,6 +117,15 @@ public:
     // no D8 routing, infiltration timing, or basin filling occurs here.
     QJsonObject createRainfallScenario(const QString &id, const QJsonObject &request,
                                        QString *error) const;
+    // Non-blocking scenario creation. Unlike the legacy synchronous method,
+    // task submission never loads a DEM or calculates polygon coverage.
+    // A bounded cancelable queue is owned by the service (HTTP independent).
+    QJsonObject startRainfallScenario(const QString &id, const QJsonObject &request,
+                                     QString *error);
+    QJsonObject rainfallScenarioTask(const QString &id, const QString &task_id,
+                                    QString *error) const;
+    bool cancelRainfallScenarioTask(const QString &id, const QString &task_id,
+                                   QString *error);
     QJsonArray rainfallScenarios(const QString &id, QString *error) const;
     QJsonObject rainfallScenario(const QString &id, const QString &scenario_uuid,
                                  QString *error) const;
@@ -172,6 +181,7 @@ public:
 
 private:
     struct Job;
+    struct RainfallTask;
     struct RedistributionTask;
     struct InundationTask;
     struct CoupledTask
@@ -183,6 +193,12 @@ private:
         QJsonObject request;
         std::atomic<bool> cancelled {false};
     };
+    QJsonObject createRainfallScenarioImpl(const QString &id, const QJsonObject &request,
+                                           const std::atomic<bool> *cancel_requested,
+                                           QString *error) const;
+    void scheduleRainfallTasks();
+    void runRainfallTask(const QSharedPointer<RainfallTask> &task);
+    QJsonObject rainfallTaskJson(const QSharedPointer<RainfallTask> &task) const;
     void runCoupledTask(const QSharedPointer<CoupledTask> &task);
     void runInundationTask(const QSharedPointer<InundationTask> &task);
     void runRedistributionTask(const QSharedPointer<RedistributionTask> &task);
@@ -200,6 +216,18 @@ private:
 
     ServiceConfig config;
     mutable QMutex jobs_mutex;
+    // Reserve scenario slots before CPU work, including synchronous callers.
+    mutable QMutex rainfall_creation_mutex;
+    mutable QHash<QString, int> rainfall_creation_reservations;
+    // Counts of committed scenario manifests, initialized lazily from disk.
+    // Protected by rainfall_creation_mutex alongside in-flight reservations.
+    mutable QHash<QString, int> rainfall_committed_scenario_counts;
+    mutable QMutex rainfall_tasks_mutex;
+    QHash<QString, QSharedPointer<RainfallTask>> rainfall_tasks;
+    QQueue<QString> rainfall_task_order; // bounded terminal-status retention
+    QQueue<QSharedPointer<RainfallTask>> rainfall_queue;
+    int rainfall_worker_slots = 0;
+    QThreadPool rainfall_workers;
     mutable QMutex redistribution_cache_mutex;
     mutable QMutex redistribution_tasks_mutex;
     QHash<QString, QSharedPointer<RedistributionTask>> redistribution_tasks;

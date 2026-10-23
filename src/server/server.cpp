@@ -409,6 +409,50 @@ void Server::setupRoutes()
         return jsonResponse(result, Status::Created);
     });
 
+    // Optional asynchronous scenario creation. The legacy POST above keeps
+    // its response contract; the task API does not block the HTTP event loop.
+    this->http.route("/v1/jobs/<arg>/rainfall-scenario-tasks",
+                     QHttpServerRequest::Method::Post,
+                     [this](const QString &id, const QHttpServerRequest &request)
+    {
+        if (request.body().size() > 262144)
+            return errorResponse(QStringLiteral("Rainfall request exceeds 256 KiB"), Status::BadRequest);
+        QJsonParseError parse_error;
+        const QJsonDocument document = QJsonDocument::fromJson(request.body(), &parse_error);
+        if (parse_error.error != QJsonParseError::NoError || !document.isObject())
+            return errorResponse(QStringLiteral("Invalid rainfall scenario JSON"), Status::BadRequest);
+        QString error;
+        const QJsonObject result = this->service.startRainfallScenario(id, document.object(), &error);
+        if (!error.isEmpty())
+            return errorResponse(error,
+                error.startsWith(QStringLiteral("Rainfall scenario queue full"))
+                    ? static_cast<Status>(429) :
+                error.startsWith(QStringLiteral("Unknown"))
+                    ? Status::NotFound : Status::BadRequest);
+        return jsonResponse(result, Status::Accepted);
+    });
+
+    this->http.route("/v1/jobs/<arg>/rainfall-scenario-tasks/<arg>",
+                     QHttpServerRequest::Method::Get,
+                     [this](const QString &id, const QString &task_id)
+    {
+        QString error;
+        const QJsonObject result = this->service.rainfallScenarioTask(id, task_id, &error);
+        if (!error.isEmpty()) return errorResponse(error, Status::NotFound);
+        return jsonResponse(result);
+    });
+
+    this->http.route("/v1/jobs/<arg>/rainfall-scenario-tasks/<arg>",
+                     QHttpServerRequest::Method::Delete,
+                     [this](const QString &id, const QString &task_id)
+    {
+        QString error;
+        if (!this->service.cancelRainfallScenarioTask(id, task_id, &error))
+            return errorResponse(error, Status::NotFound);
+        return jsonResponse(this->service.rainfallScenarioTask(id, task_id, &error),
+                            Status::Accepted);
+    });
+
     this->http.route("/v1/jobs/<arg>/rainfall-scenarios", QHttpServerRequest::Method::Get,
                      [this](const QString &id)
     {

@@ -345,6 +345,29 @@ class HttpContractTests(unittest.TestCase):
         self.assertEqual(len(runoff), 32)
         self.assertTrue(all(value >= 0 for value in struct.unpack("<4d", runoff)))
 
+        # The opt-in task endpoint must return without running the raster
+        # calculation on the HTTP thread, and persist the same result type.
+        task_path = f"/v1/jobs/{first['id']}/rainfall-scenario-tasks"
+        self.expect_json(400, "POST", task_path, {"depth_mm": "bad"})
+        submitted = self.expect_json(202, "POST", task_path, rainfall)
+        task_id = submitted["task_id"]
+        detail_path = task_path + "/" + task_id
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            async_state = self.expect_json(200, "GET", detail_path)
+            if async_state["state"] in ("completed", "failed", "canceled"):
+                break
+            time.sleep(0.025)
+        self.assertEqual(async_state["state"], "completed", async_state)
+        async_scenario = async_state["scenario"]
+        self.assertGreater(async_scenario["effective_runoff_volume_m3"], 0)
+        async_id = async_scenario["id"]
+        self.assertNotEqual(async_id, scenario_id)
+        self.assertEqual(self.expect_json(200, "GET",
+            f"/v1/jobs/{first['id']}/rainfall-scenarios/{async_id}")["id"], async_id)
+        self.assertEqual(self.expect_json(202, "DELETE", detail_path)["state"], "completed")
+        self.expect_json(404, "GET", task_path + "/unknown")
+
         # The next process must discover both jobs and the immutable scenario.
         # This does not yet test interrupted writes (Stage 4).
         self.stop_server()

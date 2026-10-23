@@ -91,6 +91,11 @@ uses Map REST; optional GDAL GeoTIFF readers are for testing/development.
 - The analysis service owns UUID jobs, bounded requests, stage status,
   cancellation, manifests, raster and basin archives, scenario caches and
   checksum-based recovery/read validation.
+- Rainfall scenario creation also has an opt-in async task API with at most
+  two calculation workers and eight queued/running tasks; legacy synchronous
+  scenario creation remains supported. Scenario-count admission is atomic for
+  concurrent library callers. Task status is transient, persisted scenario
+  archives are not.
 - Terrain workers (`max_concurrent_analyses`, 1–4) are separate from admission
   (`max_outstanding_analyses`, 1–64, >= worker count). Admission counts queued
   plus running terrain jobs and in-progress submission reservations. The
