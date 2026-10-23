@@ -344,6 +344,60 @@ int main(int argc, char **argv)
         assert(error.contains(QStringLiteral("Invalid constrained breach")));
         const QByteArray mask = service.catchment(successful_id, columns - 1, rows - 1, &error);
         assert(error.isEmpty() && mask.size() == columns * rows);
+        // Async catchment must preserve exact bytes without holding a
+        // long-running HTTP handler, including concurrent task polls.
+        assert(service.startCatchment(successful_id, -1, 0, &error).isEmpty());
+        assert(error.startsWith(QStringLiteral("Invalid")));
+        const QJsonObject submitted_catchment = service.startCatchment(
+            successful_id, columns - 1, rows - 1, &error);
+        assert(error.isEmpty() && !submitted_catchment.isEmpty());
+        const QString catchment_task_id = submitted_catchment.value(
+            QStringLiteral("task_id")).toString();
+        assert(!catchment_task_id.isEmpty());
+        QElapsedTimer catchment_timer;
+        catchment_timer.start();
+        QJsonObject catchment_state;
+        while (catchment_timer.elapsed() < 10000)
+        {
+            catchment_state = service.catchmentTask(successful_id, catchment_task_id, &error);
+            assert(error.isEmpty() && !catchment_state.isEmpty());
+            if (catchment_state.value(QStringLiteral("state")) == QStringLiteral("completed"))
+                break;
+            assert(catchment_state.value(QStringLiteral("state")) != QStringLiteral("failed"));
+            QThread::msleep(10);
+        }
+        assert(catchment_state.value(QStringLiteral("state")) == QStringLiteral("completed"));
+        const QByteArray async_mask = service.catchmentTaskMask(
+            successful_id, catchment_task_id, &error);
+        assert(error.isEmpty() && async_mask == mask);
+        assert(service.cancelCatchmentTask(successful_id, catchment_task_id, &error));
+        assert(service.catchmentTask(successful_id, catchment_task_id, &error)
+            .value(QStringLiteral("state")) == QStringLiteral("completed"));
+        assert(service.catchmentTask(successful_id, QStringLiteral("bad-id"), &error).isEmpty());
+        assert(error.startsWith(QStringLiteral("Unknown")));
+        // The oldest terminal task is evicted with its spool result when more
+        // than four terminal tasks have been retained.
+        for (int i = 0; i < 4; ++i)
+        {
+            const QJsonObject next = service.startCatchment(
+                successful_id, columns - 1, rows - 1, &error);
+            assert(error.isEmpty() && !next.isEmpty());
+            const QString next_id = next.value(QStringLiteral("task_id")).toString();
+            QElapsedTimer timer;
+            timer.start();
+            while (timer.elapsed() < 10000)
+            {
+                const QJsonObject status = service.catchmentTask(successful_id, next_id, &error);
+                assert(error.isEmpty());
+                if (status.value(QStringLiteral("state")) == QStringLiteral("completed")) break;
+                assert(status.value(QStringLiteral("state")) != QStringLiteral("failed"));
+                QThread::msleep(10);
+            }
+            assert(service.catchmentTask(successful_id, next_id, &error)
+                .value(QStringLiteral("state")) == QStringLiteral("completed"));
+        }
+        assert(service.catchmentTask(successful_id, catchment_task_id, &error).isEmpty());
+        assert(error.startsWith(QStringLiteral("Unknown")));
         const QJsonObject watershed = service.watershedBoundary(
             successful_id, columns - 1, rows - 1, &error);
         assert(error.isEmpty());

@@ -91,6 +91,17 @@ uses Map REST; optional GDAL GeoTIFF readers are for testing/development.
 - The analysis service owns UUID jobs, bounded requests, stage status,
   cancellation, manifests, raster and basin archives, scenario caches and
   checksum-based recovery/read validation.
+- Catchment masks have a bounded asynchronous task API (`POST /v1/jobs/{id}/catchment-tasks`,
+  `GET/DELETE /v1/jobs/{id}/catchment-tasks/{task-id}`, and `GET .../{task-id}/mask`).
+  One full-grid calculation runs at a time; four may be queued/running; the four
+  newest terminal tasks remain readable while the service is running. Masks
+  are disk-spooled, not kept in the job map, and are deleted on server shutdown.
+  Canceled queued tasks release capacity immediately. Full-grid catchment
+  graph reconstruction is serialized across both APIs; a second synchronous
+  catchment request receives HTTP 429 rather than allocating another graph. The legacy synchronous
+  `GET /catchment` remains compatible for existing clients; asynchronous
+  requests are recommended for large grids. Catchment status and masks are not
+  persisted across restarts.
 - Rainfall scenario creation also has an opt-in async task API with at most
   two calculation workers and eight queued/running tasks; legacy synchronous
   scenario creation remains supported. Scenario-count admission is atomic for

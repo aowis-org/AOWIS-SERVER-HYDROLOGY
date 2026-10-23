@@ -40,7 +40,8 @@ The test exercises:
 - asynchronous job creation and completion, cell geometry and dataset identity;
 - byte-level little-endian raster MIME/layout and known elevation values;
 - deterministic flow-related raster products between independent analyses;
-- basin listing, drainage network, downstream tracing and catchment masks;
+- basin listing, drainage network, downstream tracing, synchronous and
+  asynchronous catchment masks (byte-identical outputs), transient task cleanup;
 - a persisted rainfall scenario and raw `float64` runoff window;
 - discovering and reading jobs, rasters and the scenario after process restart;
 - bounded terrain-job admission (429 without disk artifacts), queued-job
@@ -84,3 +85,17 @@ Do not attribute speedups to the HTTP framework when differences are caused by
 DEM cache warmth or numerical work. Scientific correctness is a prerequisite
 for performance comparisons, not a performance metric.
 
+
+## Transient catchment task contract
+
+The HTTP contract suite compares synchronous and asynchronous catchment masks
+byte-for-byte, checks invalid outlet requests, task polling, and verifies that
+transient catchment task metadata is not restored after restart. For very large
+catchments, prefer the async API so the HTTP request worker performs only
+submission/polling, rather than running full-grid graph reconstruction.
+
+One worker processes catchment tasks at a time to bound peak memory. The task
+queue admits four queued/running calculations and retains four completed or
+terminal results on disk. The original `GET /catchment` remains synchronous
+for existing integrations; replacing that route is not a prerequisite of
+HTTP-server migration.

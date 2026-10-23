@@ -13,9 +13,13 @@
 #include <QJsonObject>
 #include <QMutex>
 #include <QQueue>
+#include <QSemaphore>
 #include <QSharedPointer>
 #include <QString>
 #include <QThreadPool>
+#include <QTemporaryDir>
+
+#include <memory>
 
 #include <atomic>
 #include <cstdint>
@@ -84,6 +88,16 @@ public:
     QByteArray rasterWindow(const QString &id, const QString &layer,
                             int x, int y, int width, int height, QString *error) const;
     QByteArray catchment(const QString &id, int x, int y, QString *error) const;
+    // Heavy full-grid catchments can be requested without occupying an HTTP
+    // handler. Task state/masks are transient; masks are spooled to disk and
+    // the bounded task cache is discarded when this service stops.
+    QJsonObject startCatchment(const QString &id, int x, int y, QString *error);
+    QJsonObject catchmentTask(const QString &id, const QString &task_id,
+                              QString *error) const;
+    QByteArray catchmentTaskMask(const QString &id, const QString &task_id,
+                                 QString *error) const;
+    bool cancelCatchmentTask(const QString &id, const QString &task_id,
+                             QString *error);
 
     // Transport-independent spatial queries on a completed persistent graph.
     // Trace reads only cells along its path; network extraction is bounded by
@@ -182,6 +196,17 @@ public:
 private:
     struct Job;
     struct RainfallTask;
+    struct CatchmentTask
+    {
+        QString id;
+        QString analysis_id;
+        int x = 0;
+        int y = 0;
+        QString state = QStringLiteral("queued");
+        QString error;
+        QString mask_path;
+        std::atomic<bool> cancelled {false};
+    };
     struct RedistributionTask;
     struct InundationTask;
     struct CoupledTask
@@ -196,6 +221,13 @@ private:
     QJsonObject createRainfallScenarioImpl(const QString &id, const QJsonObject &request,
                                            const std::atomic<bool> *cancel_requested,
                                            QString *error) const;
+    QByteArray catchmentImpl(const QString &id, int x, int y,
+                             const std::atomic<bool> *cancel_requested,
+                             QString *error) const;
+    void scheduleCatchmentTasks();
+    void runCatchmentTask(const QSharedPointer<CatchmentTask> &task);
+    QJsonObject catchmentTaskJson(const QSharedPointer<CatchmentTask> &task) const;
+    void pruneCatchmentResultsLocked();
     void scheduleRainfallTasks();
     void runRainfallTask(const QSharedPointer<RainfallTask> &task);
     QJsonObject rainfallTaskJson(const QSharedPointer<RainfallTask> &task) const;
@@ -228,6 +260,17 @@ private:
     QQueue<QSharedPointer<RainfallTask>> rainfall_queue;
     int rainfall_worker_slots = 0;
     QThreadPool rainfall_workers;
+    // Shared by legacy synchronous calls and asynchronous worker tasks.
+    // Prevent multiplying multi-gigabyte graph allocations when HTTP becomes
+    // multithreaded. An ordinary sync caller is rejected rather than blocked.
+    mutable QSemaphore catchment_calculation_slot {1};
+    mutable QMutex catchment_tasks_mutex;
+    QHash<QString, QSharedPointer<CatchmentTask>> catchment_tasks;
+    QQueue<QString> catchment_task_order;
+    QQueue<QSharedPointer<CatchmentTask>> catchment_queue;
+    int catchment_worker_slots = 0;
+    QThreadPool catchment_workers;
+    std::unique_ptr<QTemporaryDir> catchment_spool;
     mutable QMutex redistribution_cache_mutex;
     mutable QMutex redistribution_tasks_mutex;
     QHash<QString, QSharedPointer<RedistributionTask>> redistribution_tasks;

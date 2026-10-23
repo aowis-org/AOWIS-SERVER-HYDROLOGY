@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
@@ -198,6 +199,25 @@ class HttpContractTests(unittest.TestCase):
         self.assertTrue(mime.startswith("application/vnd.aowis.raster-"), mime)
         return mime, data
 
+    def persisted_job_directories(self):
+        """Count analysis UUID directories, not transient service scratch space.
+
+        Hydrology can keep ephemeral task spools beside immutable analysis
+        directories. A rejected submission must not create a new analysis
+        directory, but scratch storage is not itself an admitted analysis.
+        """
+        jobs = set()
+        for path in (self.root / "analyses").iterdir():
+            if not path.is_dir():
+                continue
+            try:
+                canonical = str(uuid.UUID(path.name))
+            except ValueError:
+                continue
+            if path.name == canonical:
+                jobs.add(path.name)
+        return jobs
+
     def test_status_errors_and_request_size(self):
         status = self.expect_json(200, "GET", "/status")
         self.assertEqual(status["service"], "aowis-server-hydrology")
@@ -238,7 +258,10 @@ class HttpContractTests(unittest.TestCase):
                              ["terrain_jobs"]["outstanding"], 2)
             rejected = self.expect_json(429, "POST", "/v1/jobs", request)
             self.assertIn("capacity", rejected["error"])
-            self.assertEqual(len(list((self.root / "analyses").iterdir())), 2)
+            # A transient catchment spool may be present under analyses/.
+            # Require *exactly* the two accepted UUID job directories: the
+            # rejected submission must not leave a third job directory.
+            self.assertEqual(self.persisted_job_directories(), {first, second})
             self.assertEqual(self.expect_json(202, "DELETE", f"/v1/jobs/{second}")
                              ["state"], "canceled")
             self.assertEqual(self.expect_json(200, "GET", "/status")
@@ -315,6 +338,27 @@ class HttpContractTests(unittest.TestCase):
         self.assertEqual((status, mime), (200, "application/vnd.aowis.catchment-u8"))
         self.assertEqual(len(mask), columns * rows)
         self.assertEqual(mask[0], 1)
+        # Full-grid masks are also available via a bounded asynchronous path.
+        # Both adapters must return bit-for-bit identical binary output.
+        catchment_path = f"/v1/jobs/{first['id']}/catchment-tasks"
+        self.expect_json(400, "POST", catchment_path, {"x": "0", "y": 0})
+        self.expect_json(400, "POST", catchment_path, {"x": -1, "y": 0})
+        submitted_catchment = self.expect_json(202, "POST", catchment_path,
+                                               {"x": 0, "y": 0})
+        catchment_task_path = catchment_path + "/" + submitted_catchment["task_id"]
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            catchment_state = self.expect_json(200, "GET", catchment_task_path)
+            if catchment_state["state"] in ("completed", "failed", "canceled"):
+                break
+            time.sleep(0.025)
+        self.assertEqual(catchment_state["state"], "completed", catchment_state)
+        status, mime, async_mask = self.call("GET", catchment_task_path + "/mask")
+        self.assertEqual((status, mime), (200, "application/vnd.aowis.catchment-u8"))
+        self.assertEqual(async_mask, mask)
+        self.assertEqual(self.expect_json(202, "DELETE", catchment_task_path)["state"],
+                         "completed")
+        self.expect_json(404, "GET", catchment_path + "/unknown")
 
         # A second independently computed job must give identical binary
         # products: no UUIDs, timing data or floating JSON key order involved.
@@ -372,6 +416,9 @@ class HttpContractTests(unittest.TestCase):
         # This does not yet test interrupted writes (Stage 4).
         self.stop_server()
         self.start_server()
+        # Catchment tasks, unlike completed terrain analyses, are intentionally
+        # transient across service restarts (and their spool is removed).
+        self.expect_json(404, "GET", catchment_task_path)
         self.assertEqual(len(self.expect_json(200, "GET", "/v1/jobs")["jobs"]), 2)
         self.assertEqual(self.expect_json(200, "GET", scenario_path)["id"], scenario_id)
         for layer, expected in snapshots.items():

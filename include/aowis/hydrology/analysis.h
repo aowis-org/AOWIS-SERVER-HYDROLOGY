@@ -79,7 +79,8 @@ AnalysisResult analyze(const ElevationGrid &grid,
 // selected outlet), zero otherwise. This operates on the complete analysis
 // domain, not only the viewport or the user's visible polygon.
 std::vector<std::uint8_t> delineateCatchment(const AnalysisResult &result,
-                                             std::uint64_t outlet_index);
+                                             std::uint64_t outlet_index,
+                                             const std::atomic<bool> *cancel_requested = nullptr);
 
 // Centre-of-cell for an index in the grid, in the grid's native CRS.
 void cellCoordinate(const ElevationGrid &grid, std::uint64_t index,

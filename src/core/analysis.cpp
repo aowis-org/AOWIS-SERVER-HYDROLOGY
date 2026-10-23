@@ -505,19 +505,25 @@ AnalysisResult analyze(const ElevationGrid &grid, const AnalysisOptions &options
 }
 
 std::vector<std::uint8_t> delineateCatchment(const AnalysisResult &result,
-                                             std::uint64_t outlet_index)
+                                             std::uint64_t outlet_index,
+                                             const std::atomic<bool> *cancel_requested)
 {
     const std::size_t count = result.downstream.size();
     if (outlet_index >= count ||
         result.upstream_cell_count.size() != count ||
         result.upstream_cell_count[std::size_t(outlet_index)] == 0)
         throw std::invalid_argument("Catchment outlet lies outside the valid DEM");
+    if (cancel_requested && cancel_requested->load())
+        throw std::runtime_error("Catchment task canceled");
     std::vector<std::uint8_t> mask(count, 0);
     std::queue<std::uint64_t> frontier;
     mask[std::size_t(outlet_index)] = 1;
     frontier.push(outlet_index);
+    std::uint64_t processed = 0;
     while (!frontier.empty())
     {
+        if ((++processed & 8191u) == 0 && cancel_requested && cancel_requested->load())
+            throw std::runtime_error("Catchment task canceled");
         const std::uint64_t current = frontier.front();
         frontier.pop();
         for (int direction = 0; direction < 8; ++direction)

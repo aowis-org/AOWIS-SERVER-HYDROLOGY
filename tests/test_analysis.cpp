@@ -94,6 +94,21 @@ int main()
     assert(result.upstream_area_m2[12] > 0.0);
     assert(result.downstream[24] == -1);
     const std::vector<std::uint8_t> catchment = delineateCatchment(result, 24);
+    // Async callers may cancel catchment traversal without changing the
+    // numerical result of a successful synchronous call.
+    std::atomic<bool> catchment_cancelled {true};
+    bool catchment_cancellation_observed = false;
+    try
+    {
+        (void)delineateCatchment(result, 24, &catchment_cancelled);
+    }
+    catch (const std::runtime_error &)
+    {
+        catchment_cancellation_observed = true;
+    }
+    assert(catchment_cancellation_observed);
+    catchment_cancelled.store(false);
+    assert(delineateCatchment(result, 24, &catchment_cancelled) == catchment);
     assert(catchment[24] == 1);
     assert(result.upstream_cell_count[24] >= 1);
     std::uint64_t counted = 0;

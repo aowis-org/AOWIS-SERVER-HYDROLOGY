@@ -478,6 +478,7 @@ AnalysisService::AnalysisService(const ServiceConfig &config)
 {
     this->workers.setMaxThreadCount(1);
     this->rainfall_workers.setMaxThreadCount(2);
+    this->catchment_workers.setMaxThreadCount(1);
     this->redistribution_workers.setMaxThreadCount(1);
     this->coupled_workers.setMaxThreadCount(1);
 }
@@ -504,6 +505,12 @@ AnalysisService::~AnalysisService()
         this->rainfall_queue.clear();
     }
     {
+        QMutexLocker locker(&this->catchment_tasks_mutex);
+        for (const auto &task : std::as_const(this->catchment_tasks))
+            task->cancelled.store(true);
+        this->catchment_queue.clear();
+    }
+    {
         QMutexLocker locker(&this->redistribution_tasks_mutex);
         for (const QSharedPointer<RedistributionTask> &task :
              std::as_const(this->redistribution_tasks))
@@ -518,6 +525,7 @@ AnalysisService::~AnalysisService()
             task->cancelled.store(true);
     }
     this->rainfall_workers.waitForDone();
+    this->catchment_workers.waitForDone();
     this->coupled_workers.waitForDone();
     this->redistribution_workers.waitForDone();
     this->workers.waitForDone();
@@ -545,6 +553,15 @@ bool AnalysisService::initialize(QString *error)
     {
         if (error != nullptr)
             *error = QStringLiteral("Cannot create hydrology output directory");
+        return false;
+    }
+    // Keep transient catchment masks separate from persisted scientific
+    // results. QTemporaryDir removes them only after the workers have joined.
+    this->catchment_spool = std::make_unique<QTemporaryDir>(
+        QDir(this->config.output_directory).filePath(QStringLiteral(".catchment-tasks-XXXXXX")));
+    if (!this->catchment_spool->isValid())
+    {
+        if (error != nullptr) *error = QStringLiteral("Cannot create catchment task spool");
         return false;
     }
     restoreJobs();
@@ -1102,6 +1119,12 @@ QByteArray AnalysisService::rasterWindow(const QString &id, const QString &layer
 
 QByteArray AnalysisService::catchment(const QString &id, int x, int y, QString *error) const
 {
+    return catchmentImpl(id, x, y, nullptr, error);
+}
+
+QByteArray AnalysisService::catchmentImpl(const QString &id, int x, int y,
+    const std::atomic<bool> *cancel_requested, QString *error) const
+{
     if (error != nullptr) error->clear();
     const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
     if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
@@ -1114,6 +1137,31 @@ QByteArray AnalysisService::catchment(const QString &id, int x, int y, QString *
         if (error != nullptr) *error = QStringLiteral("Invalid catchment outlet cell");
         return {};
     }
+    // Every catchment materializes whole-grid graph arrays today. Protect
+    // the process against concurrent allocations, including calls through
+    // the legacy synchronous C++/HTTP API. Async workers may wait here; sync
+    // handlers return a busy error without occupying an HTTP worker.
+    if (cancel_requested)
+    {
+        while (!this->catchment_calculation_slot.tryAcquire(1, 50))
+        {
+            if (cancel_requested->load())
+            {
+                if (error) *error = QStringLiteral("Catchment task canceled");
+                return {};
+            }
+        }
+    }
+    else if (!this->catchment_calculation_slot.tryAcquire())
+    {
+        if (error) *error = QStringLiteral("Catchment calculation busy");
+        return {};
+    }
+    struct ReleaseSlot final
+    {
+        QSemaphore &slot;
+        ~ReleaseSlot() { slot.release(); }
+    } release {this->catchment_calculation_slot};
     try
     {
         const std::uint64_t cells = std::uint64_t(item->grid.columns) * item->grid.rows;
@@ -1123,6 +1171,8 @@ QByteArray AnalysisService::catchment(const QString &id, int x, int y, QString *
         if (!links.open(QIODevice::ReadOnly) || !counts.open(QIODevice::ReadOnly) ||
             links.size() != qint64(cells * 8) || counts.size() != qint64(cells * 8))
             throw std::runtime_error("Missing or incomplete flow graph");
+        if (cancel_requested && cancel_requested->load())
+            throw std::runtime_error("Catchment task canceled");
         const QByteArray links_bytes = links.readAll();
         const QByteArray counts_bytes = counts.readAll();
         if (links_bytes.size() != qsizetype(cells * 8) ||
@@ -1134,13 +1184,15 @@ QByteArray AnalysisService::catchment(const QString &id, int x, int y, QString *
         result.upstream_cell_count.resize(std::size_t(cells));
         for (std::uint64_t cell = 0; cell < cells; ++cell)
         {
+            if ((cell & 8191u) == 0 && cancel_requested && cancel_requested->load())
+                throw std::runtime_error("Catchment task canceled");
             result.downstream[std::size_t(cell)] = downstreamValue(
                 links_bytes.constData() + qsizetype(cell * 8));
             result.upstream_cell_count[std::size_t(cell)] = countValue(
                 counts_bytes.constData() + qsizetype(cell * 8));
         }
         const std::vector<std::uint8_t> mask = delineateCatchment(result,
-            std::uint64_t(y) * item->grid.columns + std::uint64_t(x));
+            std::uint64_t(y) * item->grid.columns + std::uint64_t(x), cancel_requested);
         return QByteArray(reinterpret_cast<const char *>(mask.data()), qsizetype(mask.size()));
     }
     catch (const std::exception &ex)

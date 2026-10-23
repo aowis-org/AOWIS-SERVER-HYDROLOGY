@@ -248,6 +248,7 @@ Useful GET/POST endpoints after job completion:
 | Original/conditioned elevation, flow, contributing area and fill diagnostics | `GET /raster/{layer}?x=0&y=0&width=256&height=256` |
 | Basin list/detail and water-level storage | `GET /basins`, `/basins/{id}`, `/basins/{id}/storage?level_m=...`, `/basins/{id}/curve?samples=9` |
 | Catchment and drainage queries | `GET /catchment?x=...&y=...`, `/trace?x=...&y=...&distance_km=20`, `/network?min_upstream_area_km2=2`, `/watershed?x=...&y=...` |
+| Non-blocking full-grid catchments | `POST /catchment-tasks` with `{"x": 0, "y": 0}`, `GET/DELETE /catchment-tasks/{task-id}`, `GET /catchment-tasks/{task-id}/mask` |
 | Geographically selected channels | `POST /affected-network` |
 | Scenario creation and retrieval | `POST /rainfall-scenarios` (legacy synchronous), `GET /rainfall-scenarios`, `GET /rainfall-scenarios/{id}`, `GET /rainfall-scenarios/{id}/runoff?...` |
 | Non-blocking scenario calculation | `POST /rainfall-scenario-tasks`, `GET /rainfall-scenario-tasks/{task-id}`, `DELETE /rainfall-scenario-tasks/{task-id}` |

@@ -354,7 +354,8 @@ void Server::setupRoutes()
         QString error;
         const QJsonObject result = this->service.watershedBoundary(id, x, y, &error);
         if (!error.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Invalid")) ||
+            return errorResponse(error, error.startsWith(QStringLiteral("Catchment calculation busy"))
+                ? static_cast<Status>(429) : error.startsWith(QStringLiteral("Invalid")) ||
                 error.startsWith(QStringLiteral("Too many"))
                 ? Status::BadRequest : Status::InternalServerError);
         return jsonResponse(result);
@@ -715,6 +716,74 @@ void Server::setupRoutes()
             QStringLiteral("cancel_requested")}}, Status::Accepted);
     });
 
+    // Prefer these asynchronous endpoints for large rasters. Work executes in
+    // a bounded service-owned pool; task masks are transient, disk-backed,
+    // and entirely independent of the current HTTP adapter.
+    this->http.route("/v1/jobs/<arg>/catchment-tasks",
+                     QHttpServerRequest::Method::Post,
+                     [this](const QString &id, const QHttpServerRequest &request)
+    {
+        if (request.body().size() > 1024)
+            return errorResponse(QStringLiteral("Catchment request too large"), Status::BadRequest);
+        QJsonParseError parse_error;
+        const QJsonDocument document = QJsonDocument::fromJson(request.body(), &parse_error);
+        if (parse_error.error != QJsonParseError::NoError || !document.isObject())
+            return errorResponse(QStringLiteral("Invalid catchment JSON"), Status::BadRequest);
+        const QJsonObject object = document.object();
+        if (!object.value(QStringLiteral("x")).isDouble() ||
+            !object.value(QStringLiteral("y")).isDouble() ||
+            object.value(QStringLiteral("x")).toDouble() !=
+                double(object.value(QStringLiteral("x")).toInt(-1)) ||
+            object.value(QStringLiteral("y")).toDouble() !=
+                double(object.value(QStringLiteral("y")).toInt(-1)))
+            return errorResponse(QStringLiteral("Invalid catchment outlet coordinates"), Status::BadRequest);
+        QString error;
+        const QJsonObject result = this->service.startCatchment(
+            id, object.value(QStringLiteral("x")).toInt(),
+            object.value(QStringLiteral("y")).toInt(), &error);
+        if (!error.isEmpty())
+            return errorResponse(error,
+                error.startsWith(QStringLiteral("Catchment task queue full"))
+                    ? static_cast<Status>(429) :
+                error.startsWith(QStringLiteral("Unknown")) ? Status::NotFound :
+                error.startsWith(QStringLiteral("Analysis not completed")) ? Status::Conflict :
+                Status::BadRequest);
+        return jsonResponse(result, Status::Accepted);
+    });
+
+    this->http.route("/v1/jobs/<arg>/catchment-tasks/<arg>",
+                     QHttpServerRequest::Method::Get,
+                     [this](const QString &id, const QString &task_id)
+    {
+        QString error;
+        const QJsonObject result = this->service.catchmentTask(id, task_id, &error);
+        if (!error.isEmpty()) return errorResponse(error, Status::NotFound);
+        return jsonResponse(result);
+    });
+
+    this->http.route("/v1/jobs/<arg>/catchment-tasks/<arg>/mask",
+                     QHttpServerRequest::Method::Get,
+                     [this](const QString &id, const QString &task_id)
+    {
+        QString error;
+        const QByteArray mask = this->service.catchmentTaskMask(id, task_id, &error);
+        if (!error.isEmpty())
+            return errorResponse(error, error.startsWith(QStringLiteral("Unknown"))
+                ? Status::NotFound : error.startsWith(QStringLiteral("Catchment result not ready"))
+                ? Status::Conflict : Status::InternalServerError);
+        return QHttpServerResponse(QByteArrayLiteral("application/vnd.aowis.catchment-u8"), mask);
+    });
+
+    this->http.route("/v1/jobs/<arg>/catchment-tasks/<arg>",
+                     QHttpServerRequest::Method::Delete,
+                     [this](const QString &id, const QString &task_id)
+    {
+        QString error;
+        if (!this->service.cancelCatchmentTask(id, task_id, &error))
+            return errorResponse(error, Status::NotFound);
+        return jsonResponse(this->service.catchmentTask(id, task_id, &error), Status::Accepted);
+    });
+
     this->http.route("/v1/jobs/<arg>/catchment", QHttpServerRequest::Method::Get,
                      [this](const QString &id, const QHttpServerRequest &request)
     {
@@ -731,7 +800,8 @@ void Server::setupRoutes()
         const QByteArray data = this->service.catchment(id, x, y, &error);
         if (!error.isEmpty())
             return errorResponse(error, error.startsWith(QStringLiteral("Invalid"))
-                ? Status::BadRequest : Status::InternalServerError);
+                ? Status::BadRequest : error.startsWith(QStringLiteral("Catchment calculation busy"))
+                ? static_cast<Status>(429) : Status::InternalServerError);
         return QHttpServerResponse(QByteArrayLiteral("application/vnd.aowis.catchment-u8"), data);
     });
 }
