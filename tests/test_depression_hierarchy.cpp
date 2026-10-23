@@ -67,6 +67,30 @@ int main()
     catch (const std::invalid_argument &) { rejected = true; }
     assert(rejected);
 
+    // Every elevation is distinct: the unique-height fast path must still
+    // discover the same connected basin and calculate its spill volume.
+    // Large groups of single-cell elevations must not need plateau maps.
+    const ElevationGrid unique_heights = gridOf(5, 5, {
+        40, 41, 42, 43, 44,
+        45, 14, 15, 16, 46,
+        47, 17, 10, 18, 48,
+        49, 19, 11, 13, 50,
+        51, 52, 53, 54, 55
+    });
+    const DepressionHierarchy unique_hierarchy = buildDepressionHierarchy(unique_heights);
+    assert(unique_hierarchy.basins.size() == 1);
+    const DepressionBasin &unique_basin = unique_hierarchy.basins.front();
+    assert(unique_basin.minimum_cell == 12);
+    assert(unique_basin.spill_elevation_m == 40);
+    assert(unique_basin.spills_to_domain_boundary);
+    assert(unique_basin.cells_below_spill == 9);
+    double unique_volume = 0.0;
+    for (std::uint32_t row = 1; row < 4; ++row)
+        for (std::uint32_t col = 1; col < 4; ++col)
+            unique_volume += (40.0 - unique_heights.elevations_m[std::size_t(row * 5 + col)]) *
+                rasterRowCellAreaM2(unique_heights.geometry, unique_heights.columns, row);
+    assert(approximately(unique_basin.capacity_at_spill_m3, unique_volume));
+
     // Two minima in a broad valley connect across a 12-metre saddle, then
     // spill through a 16-metre rim. Both leaves must have the merged basin
     // as parent. Each leaf has 2 metres of capacity when first joining.

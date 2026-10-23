@@ -189,6 +189,96 @@ DepressionHierarchy buildDepressionHierarchy(
     result.rows = source.rows;
     std::vector<std::uint32_t> activation_stamp(std::size_t(cell_count), 0);
     std::uint32_t stamp = 0;
+    // Reuse the small vectors across basins. A real-world DEM can have
+    // thousands of individual saddle elevations and local minima.
+    std::vector<std::uint64_t> roots;
+    std::vector<std::uint64_t> closed;
+    roots.reserve(16);
+    closed.reserve(8);
+    const auto processPlateau = [&](std::uint64_t plateau_key,
+                                    const std::vector<std::uint64_t> &pixels,
+                                    float height)
+    {
+        checkCancelled(cancel_requested);
+        std::uint64_t plateau = components.find(plateau_key);
+        roots.clear();
+        roots.push_back(plateau);
+        for (const std::uint64_t index : pixels)
+            for (int direction = 0; direction < 8; ++direction)
+            {
+                std::uint64_t other = 0;
+                if (adjacent(source, index, direction, &other) &&
+                    components.roots[std::size_t(other)] >= 0 &&
+                    activation_stamp[std::size_t(other)] != stamp)
+                    roots.push_back(components.find(other));
+            }
+        for (std::uint64_t &root : roots)
+            root = components.find(root);
+        std::sort(roots.begin(), roots.end());
+        roots.erase(std::unique(roots.begin(), roots.end()), roots.end());
+        const std::uint64_t saddle_cell = pixels.front();
+        bool open = false;
+        closed.clear();
+        for (const std::uint64_t root : roots)
+        {
+            if (components.open[std::size_t(root)] != 0)
+                open = true;
+            else if (components.basin[std::size_t(root)] >= 0)
+                closed.push_back(root);
+        }
+
+        std::int64_t next_basin = -1;
+        if (open)
+        {
+            for (const std::uint64_t root : closed)
+                finishBasin(result, components, root, double(height), saddle_cell, true, -1);
+        }
+        else if (closed.size() >= 2)
+        {
+            const std::uint64_t id = result.basins.size();
+            DepressionBasin parent;
+            parent.index = id;
+            parent.spill_cell = saddle_cell;
+            parent.formation_elevation_m = height;
+            parent.minimum_elevation_m = std::numeric_limits<double>::infinity();
+            for (const std::uint64_t root : closed)
+            {
+                const std::uint64_t child_id = std::uint64_t(components.basin[std::size_t(root)]);
+                const DepressionBasin &child = result.basins[std::size_t(child_id)];
+                if (child.minimum_elevation_m < parent.minimum_elevation_m)
+                {
+                    parent.minimum_elevation_m = child.minimum_elevation_m;
+                    parent.minimum_cell = child.minimum_cell;
+                }
+                parent.child_indices.push_back(child_id);
+            }
+            for (const std::uint64_t root : closed)
+                finishBasin(result, components, root, double(height), saddle_cell,
+                            false, std::int64_t(id));
+            result.basins.push_back(std::move(parent));
+            next_basin = std::int64_t(id);
+        }
+        else if (closed.size() == 1)
+            next_basin = components.basin[std::size_t(closed.front())];
+        else if (!open)
+        {
+            // Newly appearing isolated flat plateau: local minimum.
+            next_basin = std::int64_t(result.basins.size());
+            DepressionBasin leaf;
+            leaf.index = std::uint64_t(next_basin);
+            leaf.minimum_cell = pixels.front();
+            leaf.minimum_elevation_m = height;
+            leaf.formation_elevation_m = height;
+            leaf.spill_cell = pixels.front();
+            result.basins.push_back(std::move(leaf));
+        }
+        for (const std::uint64_t root : roots)
+            plateau = components.unite(plateau, root);
+        plateau = components.find(plateau);
+        components.basin[std::size_t(plateau)] = open ? -1 : next_basin;
+        components.open[std::size_t(plateau)] = open ? 1 : 0;
+    };
+    std::vector<std::uint64_t> singleton_plateau(1);
     std::size_t first = 0;
     while (first < sorted.size())
     {
@@ -212,6 +302,16 @@ DepressionHierarchy buildDepressionHierarchy(
             if (components.open[std::size_t(index)] != 0)
                 result.has_open_boundary = true;
             activation_stamp[std::size_t(index)] = stamp;
+        }
+        // A unique elevation is already a one-cell plateau. Avoid constructing
+        // a hash map and sorting plateau groups in this extremely common case;
+        // retain precisely the same saddle and component handling as above.
+        if (end == first + 1)
+        {
+            singleton_plateau.front() = sorted[first];
+            processPlateau(sorted[first], singleton_plateau, height);
+            first = end;
+            continue;
         }
         // Process equal-elevation plateaus together. This avoids inventing
         // an individual basin for every pixel in a flat depression floor.
@@ -239,88 +339,8 @@ DepressionHierarchy buildDepressionHierarchy(
         for (const std::pair<const std::uint64_t, std::vector<std::uint64_t>> &entry : plateaus)
             plateau_roots.push_back(entry.first);
         std::sort(plateau_roots.begin(), plateau_roots.end());
-
         for (const std::uint64_t plateau_key : plateau_roots)
-        {
-            checkCancelled(cancel_requested);
-            const std::vector<std::uint64_t> &pixels = plateaus.at(plateau_key);
-            std::uint64_t plateau = components.find(plateau_key);
-            std::vector<std::uint64_t> roots{plateau};
-            for (const std::uint64_t index : pixels)
-                for (int direction = 0; direction < 8; ++direction)
-                {
-                    std::uint64_t other = 0;
-                    if (adjacent(source, index, direction, &other) &&
-                        components.roots[std::size_t(other)] >= 0 &&
-                        activation_stamp[std::size_t(other)] != stamp)
-                        roots.push_back(components.find(other));
-                }
-            for (std::uint64_t &root : roots)
-                root = components.find(root);
-            std::sort(roots.begin(), roots.end());
-            roots.erase(std::unique(roots.begin(), roots.end()), roots.end());
-            const std::uint64_t saddle_cell = pixels.front();
-            bool open = false;
-            std::vector<std::uint64_t> closed;
-            for (const std::uint64_t root : roots)
-            {
-                if (components.open[std::size_t(root)] != 0)
-                    open = true;
-                else if (components.basin[std::size_t(root)] >= 0)
-                    closed.push_back(root);
-            }
-
-            std::int64_t next_basin = -1;
-            if (open)
-            {
-                for (const std::uint64_t root : closed)
-                    finishBasin(result, components, root, double(height), saddle_cell, true, -1);
-            }
-            else if (closed.size() >= 2)
-            {
-                const std::uint64_t id = result.basins.size();
-                DepressionBasin parent;
-                parent.index = id;
-                parent.spill_cell = saddle_cell;
-                parent.formation_elevation_m = height;
-                parent.minimum_elevation_m = std::numeric_limits<double>::infinity();
-                for (const std::uint64_t root : closed)
-                {
-                    const std::uint64_t child_id = std::uint64_t(components.basin[std::size_t(root)]);
-                    const DepressionBasin &child = result.basins[std::size_t(child_id)];
-                    if (child.minimum_elevation_m < parent.minimum_elevation_m)
-                    {
-                        parent.minimum_elevation_m = child.minimum_elevation_m;
-                        parent.minimum_cell = child.minimum_cell;
-                    }
-                    parent.child_indices.push_back(child_id);
-                }
-                for (const std::uint64_t root : closed)
-                    finishBasin(result, components, root, double(height), saddle_cell,
-                                false, std::int64_t(id));
-                result.basins.push_back(std::move(parent));
-                next_basin = std::int64_t(id);
-            }
-            else if (closed.size() == 1)
-                next_basin = components.basin[std::size_t(closed.front())];
-            else if (!open)
-            {
-                // Newly appearing isolated flat plateau: local minimum.
-                next_basin = std::int64_t(result.basins.size());
-                DepressionBasin leaf;
-                leaf.index = std::uint64_t(next_basin);
-                leaf.minimum_cell = pixels.front();
-                leaf.minimum_elevation_m = height;
-                leaf.formation_elevation_m = height;
-                leaf.spill_cell = pixels.front();
-                result.basins.push_back(std::move(leaf));
-            }
-            for (const std::uint64_t root : roots)
-                plateau = components.unite(plateau, root);
-            plateau = components.find(plateau);
-            components.basin[std::size_t(plateau)] = open ? -1 : next_basin;
-            components.open[std::size_t(plateau)] = open ? 1 : 0;
-        }
+            processPlateau(plateau_key, plateaus.at(plateau_key), height);
         first = end;
     }
     return result;

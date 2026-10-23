@@ -121,7 +121,8 @@ class ConcurrentJobTests(unittest.TestCase):
         options = (("--max-cells", "2"), ("--max-batch-cells", "2"),
                    ("--max-total-cells", "2"), ("--warmup-rounds", "3"),
                    ("--rounds", "6"), ("--existing-job", "other"),
-                   ("--rss-poll-seconds", "0.001"), ("--repeats", "2"))
+                   ("--rss-poll-seconds", "0.001"),
+                   ("--rss-settle-seconds", "11"), ("--repeats", "2"))
         for choice in options:
             with self.subTest(choice=choice):
                 args = minimal_args(*choice)
@@ -183,6 +184,45 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertEqual(summary["map"]["peak_increase_kib"], 0)
         with self.assertRaises(jobs.single.BenchmarkError):
             jobs.read_rss_kib(999999999)
+
+    def test_post_wave_rss_does_not_extend_completion_wall(self):
+        with Fixture() as url:
+            args = minimal_args("--hydrology-url", url, "--jobs", "1", "--rounds", "1",
+                                "--hydrology-pid", "1234", "--rss-settle-seconds", "0.2")
+            with mock.patch.object(jobs, "read_rss_kib", return_value=2048) as reader:
+                begin = time.perf_counter()
+                report = jobs.benchmark(args)
+                elapsed_ms = (time.perf_counter() - begin) * 1000
+        self.assertGreaterEqual(reader.call_count, 2)
+        wave = report["measured_waves"][0]
+        rss = wave["rss"]["hydrology"]
+        self.assertEqual(rss["settled_kib"], 2048)
+        self.assertEqual(rss["settled_change_kib"], 0)
+        self.assertGreaterEqual(elapsed_ms - wave["completion_wall_ms"], 180)
+        group = report["results"][0]["rss_kib"]["hydrology"]
+        self.assertEqual(group["settled_kib"]["median"], 2048)
+        self.assertEqual(group["settled_change_kib"]["median"], 0)
+
+    def test_rss_statistical_summary_rejects_mixed_sampling(self):
+        baseline = (4, 4, "dataset", 3, 2, "digest")
+        details = {"latency_ms": 100.0, "queue_wait_ms": 0.1,
+                   "terrain_peak_in_flight": 4,
+                   "stage_timings_ms": {key: 10.0 for key in jobs.STAGES}}
+        def wave(round_no, rss):
+            return {"jobs": 1, "round": round_no, "identity": baseline,
+                    "completion_wall_ms": 100.0,
+                    "completed_jobs_per_second": 10.0,
+                    "jobs_details": [details], "rss": rss}
+        values = {"initial_kib": 50, "peak_kib": 100,
+                  "peak_increase_kib": 50, "settled_kib": 60,
+                  "settled_change_kib": 10}
+        with self.assertRaisesRegex(jobs.single.BenchmarkError, "mixed RSS"):
+            jobs.summarize([wave(1, None), wave(2, {"hydrology": values})],
+                           [1], 2, 0, 16)
+        group = jobs.summarize([wave(1, {"hydrology": values}),
+                                wave(2, {"hydrology": values})],
+                               [1], 2, 0, 16)["results"][0]
+        self.assertEqual(group["rss_kib"]["hydrology"]["peak_kib"]["median"], 100)
 
     def test_completed_verify_mime_and_hash(self):
         args = minimal_args()

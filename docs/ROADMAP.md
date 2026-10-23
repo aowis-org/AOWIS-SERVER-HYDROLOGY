@@ -23,8 +23,17 @@ throughput: queuing, not Map request concurrency, was the primary observed
 cause. The independent terrain-analysis worker pool is now configurable 1..4
 (default 1 for stable memory use and borrowed in-process Map compatibility),
 with persisted queue-wait duration and a benchmark distribution to distinguish
-queue delay from actual worker time. Parallel inter-job speedup and memory
-safety on real deployment remain unmeasured until an opt-in higher-worker test. The source scripts are explicitly included in repository ZIPs rather than accidentally ignored by a broad `benchmark*` rule. **Remaining:** remeasure source acquisition and larger city/metro regions with repetitions and peak server RAM, profile the new dominant fetch/D8 costs, test concurrent jobs, compare independently configured GRASS/WhiteboxTools results, and design out-of-core processing only if justified. **Exit:** repeatable field-realistic benchmark reports, documented numerical accuracy, tested resource limits and representative service-deployment performance.
+queue delay from actual worker time. Live tests with two and four workers established real inter-job overlap:
+a four-job batch improved from 2.22 jobs/s with one worker to 4.00 jobs/s with
+two and 5.01 jobs/s with four on the 195,712-cell region (three-wave medians).
+A 948,600-cell region with four workers completed four analyses in 3.57 s
+(2.56× the one-job batch throughput) and sampled 450 MiB peak Hydrology RSS;
+a separate idle check 5 seconds later saw 94 MiB. The benchmark now records
+post-wave sampled RSS separately from timed execution, to distinguish transient
+worker cleanup from settled process memory. Hierarchy construction retains
+identical grouping for equal-height plateaus and avoids hash-map grouping for
+singleton height levels while reusing scratch vectors; live GLO-30 speedup
+remains to be independently established. The source scripts are explicitly included in repository ZIPs rather than accidentally ignored by a broad `benchmark*` rule. **Remaining:** remeasure hierarchy optimization on live GLO-30, compare per-job Map patch request limits under four simultaneous analyses, test repeated large/city/metro grids with RSS after cleanup, compare independently configured GRASS/WhiteboxTools results, and design out-of-core processing only if justified. **Exit:** repeatable field-realistic benchmark reports, documented numerical accuracy, tested resource limits and representative service-deployment performance.
 
 ## External integration checkpoints
 

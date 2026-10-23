@@ -118,6 +118,10 @@ change that setting. The separate `tools/benchmark_map_jobs.py` performs
 bounded **simultaneous analysis jobs** (1/2/4 jobs per wave), records
 per-job worker latency and batch throughput, verifies saved DEM windows after
 each measured wave, and can sample local Linux Map/Hydrology process RSS.
+With local PIDs, it also samples RSS again after an independently configurable
+post-wave delay (`--rss-settle-seconds`, default 2), without including that
+wait in batch execution time. Each report includes raw wave RSS and per-level
+memory distributions; a delayed reading is not proof of complete reclamation.
 It does not change the service scheduler or delete the persisted jobs it creates.
 
 `tools/benchmark_map_http.py` benchmarks a live Map → Hydrology terrain job,
@@ -129,7 +133,9 @@ for command examples and measurement limitations.
 
 The depression-hierarchy core reuses each row's unchanged GeographicLib
 cell-area calculation, instead of repeating it for every activated cell.
-This improves construction and repeated basin-storage queries without changing
+The elevation sweep also avoids plateau hash-map construction for singleton
+heights and reuses neighbor/root scratch vectors across plateau components.
+These optimizations preserve the shared basin-merging rules without changing
 raster geometry, basin identifiers, archived results or the public API.
 See [docs/DEPRESSION_HIERARCHY.md](docs/DEPRESSION_HIERARCHY.md) for
 accuracy assumptions and [docs/BENCHMARKING.md](docs/BENCHMARKING.md) for

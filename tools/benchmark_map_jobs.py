@@ -49,6 +49,16 @@ def _positive_pid(value):
     return single.positive_int(value)
 
 
+def nonnegative_float(value):
+    try:
+        number = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("expected a nonnegative number") from error
+    if not math.isfinite(number) or number < 0:
+        raise argparse.ArgumentTypeError("expected a nonnegative finite number")
+    return number
+
+
 def build_parser():
     parser = single.build_parser()
     parser.description = __doc__
@@ -69,6 +79,8 @@ def build_parser():
                         help="optional local Linux Hydrology PID for /proc VmRSS samples")
     parser.add_argument("--rss-poll-seconds", type=single.positive_float, default=0.025,
                         help="optional /proc sampling interval during waves (0.01..1 s)")
+    parser.add_argument("--rss-settle-seconds", type=nonnegative_float, default=2.0,
+                        help="post-wave delay before reading RSS again, with PIDs only (0..10 s; default 2)")
     return parser
 
 
@@ -84,6 +96,8 @@ def validate_args(args):
         raise single.BenchmarkError("invalid window, patch size, polling interval, basin limit or repeats")
     if not 0.01 <= args.rss_poll_seconds <= 1:
         raise single.BenchmarkError("--rss-poll-seconds must be 0.01..1")
+    if not 0 <= args.rss_settle_seconds <= 10:
+        raise single.BenchmarkError("--rss-settle-seconds must be 0..10")
     columns, rows = single.estimated_grid((args.west, args.south, args.east, args.north), args.resolution_m)
     cells = columns * rows
     if cells > args.max_cells:
@@ -267,17 +281,32 @@ def run_wave(args, level, round_number, warmup=False):
                     jobs.append(future.result())
                 except (single.BenchmarkError, KeyError, TypeError, ValueError) as error:
                     errors.append(error)
-    wave_end = time.perf_counter()
+            # Stop the timed interval at completion, BEFORE worker cleanup,
+            # RSS settling or persisted raster verification.
+            wave_end = time.perf_counter()
     if errors:
         raise single.BenchmarkError(f"{level}-job wave {round_number}: {errors[0]}; other submitted jobs may persist")
     jobs.sort(key=lambda job: job["slot"])
     if len({job["job_id"] for job in jobs}) != level:
         raise single.BenchmarkError("Hydrology reused a job ID during simultaneous submissions")
+    rss = sampler.summary()
+    if rss is not None:
+        # A completed job can still own DEM/D8/hierarchy arrays briefly.
+        # Observe a separate post-wave point, WITHOUT adding the delay to
+        # throughput or letting raster verification alter the measurement.
+        if args.rss_settle_seconds > 0:
+            time.sleep(args.rss_settle_seconds)
+        for name, pid in pids.items():
+            if name not in rss:
+                raise single.BenchmarkError(f"missing wave RSS samples for {name}")
+            settled = read_rss_kib(pid)
+            rss[name]["settled_kib"] = settled
+            rss[name]["settled_change_kib"] = settled - rss[name]["initial_kib"]
     reference = verify_wave(args, jobs)
     return {"jobs": level, "round": round_number, "warmup": warmup,
             "completion_wall_ms": (wave_end - wave_start) * 1000,
             "completed_jobs_per_second": level / (wave_end - wave_start),
-            "rss": sampler.summary(), "jobs_details": [{k: v for k, v in job.items()
+            "rss": rss, "jobs_details": [{k: v for k, v in job.items()
                 if k not in ("submitted_at", "completed_at")} for job in jobs],
             "identity": reference}
 
@@ -302,7 +331,19 @@ def summarize(waves, levels, rounds, warmup_rounds, expected_cells):
         if any(value is None for value in queue_waits) and not all(
                 value is None for value in queue_waits):
             raise single.BenchmarkError("mixed queue-wait diagnostics across jobs")
-        group = {"jobs": level, "waves": rounds,
+        rss_samples = [wave.get("rss") for wave in batch]
+        if all(sample is None for sample in rss_samples):
+            rss_stats = None
+        elif any(sample is None for sample in rss_samples):
+            raise single.BenchmarkError("mixed RSS sampling across measured waves")
+        else:
+            process_names = set(rss_samples[0])
+            if any(set(sample) != process_names for sample in rss_samples):
+                raise single.BenchmarkError("inconsistent RSS processes across measured waves")
+            rss_stats = {name: {field: distribution([sample[name][field] for sample in rss_samples])
+                for field in ("peak_kib", "peak_increase_kib", "settled_kib", "settled_change_kib")}
+                for name in sorted(process_names)}
+        group = {"jobs": level, "waves": rounds, "rss_kib": rss_stats,
                  "queue_wait_ms": (distribution(queue_waits)
                                    if all(value is not None for value in queue_waits) else None),
                  "wall_ms": distribution([wave["completion_wall_ms"] for wave in batch]),
@@ -332,6 +373,8 @@ def summarize(waves, levels, rounds, warmup_rounds, expected_cells):
                 "Measured throughput is per batch, not sustainable throughput or server admission capacity.",
                 "Each job may simultaneously issue up to four Map HTTP patch requests; the jobs limit bounds concurrent clients, not global Map requests.",
                 "Linux RSS samples are optional and measure the supplied processes' resident memory, not peak aggregate system memory.",
+                "settled_kib is read after --rss-settle-seconds of post-wave delay, before raster verification; it is not evidence of complete reclamation or absence of leaks.",
+                "Post-wave memory delay and verification are excluded from all completion wall times and throughput.",
                 "Map parity is checked only after each wave; Map calls are not part of the completion wall time.",
                 "Round order is rotated; changing caches, CPU load, memory and disk I/O can affect every measurement.",
                 "Queue wait is measured by Hydrology before worker execution and does not count toward total_worker.",

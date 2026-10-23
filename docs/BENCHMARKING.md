@@ -468,8 +468,9 @@ always improves performance: it adds CPU competition, increases live DEM
 memory and can multiply Map requests.
 
 The benchmark stops each wave's wall timer when the **last** analysis reports
-`completed`, then reads a stored elevation raster window for every job. Those
-checks, and an optional independent Map DEM-parity check when `--map-url` is
+`completed`, then optionally observes delayed RSS, and then reads a stored
+elevation raster window for every job. Those checks, and an optional
+independent Map DEM-parity check when `--map-url` is
 supplied, are deliberately excluded from the completion wall time; they
 also cannot affect other jobs within that wave. All jobs must agree on
 dimensions, dataset, basin count, conditioned cells and the sampled elevation
@@ -506,7 +507,26 @@ IDs from your local Map and Hydrology services; e.g. append:
 
 Only when PIDs are supplied, the tool periodically reads `/proc/<pid>/status`
 `VmRSS` during each wave, reporting `initial_kib`, `peak_kib`, `last_kib`,
-`peak_increase_kib`, and sample counts for each process. PID accessibility is
+`peak_increase_kib`, and sample counts for each process. It also waits
+`--rss-settle-seconds` (default **2.0**, valid **0..10**) **after** the timed
+wave and takes a separate process reading: `settled_kib` and
+`settled_change_kib` (relative to initial). Set the delay to 5 seconds for
+comparisons with manual settled-RSS checks; zero means immediate post-wave
+sampling. RSS data is provided for every wave and as per-process distributions
+under `results[].rss_kib`; these are absent (`null`) without PIDs. The delay
+and subsequent DEM-result verification are both excluded from
+`completion_wall_ms` and throughput. For example, after a live run with PIDs:
+
+```bash
+jq '[.results[] | {jobs, hydrology_peak_kib: .rss_kib.hydrology.peak_kib.median,
+  hydrology_after_delay_kib: .rss_kib.hydrology.settled_kib.median,
+  map_peak_kib: .rss_kib.map.peak_kib.median}]' benchmark-map-jobs.json
+```
+
+Settled means **delayed sampled RSS**,
+not proof that workers are all destroyed, all malloc arenas were reclaimed,
+or no other process work occurred; the result is not a leak detector.
+PID accessibility is
 validated before any job is submitted; benchmark failure can still leave jobs
 running. These samples are **not** peak total system RAM, include neither
 unreported child processes nor Map's cache allocations that happened before
@@ -521,7 +541,7 @@ python3 tests/test_benchmark_map_jobs.py -v
 ```
 
 The opt-in `AOWIS_HYDROLOGY_BUILD_BENCHMARKS=ON` CTest suite registers the
-same offline test. Ordinary Debug/Release builds and the 18-test service
+same offline test. Ordinary Debug/Release builds and the 19-test service
 suite remain unchanged; the tool does **not** need new C++ instrumentation.
 
 ## Verification and reference comparisons

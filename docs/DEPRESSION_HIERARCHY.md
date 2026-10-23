@@ -24,6 +24,16 @@ The hydrology core includes `depression_hierarchy.h` with a **raster-centre bath
   Different rows retain distinct areas; this is checked on EPSG:4326 and
   WGS84 UTM test grids. Neither the basin topology nor the archive format
   changes, and no existing job must be regenerated.
+- **Singleton-height fast path:** An elevation group containing one cell
+  bypasses the temporary hash map and plateau-root sort. All cells still go
+  through the same component connectivity, saddle detection, merge, and basin
+  finalization routine. For multi-cell equal-elevation groups, the existing
+  plateau grouping and stable root ordering are retained. Reusable neighbor
+  and closed-component vectors reduce repeated allocations. This changes no
+  basin serial format, float arithmetic, boundary treatment, or API.
+  Synthetic mixed/near-unique elevations produced identical basin records
+  when compared with the preceding implementation; speedup on live GLO-30
+  is to be measured independently rather than inferred from synthetic tests.
 
 `basinStorageAtLevel(source, hierarchy, index, water_level_m, max_visited_cells, cancel)` estimates the connected area and stored volume at a queried water level. Its accepted interval is **from the basin's formation elevation through its spill elevation**. At exactly the spill level, it returns the stable pre-spill statistics produced by the elevation sweep (saddle-height cells add no capacity). Levels above spill are rejected; the caller must later apply the Fill–Spill–Merge distribution algorithm rather than ignoring the spill.
 
