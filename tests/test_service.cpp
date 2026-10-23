@@ -9,6 +9,7 @@
 #include <QElapsedTimer>
 #include <QDir>
 #include <QFile>
+#include <QJsonDocument>
 #include <QTemporaryDir>
 #include <QThread>
 #include <QUuid>
@@ -582,6 +583,121 @@ int main(int argc, char **argv)
         const QJsonObject persisted_network = restored.channelNetwork(
             successful_id, 0.001, &error);
         assert(error.isEmpty() && !persisted_network.isEmpty());
+    }
+    // A completed manifest is a publication promise: every required artifact
+    // must survive a restart with exactly the expected shape and identity.
+    // Exercise deletion, truncation, same-length silent corruption, damaged
+    // hierarchy checksums, interrupted publication, and legacy metadata.
+    {
+        QTemporaryDir integrity_directory;
+        assert(integrity_directory.isValid());
+        ServiceConfig isolated = configuration;
+        isolated.output_directory = integrity_directory.path();
+        QString id;
+        {
+            AnalysisService service(isolated);
+            QString error;
+            assert(service.initialize(&error));
+            id = service.submit(smallRequest(), &error);
+            assert(!id.isEmpty() && error.isEmpty());
+            waitForState(service, id, QStringLiteral("completed"));
+            assert(service.job(id).value(QStringLiteral("artifact_integrity"))
+                       .toObject().size() == 8);
+        }
+        const QDir folder(QDir(isolated.output_directory).filePath(id));
+        const auto readBytes = [&](const QString &name)
+        {
+            QFile file(folder.filePath(name));
+            assert(file.open(QIODevice::ReadOnly));
+            return file.readAll();
+        };
+        const auto replaceBytes = [&](const QString &name, const QByteArray &bytes)
+        {
+            QFile file(folder.filePath(name));
+            assert(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            assert(file.write(bytes) == bytes.size());
+            file.close();
+        };
+        const QByteArray original_manifest = readBytes(QStringLiteral("job.json"));
+        const QJsonObject original_job = QJsonDocument::fromJson(original_manifest).object();
+        const auto checkStateAfterRestart = [&](const QString &expected,
+                                                const QString &error_fragment)
+        {
+            AnalysisService service(isolated);
+            QString error;
+            assert(service.initialize(&error));
+            const QJsonObject status = service.job(id);
+            assert(status.value(QStringLiteral("state")) == expected);
+            if (!error_fragment.isEmpty())
+            {
+                assert(status.value(QStringLiteral("error")).toString().contains(error_fragment));
+                assert(service.rasterWindow(id, QStringLiteral("elevation"),
+                    0, 0, 1, 1, &error).isEmpty());
+            }
+        };
+        // Exactly one missing file must invalidate a previously complete job.
+        const QString missing_name = QStringLiteral("conditioned.f32");
+        const QByteArray original_conditioned = readBytes(missing_name);
+        assert(QFile::remove(folder.filePath(missing_name)));
+        checkStateAfterRestart(QStringLiteral("failed"), QStringLiteral("artifact"));
+        replaceBytes(missing_name, original_conditioned);
+        replaceBytes(QStringLiteral("job.json"), original_manifest);
+        checkStateAfterRestart(QStringLiteral("completed"), {});
+
+        // Correct name but truncated raster is still invalid.
+        const QString truncated_name = QStringLiteral("downstream.i64");
+        const QByteArray original_links = readBytes(truncated_name);
+        replaceBytes(truncated_name, original_links.left(original_links.size() - 8));
+        checkStateAfterRestart(QStringLiteral("failed"), QStringLiteral("length"));
+        replaceBytes(truncated_name, original_links);
+        replaceBytes(QStringLiteral("job.json"), original_manifest);
+
+        // A same-size corruption cannot evade the new content identities.
+        const QString corrupt_name = QStringLiteral("elevation.f32");
+        const QByteArray original_elevation = readBytes(corrupt_name);
+        QByteArray corrupted_elevation = original_elevation;
+        corrupted_elevation[0] = char(corrupted_elevation.at(0) ^ 0x10);
+        replaceBytes(corrupt_name, corrupted_elevation);
+        checkStateAfterRestart(QStringLiteral("failed"), QStringLiteral("checksum"));
+        replaceBytes(corrupt_name, original_elevation);
+        replaceBytes(QStringLiteral("job.json"), original_manifest);
+
+        const QString basin_name = QStringLiteral("basins.aowbin");
+        const QByteArray original_basins = readBytes(basin_name);
+        QByteArray corrupted_basins = original_basins;
+        corrupted_basins[8] = char(corrupted_basins.at(8) ^ 0x01);
+        replaceBytes(basin_name, corrupted_basins);
+        checkStateAfterRestart(QStringLiteral("failed"), QStringLiteral("basin"));
+        replaceBytes(basin_name, original_basins);
+        replaceBytes(QStringLiteral("job.json"), original_manifest);
+
+        QJsonObject broken_inventory = original_job;
+        QJsonObject entries = original_job.value(QStringLiteral("artifact_integrity")).toObject();
+        entries.remove(QStringLiteral("basins.aowbin"));
+        broken_inventory.insert(QStringLiteral("artifact_integrity"), entries);
+        replaceBytes(QStringLiteral("job.json"), QJsonDocument(broken_inventory).toJson());
+        checkStateAfterRestart(QStringLiteral("failed"), QStringLiteral("inventory"));
+        replaceBytes(QStringLiteral("job.json"), original_manifest);
+
+        // Inventories are optional only for old completed analyses. Their
+        // primary raster sizes and basin checksum are nevertheless checked.
+        QJsonObject legacy = original_job;
+        legacy.remove(QStringLiteral("artifact_integrity"));
+        const QByteArray legacy_manifest = QJsonDocument(legacy).toJson();
+        replaceBytes(QStringLiteral("job.json"), legacy_manifest);
+        checkStateAfterRestart(QStringLiteral("completed"), {});
+        replaceBytes(truncated_name, original_links.left(original_links.size() - 8));
+        checkStateAfterRestart(QStringLiteral("failed"), QStringLiteral("length"));
+        replaceBytes(truncated_name, original_links);
+        replaceBytes(QStringLiteral("job.json"), original_manifest);
+
+        // Interrupted status is terminal on restart even with intact files.
+        QJsonObject interrupted = original_job;
+        interrupted.insert(QStringLiteral("state"), QStringLiteral("saving"));
+        replaceBytes(QStringLiteral("job.json"), QJsonDocument(interrupted).toJson());
+        checkStateAfterRestart(QStringLiteral("failed"), QStringLiteral("interrupted"));
+        replaceBytes(QStringLiteral("job.json"), original_manifest);
+        checkStateAfterRestart(QStringLiteral("completed"), {});
     }
     // One closed, static basin persists across restarts. UUID identities are
     // stable, and level/volume samples use source elevations, not D8 heights.

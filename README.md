@@ -326,3 +326,12 @@ The repository's `tools/apply_patch.sh` accepts only
 fresh extraction timestamps. This is a developer workflow, not an aspect of
 the Hydrology data model. The project archive excludes Git internals,
 ignored build products and its submodule source tree.
+
+### Durable primary analysis results
+
+Primary terrain rasters and basin hierarchy archives are committed as immutable
+files before a job becomes `completed`. Completed jobs include an artifact
+integrity inventory (SHA-256 and exact byte sizes), verified upon server
+restart. Missing or corrupt primary results are reported as failed rather than
+served as completed analyses. Older archives without these hashes remain
+readable after structural and length checks. See `docs/VERIFICATION.md`.

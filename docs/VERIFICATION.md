@@ -111,3 +111,38 @@ request bodies. `aowis-hydrology-server-config-cli` validates worker and
 request-queue bounds without opening network sockets. Measure HTTP throughput
 against identical workloads; a change of transport alone is not evidence of
 a measured speedup.
+
+## Persisted terrain analysis integrity
+
+A completed terrain analysis contains seven row-major primary rasters and one
+versioned depression hierarchy archive. The immutable raster files must each
+have exactly `columns × rows × bytes_per_cell` bytes. The archive header must
+match the job grid, its declared basin count must match its exact byte length,
+and its built-in checksum must be valid. Derived rainfall, redistribution,
+inundation and coupled-simulation outputs have their own lifecycles and are not
+required for the terrain analysis itself to be complete.
+
+New terrain jobs record an `artifact_integrity` inventory in `job.json`, with
+SHA-256 and byte length for all eight source artifacts. Hashes are calculated
+while writing the primary rasters and archive. The server commits each file
+through `QSaveFile` and publishes a `completed` manifest only after all files
+have been committed and their structure verified. It does not expose the
+completed state to readers until that final manifest has been committed.
+
+At startup, every completed job is checked **before** it is made available as
+completed. Files with missing, truncated or mismatching content cause the job
+to be marked `failed` with a specific diagnostic and a recommendation to rerun
+analysis. This status is persisted; files are not silently deleted or
+recomputed. For jobs created before the integrity inventory was introduced,
+file lengths, archive header and built-in archive checksum are still validated,
+but equal-length modifications to an old raster cannot be detected without a
+recorded digest. A present but malformed or partial inventory never silently
+falls back to the legacy validation rules.
+
+SHA-256 verification reads the stored artifact contents once per service start.
+Large completed repositories can therefore take longer to recover, proportionally
+to their stored data size. The hierarchy structure is validated with a streaming
+checksum at startup to avoid decoding all basin records into memory; its full
+semantic record validation remains performed by the archive decoder when the
+hierarchy is read. Tests cover missing files, truncation, equal-length damage,
+archive corruption, interrupted publication and legacy inventories.

@@ -243,7 +243,8 @@ private:
     void restoreJobs();
     void runJob(const QSharedPointer<Job> &job);
     void scheduleTerrainJobs();
-    bool writeManifest(const QSharedPointer<Job> &job) const;
+    bool writeManifest(const QSharedPointer<Job> &job,
+                       const QString &state_override = {}) const;
     QString jobDirectory(const QString &id) const;
 
     ServiceConfig config;

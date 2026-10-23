@@ -18,6 +18,7 @@
 #include <QtEndian>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -26,6 +27,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 namespace Aowis::Hydrology
@@ -51,6 +53,7 @@ struct AnalysisService::Job
     std::uint64_t basin_count = 0;
     QJsonObject stage_timings_ms;
     QJsonObject terrain_fetch_details;
+    QJsonObject artifact_integrity;
     std::chrono::steady_clock::time_point queued_at{};
     std::atomic<bool> cancelled {false};
 };
@@ -100,7 +103,7 @@ bool safeJobId(const QString &id)
 // IEEE754 and integer arrays are written to stable little-endian files.
 // Outputs are immutable for the lifetime of a completed job.
 template <typename T>
-void writeArray(const QString &path, const std::vector<T> &values)
+QString writeArray(const QString &path, const std::vector<T> &values)
 {
     QSaveFile file(path);
     if (!file.open(QIODevice::WriteOnly))
@@ -108,6 +111,7 @@ void writeArray(const QString &path, const std::vector<T> &values)
             .arg(path).toStdString());
     QByteArray buffer(32768, '\0');
     qsizetype used = 0;
+    QCryptographicHash hash(QCryptographicHash::Sha256);
     for (const T &value : values)
     {
         static_assert(sizeof(T) == 4 || sizeof(T) == 8);
@@ -115,6 +119,7 @@ void writeArray(const QString &path, const std::vector<T> &values)
         {
             if (file.write(buffer.constData(), used) != used)
                 throw std::runtime_error("Cannot write analysis result");
+            hash.addData(buffer.constData(), used);
             used = 0;
         }
         if constexpr (sizeof(T) == 4)
@@ -131,10 +136,15 @@ void writeArray(const QString &path, const std::vector<T> &values)
         }
         used += sizeof(T);
     }
-    if (used > 0 && file.write(buffer.constData(), used) != used)
-        throw std::runtime_error("Cannot write analysis result");
+    if (used > 0)
+    {
+        if (file.write(buffer.constData(), used) != used)
+            throw std::runtime_error("Cannot write analysis result");
+        hash.addData(buffer.constData(), used);
+    }
     if (!file.commit())
         throw std::runtime_error("Cannot commit analysis result");
+    return QString::fromLatin1(hash.result().toHex());
 }
 
 struct Layer
@@ -161,6 +171,166 @@ Layer layerSpec(const QString &layer)
     if (layer == QStringLiteral("downstream"))
         return {QStringLiteral("downstream.i64"), 8, QByteArrayLiteral("application/vnd.aowis.raster-i64le")};
     return {};
+}
+
+// The seven primary rasters are fixed-size row-major arrays; only basin
+// hierarchy is variable length. No rainfall/simulation derived cache is a
+// prerequisite for a terrain job to be complete.
+struct PrimaryArtifact
+{
+    const char *name;
+    int bytes_per_cell;
+};
+constexpr std::array<PrimaryArtifact, 8> PrimaryArtifacts{{
+    {"elevation.f32", 4}, {"conditioned.f32", 4},
+    {"potential-fill-depth.f32", 4}, {"breach-cut-depth.f32", 4},
+    {"upstream-area.f64", 8}, {"upstream-count.u64", 8},
+    {"downstream.i64", 8}, {"basins.aowbin", 0}
+}};
+
+QJsonObject artifactRecord(std::uint64_t bytes, const QString &sha256)
+{
+    return QJsonObject{{QStringLiteral("size_bytes"), double(bytes)},
+                       {QStringLiteral("sha256"), sha256}};
+}
+
+// Streaming archive verification avoids decoding potentially hundreds of MB
+// of basin records during startup. The existing decoder additionally validates
+// semantic basin relationships whenever a basin result is accessed.
+bool verifyBasinArchive(QFile &file, std::uint32_t columns, std::uint32_t rows,
+                        QString *reason)
+{
+    const QByteArray header = file.read(33);
+    const std::uint64_t cells = std::uint64_t(columns) * rows;
+    if (header.size() != 33 || std::memcmp(header.constData(), "AOWHDH01", 8) != 0 ||
+        qFromLittleEndian<quint32>(header.constData() + 8) != columns ||
+        qFromLittleEndian<quint32>(header.constData() + 12) != rows ||
+        qFromLittleEndian<quint64>(header.constData() + 16) > cells ||
+        (header.at(24) != 0 && header.at(24) != 1))
+    {
+        *reason = QStringLiteral("Invalid basin archive header");
+        return false;
+    }
+    const quint64 basin_count = qFromLittleEndian<quint64>(header.constData() + 25);
+    if (basin_count > 2 * cells ||
+        file.size() != qint64(41 + 81 * basin_count))
+    {
+        *reason = QStringLiteral("Invalid basin archive length");
+        return false;
+    }
+    constexpr quint64 fnv_prime = 1099511628211ULL;
+    quint64 hash = 14695981039346656037ULL;
+    for (unsigned char byte : header)
+    {
+        hash ^= byte;
+        hash *= fnv_prime;
+    }
+    qint64 remaining = file.size() - 33 - 8;
+    while (remaining > 0)
+    {
+        const QByteArray chunk = file.read(std::min<qint64>(remaining, 1024 * 1024));
+        if (chunk.isEmpty())
+        {
+            *reason = QStringLiteral("Truncated basin archive");
+            return false;
+        }
+        for (unsigned char byte : chunk)
+        {
+            hash ^= byte;
+            hash *= fnv_prime;
+        }
+        remaining -= chunk.size();
+    }
+    const QByteArray trailer = file.read(8);
+    if (trailer.size() != 8 || qFromLittleEndian<quint64>(trailer.constData()) != hash)
+    {
+        *reason = QStringLiteral("Basin archive checksum mismatch");
+        return false;
+    }
+    return true;
+}
+
+bool verifyPrimaryArtifacts(const QString &folder, std::uint32_t columns,
+                            std::uint32_t rows, const QJsonObject &identities,
+                            QString *reason)
+{
+    const std::uint64_t cells = std::uint64_t(columns) * rows;
+    // Validate manifest geometry before doing multiplication, I/O or hashing.
+    if (columns < 2 || rows < 2 || columns > 100000 || rows > 100000 ||
+        cells > 100000000ULL)
+    {
+        *reason = QStringLiteral("Invalid completed grid dimensions");
+        return false;
+    }
+    // An absent inventory means a pre-upgrade job. An inventory, if present,
+    // must contain all files: partial or malformed inventories are corruption.
+    if (!identities.isEmpty() && identities.size() != int(PrimaryArtifacts.size()))
+    {
+        *reason = QStringLiteral("Incomplete artifact integrity inventory");
+        return false;
+    }
+    for (const PrimaryArtifact &spec : PrimaryArtifacts)
+    {
+        const QString name = QString::fromLatin1(spec.name);
+        const QFileInfo info(QDir(folder).filePath(name));
+        if (info.isSymLink() || !info.isFile())
+        {
+            *reason = QStringLiteral("Missing or invalid artifact: %1").arg(name);
+            return false;
+        }
+        const qint64 expected = spec.bytes_per_cell == 0
+            ? -1 : qint64(cells * std::uint64_t(spec.bytes_per_cell));
+        if (expected >= 0 && info.size() != expected)
+        {
+            *reason = QStringLiteral("Incorrect artifact length: %1").arg(name);
+            return false;
+        }
+        QFile file(info.filePath());
+        if (!file.open(QIODevice::ReadOnly))
+        {
+            *reason = QStringLiteral("Unreadable artifact: %1").arg(name);
+            return false;
+        }
+        if (spec.bytes_per_cell == 0 && !verifyBasinArchive(file, columns, rows, reason))
+            return false;
+        if (!identities.isEmpty())
+        {
+            const QJsonObject entry = identities.value(name).toObject();
+            const QString digest = entry.value(QStringLiteral("sha256")).toString();
+            if (entry.value(QStringLiteral("size_bytes")).toDouble(-1) != double(info.size()) ||
+                digest.size() != 64 ||
+                !std::all_of(digest.cbegin(), digest.cend(), [](QChar c) {
+                    return (c >= QChar('0') && c <= QChar('9')) ||
+                           (c >= QChar('a') && c <= QChar('f'));
+                }))
+            {
+                *reason = QStringLiteral("Invalid artifact identity: %1").arg(name);
+                return false;
+            }
+            if (!file.seek(0))
+            {
+                *reason = QStringLiteral("Cannot rewind artifact: %1").arg(name);
+                return false;
+            }
+            QCryptographicHash hash(QCryptographicHash::Sha256);
+            while (!file.atEnd())
+            {
+                const QByteArray chunk = file.read(1024 * 1024);
+                if (chunk.isEmpty())
+                {
+                    *reason = QStringLiteral("Cannot hash artifact: %1").arg(name);
+                    return false;
+                }
+                hash.addData(chunk);
+            }
+            if (QString::fromLatin1(hash.result().toHex()) != digest)
+            {
+                *reason = QStringLiteral("Artifact checksum mismatch: %1").arg(name);
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 QByteArray readRectangle(const QString &path, std::uint32_t grid_columns,
@@ -617,15 +787,21 @@ QJsonObject AnalysisService::jobJson(const QSharedPointer<Job> &job) const
     result.insert(QStringLiteral("stage_timings_ms"), job->stage_timings_ms);
     if (!job->terrain_fetch_details.isEmpty())
         result.insert(QStringLiteral("terrain_fetch_details"), job->terrain_fetch_details);
+    if (!job->artifact_integrity.isEmpty())
+        result.insert(QStringLiteral("artifact_integrity"), job->artifact_integrity);
     return result;
 }
 
-bool AnalysisService::writeManifest(const QSharedPointer<Job> &job) const
+bool AnalysisService::writeManifest(const QSharedPointer<Job> &job,
+                                    const QString &state_override) const
 {
     QSaveFile file(QDir(jobDirectory(job->id)).filePath(QStringLiteral("job.json")));
     if (!file.open(QIODevice::WriteOnly))
         return false;
-    const QByteArray data = QJsonDocument(jobJson(job)).toJson(QJsonDocument::Indented);
+    QJsonObject manifest = jobJson(job);
+    if (!state_override.isEmpty())
+        manifest.insert(QStringLiteral("state"), state_override);
+    const QByteArray data = QJsonDocument(manifest).toJson(QJsonDocument::Indented);
     return file.write(data) == data.size() && file.commit();
 }
 
@@ -643,6 +819,10 @@ void AnalysisService::restoreJobs()
         if (!document.isObject())
             continue;
         const QJsonObject saved = document.object();
+        // The directory, not untrusted JSON, defines the identity. Do not
+        // resurrect a renamed/mismatched manifest under another job UUID.
+        if (saved.value(QStringLiteral("id")).toString() != id)
+            continue;
         QSharedPointer<Job> job = QSharedPointer<Job>::create();
         job->id = id;
         job->dataset = saved.value(QStringLiteral("dataset")).toString();
@@ -675,13 +855,24 @@ void AnalysisService::restoreJobs()
         job->basin_count = std::uint64_t(saved.value(QStringLiteral("basin_count")).toDouble());
         job->stage_timings_ms = saved.value(QStringLiteral("stage_timings_ms")).toObject();
         job->terrain_fetch_details = saved.value(QStringLiteral("terrain_fetch_details")).toObject();
-        bool missing_basin_archive = false;
-        if (job->state == QStringLiteral("completed") &&
-            !QFileInfo::exists(QDir(jobDirectory(id)).filePath(QStringLiteral("basins.aowbin"))))
+        job->artifact_integrity = saved.value(QStringLiteral("artifact_integrity")).toObject();
+        bool damaged_artifacts = false;
+        if (job->state == QStringLiteral("completed"))
         {
-            job->state = QStringLiteral("failed");
-            job->error = QStringLiteral("Missing depression hierarchy artifact; rerun analysis");
-            missing_basin_archive = true;
+            QString reason;
+            // Old analyses have no artifact_integrity; they still receive
+            // exact-size and hierarchy checksum validation.
+            if ((saved.contains(QStringLiteral("artifact_integrity")) &&
+                 (!saved.value(QStringLiteral("artifact_integrity")).isObject() ||
+                  job->artifact_integrity.isEmpty())) ||
+                !verifyPrimaryArtifacts(jobDirectory(id), job->grid.columns,
+                                        job->grid.rows, job->artifact_integrity, &reason))
+            {
+                job->state = QStringLiteral("failed");
+                job->error = QStringLiteral("Invalid completed analysis artifacts: %1; rerun analysis")
+                    .arg(reason.isEmpty() ? QStringLiteral("Invalid artifact inventory") : reason);
+                damaged_artifacts = true;
+            }
         }
         if (job->state != QStringLiteral("completed") && job->state != QStringLiteral("failed") &&
             job->state != QStringLiteral("canceled"))
@@ -697,7 +888,7 @@ void AnalysisService::restoreJobs()
         QMutexLocker locker(&this->jobs_mutex);
         this->job_map.insert(id, job);
         locker.unlock();
-        if (missing_basin_archive)
+        if (damaged_artifacts)
             writeManifest(job);
     }
 }
@@ -823,13 +1014,22 @@ void AnalysisService::runJob(const QSharedPointer<Job> &job)
         writeManifest(job);
         const QDir folder(jobDirectory(job->id));
         const Clock::time_point raster_save_started = Clock::now();
-        writeArray(folder.filePath(QStringLiteral("elevation.f32")), result.source.elevations_m);
-        writeArray(folder.filePath(QStringLiteral("conditioned.f32")), result.conditioned_elevations_m);
-        writeArray(folder.filePath(QStringLiteral("potential-fill-depth.f32")), result.potential_fill_depth_m);
-        writeArray(folder.filePath(QStringLiteral("breach-cut-depth.f32")), result.breach_cut_depth_m);
-        writeArray(folder.filePath(QStringLiteral("upstream-area.f64")), result.upstream_area_m2);
-        writeArray(folder.filePath(QStringLiteral("upstream-count.u64")), result.upstream_cell_count);
-        writeArray(folder.filePath(QStringLiteral("downstream.i64")), result.downstream);
+        const auto saveRaster = [this, &job, &folder](const QString &name, const auto &values)
+        {
+            const QString sha256 = writeArray(folder.filePath(name), values);
+            const QJsonObject entry = artifactRecord(
+                std::uint64_t(values.size()) * sizeof(typename std::decay_t<decltype(values)>::value_type),
+                sha256);
+            QMutexLocker locker(&this->jobs_mutex);
+            job->artifact_integrity.insert(name, entry);
+        };
+        saveRaster(QStringLiteral("elevation.f32"), result.source.elevations_m);
+        saveRaster(QStringLiteral("conditioned.f32"), result.conditioned_elevations_m);
+        saveRaster(QStringLiteral("potential-fill-depth.f32"), result.potential_fill_depth_m);
+        saveRaster(QStringLiteral("breach-cut-depth.f32"), result.breach_cut_depth_m);
+        saveRaster(QStringLiteral("upstream-area.f64"), result.upstream_area_m2);
+        saveRaster(QStringLiteral("upstream-count.u64"), result.upstream_cell_count);
+        saveRaster(QStringLiteral("downstream.i64"), result.downstream);
         record_stage(QStringLiteral("raster_persistence"), raster_save_started);
         {
             QMutexLocker locker(&this->jobs_mutex);
@@ -850,6 +1050,13 @@ void AnalysisService::runJob(const QSharedPointer<Job> &job)
                           qsizetype(encoded.size())) != qsizetype(encoded.size()) ||
             !archive.commit())
             throw std::runtime_error("Cannot save depression hierarchy archive");
+        QCryptographicHash basin_hash(QCryptographicHash::Sha256);
+        basin_hash.addData(reinterpret_cast<const char *>(encoded.data()), qsizetype(encoded.size()));
+        {
+            QMutexLocker locker(&this->jobs_mutex);
+            job->artifact_integrity.insert(QStringLiteral("basins.aowbin"),
+                artifactRecord(encoded.size(), QString::fromLatin1(basin_hash.result().toHex())));
+        }
         record_stage(QStringLiteral("basin_persistence"), basin_save_started);
         {
             QMutexLocker locker(&this->jobs_mutex);
@@ -859,13 +1066,22 @@ void AnalysisService::runJob(const QSharedPointer<Job> &job)
         writeManifest(job);
         if (job->cancelled.load())
             throw std::runtime_error("Job canceled");
+        if (job->artifact_integrity.size() != int(PrimaryArtifacts.size()))
+            throw std::runtime_error("Cannot publish incomplete analysis artifacts");
+        QString artifact_problem;
+        if (!verifyPrimaryArtifacts(folder.path(), job->grid.columns, job->grid.rows,
+                                    QJsonObject(), &artifact_problem))
+            throw std::runtime_error(QStringLiteral("Cannot publish invalid analysis artifacts: %1")
+                .arg(artifact_problem).toStdString());
         record_stage(QStringLiteral("total_worker"), worker_started);
+        // Publish a completed manifest atomically while status stays 'saving'.
+        // Readers may observe 'completed' only AFTER durable publication.
+        if (!writeManifest(job, QStringLiteral("completed")))
+            throw std::runtime_error("Could not persist job completion metadata");
         {
             QMutexLocker locker(&this->jobs_mutex);
             job->state = QStringLiteral("completed");
         }
-        if (!writeManifest(job))
-            throw std::runtime_error("Could not persist job completion metadata");
     }
     catch (const std::exception &error)
     {
