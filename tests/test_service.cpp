@@ -9,6 +9,7 @@
 #include <QElapsedTimer>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonDocument>
 #include <QTemporaryDir>
 #include <QThread>
@@ -974,6 +975,114 @@ int main(int argc, char **argv)
         assert(error.isEmpty() && basin_page_repeat.value(QStringLiteral("cache_hit")).toBool());
         assert(basin_page_repeat.value(QStringLiteral("basins")) ==
                basin_balance.value(QStringLiteral("basins")));
+        // Content-derived identity: merely changing a timestamp must NOT
+        // invalidate the cache, while same-length edits with mtime restored
+        // must not reuse a stale redistribution result.
+        const QString basin_folder = QDir(configuration.output_directory).filePath(basin_job_id);
+        const QString scenario_folder = QDir(basin_folder).filePath(
+            QStringLiteral("rainfall-scenarios/") + basin_scenario_id);
+        const QString manifest_path = QDir(scenario_folder).filePath(QStringLiteral("scenario.json"));
+        QFile scenario_manifest(manifest_path);
+        assert(scenario_manifest.open(QIODevice::ReadOnly));
+        const QByteArray original_manifest = scenario_manifest.readAll();
+        scenario_manifest.close();
+        assert(QJsonDocument::fromJson(original_manifest).object()
+            .value(QStringLiteral("artifact_integrity")).toObject().size() == 2);
+        const QDateTime original_manifest_time = QFileInfo(manifest_path).lastModified();
+        QByteArray altered_manifest = original_manifest;
+        const QByteArray model_name("static_uniform_rainfall_runoff");
+        const qsizetype model_pos = altered_manifest.indexOf(model_name);
+        assert(model_pos >= 0);
+        altered_manifest[model_pos] = 'S'; // Same length, valid JSON, no change to physics.
+        QThread::msleep(2); // Distinct ctime even on coarse timestamp filesystems.
+        assert(scenario_manifest.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        assert(scenario_manifest.write(altered_manifest) == altered_manifest.size());
+        assert(scenario_manifest.setFileTime(original_manifest_time,
+            QFileDevice::FileModificationTime));
+        scenario_manifest.close();
+        assert(QFileInfo(manifest_path).size() == original_manifest.size());
+        const QJsonObject metadata_changed = service.rainfallRedistribution(
+            basin_job_id, basin_scenario_id, 0, 1, &error);
+        assert(error.isEmpty() && !metadata_changed.value(QStringLiteral("cache_hit")).toBool());
+        assert(metadata_changed.value(QStringLiteral("basins")) ==
+               basin_balance.value(QStringLiteral("basins")));
+        assert(scenario_manifest.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        assert(scenario_manifest.write(original_manifest) == original_manifest.size());
+        assert(scenario_manifest.setFileTime(original_manifest_time,
+            QFileDevice::FileModificationTime));
+        scenario_manifest.close();
+        const QJsonObject original_rebuilt = service.rainfallRedistribution(
+            basin_job_id, basin_scenario_id, 0, 1, &error);
+        assert(error.isEmpty() && !original_rebuilt.value(QStringLiteral("cache_hit")).toBool());
+        assert(original_rebuilt.value(QStringLiteral("basins")) ==
+               basin_balance.value(QStringLiteral("basins")));
+
+        const QString elevation_path = QDir(basin_folder).filePath(QStringLiteral("elevation.f32"));
+        QFile elevation_file(elevation_path);
+        assert(elevation_file.open(QIODevice::ReadWrite));
+        assert(elevation_file.setFileTime(QFileInfo(elevation_path).lastModified().addSecs(5),
+            QFileDevice::FileModificationTime));
+        elevation_file.close();
+        const QJsonObject touched_only = service.rainfallRedistribution(
+            basin_job_id, basin_scenario_id, 0, 1, &error);
+        assert(error.isEmpty() && touched_only.value(QStringLiteral("cache_hit")).toBool());
+
+        const QString runoff_path = QDir(scenario_folder).filePath(QStringLiteral("runoff.f64"));
+        const QDateTime original_runoff_time = QFileInfo(runoff_path).lastModified();
+        QFile runoff_file(runoff_path);
+        assert(runoff_file.open(QIODevice::ReadWrite));
+        const QByteArray original_byte = runoff_file.read(1);
+        assert(original_byte.size() == 1 && runoff_file.seek(0));
+        QThread::msleep(2);
+        const char changed_byte = char(original_byte.at(0) ^ 0x01);
+        assert(runoff_file.write(&changed_byte, 1) == 1);
+        assert(runoff_file.setFileTime(original_runoff_time,
+            QFileDevice::FileModificationTime));
+        runoff_file.close();
+        const QJsonObject invalid_source = service.rainfallRedistribution(
+            basin_job_id, basin_scenario_id, 0, 1, &error);
+        assert(invalid_source.isEmpty() &&
+               error.contains(QStringLiteral("SHA-256 mismatch")));
+        QThread::msleep(2);
+        assert(runoff_file.open(QIODevice::ReadWrite));
+        assert(runoff_file.write(original_byte) == 1);
+        assert(runoff_file.setFileTime(original_runoff_time,
+            QFileDevice::FileModificationTime));
+        runoff_file.close();
+        const QJsonObject restored_source = service.rainfallRedistribution(
+            basin_job_id, basin_scenario_id, 0, 1, &error);
+        assert(error.isEmpty() && restored_source.value(QStringLiteral("cache_hit")).toBool());
+        // Before the content-inventory schema, scenarios had only the runoff
+        // raster and manifest. They must remain readable and rebuildable.
+        QJsonObject legacy_scenario = QJsonDocument::fromJson(original_manifest).object();
+        legacy_scenario.remove(QStringLiteral("artifact_integrity"));
+        const QByteArray legacy_json = QJsonDocument(legacy_scenario).toJson(QJsonDocument::Compact);
+        assert(scenario_manifest.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        assert(scenario_manifest.write(legacy_json) == legacy_json.size());
+        scenario_manifest.close();
+        const QJsonObject legacy_result = service.rainfallRedistribution(
+            basin_job_id, basin_scenario_id, 0, 1, &error);
+        assert(error.isEmpty() && !legacy_result.value(QStringLiteral("cache_hit")).toBool());
+        assert(legacy_result.value(QStringLiteral("basins")) ==
+               basin_balance.value(QStringLiteral("basins")));
+        // Incomplete inventories must be rejected, not treated as legacy.
+        legacy_scenario.insert(QStringLiteral("artifact_integrity"), QJsonObject{
+            {QStringLiteral("runoff.f64"), QJsonObject{}}
+        });
+        const QByteArray incomplete_json = QJsonDocument(legacy_scenario).toJson(
+            QJsonDocument::Compact);
+        assert(scenario_manifest.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        assert(scenario_manifest.write(incomplete_json) == incomplete_json.size());
+        scenario_manifest.close();
+        assert(service.rainfallRedistribution(
+            basin_job_id, basin_scenario_id, 0, 1, &error).isEmpty());
+        assert(error.contains(QStringLiteral("Incomplete immutable")));
+        assert(scenario_manifest.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        assert(scenario_manifest.write(original_manifest) == original_manifest.size());
+        scenario_manifest.close();
+        const QJsonObject restored_manifest = service.rainfallRedistribution(
+            basin_job_id, basin_scenario_id, 0, 1, &error);
+        assert(error.isEmpty() && !restored_manifest.value(QStringLiteral("cache_hit")).toBool());
         // An invalidated or damaged *derived* cache is automatically
         // recomputed from the persisted DEM + runoff + basin hierarchy.
         const QString cache_path = QDir(configuration.output_directory).filePath(

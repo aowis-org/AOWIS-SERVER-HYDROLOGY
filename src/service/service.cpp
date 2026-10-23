@@ -11,6 +11,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QDateTime>
+#include <QHash>
 #include <QJsonDocument>
 #include <QMutexLocker>
 #include <QStringList>
@@ -30,6 +31,10 @@
 #include <string>
 #include <type_traits>
 #include <utility>
+
+#if defined(Q_OS_UNIX)
+#include <sys/stat.h>
+#endif
 
 namespace Aowis::Hydrology
 {
@@ -2004,10 +2009,10 @@ QJsonObject AnalysisService::createRainfallScenarioImpl(
             throw std::runtime_error("Cannot create rainfall scenario directory");
         try
         {
-            writeArray(QDir(folder).filePath(QStringLiteral("runoff.f64")),
-                       result.runoff_volume_m3);
-            writeArray(QDir(folder).filePath(QStringLiteral("coverage.f32")),
-                       result.covered_fraction);
+            const QString runoff_hash = writeArray(
+                QDir(folder).filePath(QStringLiteral("runoff.f64")), result.runoff_volume_m3);
+            const QString coverage_hash = writeArray(
+                QDir(folder).filePath(QStringLiteral("coverage.f32")), result.covered_fraction);
             if (cancel_requested != nullptr && cancel_requested->load())
                 throw std::runtime_error("Rainfall scenario canceled");
             const QJsonObject summary{
@@ -2028,7 +2033,13 @@ QJsonObject AnalysisService::createRainfallScenarioImpl(
                 {QStringLiteral("average_effective_runoff_m3_s"), result.average_effective_runoff_m3_s},
                 {QStringLiteral("touches_domain_boundary"), result.touches_domain_boundary},
                 {QStringLiteral("runoff_raster_format"), QStringLiteral("f64le_m3_per_cell")},
-                {QStringLiteral("coverage_raster_format"), QStringLiteral("f32le_fraction")}
+                {QStringLiteral("coverage_raster_format"), QStringLiteral("f32le_fraction")},
+                {QStringLiteral("artifact_integrity"), QJsonObject{
+                    {QStringLiteral("runoff.f64"), artifactRecord(
+                        std::uint64_t(result.runoff_volume_m3.size()) * 8, runoff_hash)},
+                    {QStringLiteral("coverage.f32"), artifactRecord(
+                        std::uint64_t(result.covered_fraction.size()) * 4, coverage_hash)}
+                }}
             };
             if (cancel_requested != nullptr && cancel_requested->load())
                 throw std::runtime_error("Rainfall scenario canceled");
@@ -2351,10 +2362,127 @@ namespace Aowis::Hydrology
 {
 namespace
 {
-// The inputs of a completed job/scenario are immutable under normal service
-// operation. File metadata is sufficient to cheaply invalidate a derived
-// cache after accidental/manual replacement; it is not a tamper-proof digest
-// of the potentially multi-gigabyte source rasters.
+// Fingerprints describe the bytes of committed immutable inputs, not their
+// timestamps. Persisted SHA-256 IDs are recorded when producing terrain and
+// rainfall artifacts. For old manifests without IDs we calculate them on
+// demand. This also checks published IDs against the files used by a task.
+//
+// A process-local stamp memo avoids rereading multi-gigabyte rasters for
+// every status/page request. The stamp includes inode and nanosecond ctime on
+// Unix, so an ordinary overwrite that restores size + mtime is detected.
+// External in-place mutation is unsupported; the memo is not a security
+// boundary against hostile filesystem manipulation or concurrent writers.
+struct SourceStamp
+{
+    qint64 bytes = -1;
+    qint64 mtime_seconds = 0;
+    qint64 mtime_nanoseconds = 0;
+    qint64 change_seconds = 0;
+    qint64 change_nanoseconds = 0;
+    quint64 device = 0;
+    quint64 inode = 0;
+    bool operator==(const SourceStamp &) const = default;
+};
+
+SourceStamp sourceStamp(const QString &path)
+{
+    const QFileInfo info(path);
+    if (!info.isFile() || info.isSymLink())
+        throw std::runtime_error("Missing immutable redistribution source file");
+    SourceStamp stamp;
+#if defined(Q_OS_UNIX)
+    struct stat stat_result {};
+    if (::stat(QFile::encodeName(path).constData(), &stat_result) != 0 ||
+        !S_ISREG(stat_result.st_mode))
+        throw std::runtime_error("Cannot stat immutable redistribution source file");
+    stamp.bytes = stat_result.st_size;
+    stamp.device = stat_result.st_dev;
+    stamp.inode = stat_result.st_ino;
+#if defined(Q_OS_DARWIN)
+    stamp.mtime_seconds = stat_result.st_mtimespec.tv_sec;
+    stamp.mtime_nanoseconds = stat_result.st_mtimespec.tv_nsec;
+    stamp.change_seconds = stat_result.st_ctimespec.tv_sec;
+    stamp.change_nanoseconds = stat_result.st_ctimespec.tv_nsec;
+#else
+    stamp.mtime_seconds = stat_result.st_mtim.tv_sec;
+    stamp.mtime_nanoseconds = stat_result.st_mtim.tv_nsec;
+    stamp.change_seconds = stat_result.st_ctim.tv_sec;
+    stamp.change_nanoseconds = stat_result.st_ctim.tv_nsec;
+#endif
+#else
+    stamp.bytes = info.size();
+    stamp.mtime_seconds = info.lastModified().toMSecsSinceEpoch();
+    // This platform has only the Qt timestamp precision available.
+    stamp.change_seconds = info.metadataChangeTime().toMSecsSinceEpoch();
+#endif
+    if (stamp.bytes < 0)
+        throw std::runtime_error("Invalid immutable redistribution source length");
+    return stamp;
+}
+
+QString sourceDigest(const QString &path, const QString &expected = QString(),
+                     qint64 expected_bytes = -1)
+{
+    struct Entry { SourceStamp stamp; QString sha256; };
+    static QMutex digest_mutex;
+    static QHash<QString, Entry> digests;
+    const QString key = QFileInfo(path).absoluteFilePath();
+    const SourceStamp stamp = sourceStamp(path);
+    if (expected_bytes >= 0 && stamp.bytes != expected_bytes)
+        throw std::runtime_error("Immutable redistribution source length mismatch");
+    QString digest;
+    {
+        QMutexLocker lock(&digest_mutex);
+        const auto entry = digests.constFind(key);
+        if (entry != digests.cend() && entry->stamp == stamp)
+            digest = entry->sha256;
+    }
+    if (digest.isEmpty())
+    {
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly))
+            throw std::runtime_error("Cannot read immutable redistribution source file");
+        QCryptographicHash hash(QCryptographicHash::Sha256);
+        while (!file.atEnd())
+        {
+            const QByteArray block = file.read(1024 * 1024);
+            if (block.isEmpty())
+                throw std::runtime_error("Cannot hash immutable redistribution source file");
+            hash.addData(block);
+        }
+        if (sourceStamp(path) != stamp)
+            throw std::runtime_error("Immutable redistribution source changed while hashing");
+        digest = QString::fromLatin1(hash.result().toHex());
+        QMutexLocker lock(&digest_mutex);
+        // This is only a performance memo, not persistent job state.
+        // Keep it bounded even when the service handles many scenarios.
+        if (digests.size() >= 4096)
+            digests.clear();
+        digests.insert(key, Entry{stamp, digest});
+    }
+    if (!expected.isEmpty() && digest != expected)
+        throw std::runtime_error("Immutable redistribution source SHA-256 mismatch");
+    return digest;
+}
+
+QString recordedSourceDigest(const QString &path, const QJsonObject &integrity,
+                             const QString &name)
+{
+    // A missing inventory is allowed for persisted pre-integrity analyses.
+    if (integrity.isEmpty())
+        return sourceDigest(path);
+    const QJsonObject record = integrity.value(name).toObject();
+    const QString digest = record.value(QStringLiteral("sha256")).toString();
+    const qint64 bytes = qint64(record.value(QStringLiteral("size_bytes")).toDouble(-1));
+    if (digest.size() != 64 || bytes < 0 ||
+        !std::all_of(digest.cbegin(), digest.cend(), [](QChar c) {
+            return (c >= QChar('0') && c <= QChar('9')) ||
+                   (c >= QChar('a') && c <= QChar('f'));
+        }))
+        throw std::runtime_error("Invalid immutable redistribution source identity");
+    return sourceDigest(path, digest, bytes);
+}
+
 RedistributionArchiveIdentity redistributionIdentity(
     const QString &job_id, const QString &scenario_id,
     const QString &job_folder, const QString &scenario_folder,
@@ -2369,29 +2497,50 @@ RedistributionArchiveIdentity redistributionIdentity(
         throw std::invalid_argument("Invalid cache job or scenario UUID");
     const QByteArray job_bytes = job_uuid.toRfc4122();
     const QByteArray scenario_bytes = scenario_uuid.toRfc4122();
-    if (job_bytes.size() != 16 || scenario_bytes.size() != 16)
-        throw std::invalid_argument("Invalid cache job or scenario UUID");
     for (std::size_t index = 0; index < 16; ++index)
     {
         identity.job_uuid[index] = std::uint8_t(job_bytes.at(qsizetype(index)));
         identity.scenario_uuid[index] = std::uint8_t(scenario_bytes.at(qsizetype(index)));
     }
+    QFile job_file(QDir(job_folder).filePath(QStringLiteral("job.json")));
+    if (!job_file.open(QIODevice::ReadOnly) || job_file.size() > 1024 * 1024)
+        throw std::runtime_error("Cannot read completed terrain source manifest");
+    const QJsonObject job = QJsonDocument::fromJson(job_file.readAll()).object();
+    if (job.value(QStringLiteral("id")).toString() != job_id ||
+        job.value(QStringLiteral("state")).toString() != QStringLiteral("completed"))
+        throw std::runtime_error("Invalid completed terrain source manifest");
+    const QString scenario_root = QFileInfo(scenario_folder).absolutePath();
+    const QJsonObject scenario = loadRainfallManifest(scenario_root, scenario_id);
+    const QJsonObject job_integrity = job.value(QStringLiteral("artifact_integrity")).toObject();
+    const QJsonObject scenario_integrity = scenario.value(QStringLiteral("artifact_integrity")).toObject();
+    if ((job.contains(QStringLiteral("artifact_integrity")) && job_integrity.isEmpty()) ||
+        (scenario.contains(QStringLiteral("artifact_integrity")) &&
+         scenario_integrity.size() != 2))
+        throw std::runtime_error("Incomplete immutable redistribution source identity");
+
+    // Domain separation and a model identity ensure old timestamp-based
+    // archives are not accidentally reused after this change. Bump the
+    // algorithm tag if the numerical redistribution semantics change.
     QCryptographicHash hash(QCryptographicHash::Sha256);
-    const QStringList paths{
-        QDir(job_folder).filePath(QStringLiteral("elevation.f32")),
-        QDir(job_folder).filePath(QStringLiteral("basins.aowbin")),
-        QDir(scenario_folder).filePath(QStringLiteral("runoff.f64")),
-        QDir(scenario_folder).filePath(QStringLiteral("scenario.json"))
-    };
-    for (const QString &path : paths)
+    hash.addData(QByteArrayLiteral("aowis-redistribution-source-v2:static-volume-v1\n"));
+    hash.addData(QByteArray::number(columns) + 'x' + QByteArray::number(rows) + '\n');
+    const auto addInput = [&hash](const char *name, const QString &digest)
     {
-        const QFileInfo info(path);
-        if (!info.isFile() || info.size() < 0)
-            throw std::runtime_error("Missing immutable redistribution source file");
-        const QByteArray metadata = QByteArray::number(info.size()) + ':' +
-            QByteArray::number(info.lastModified().toMSecsSinceEpoch()) + ';';
-        hash.addData(metadata);
-    }
+        hash.addData(QByteArray(name) + ':' + digest.toLatin1() + '\n');
+    };
+    addInput("elevation.f32", recordedSourceDigest(
+        QDir(job_folder).filePath(QStringLiteral("elevation.f32")),
+        job_integrity, QStringLiteral("elevation.f32")));
+    addInput("basins.aowbin", recordedSourceDigest(
+        QDir(job_folder).filePath(QStringLiteral("basins.aowbin")),
+        job_integrity, QStringLiteral("basins.aowbin")));
+    addInput("runoff.f64", recordedSourceDigest(
+        QDir(scenario_folder).filePath(QStringLiteral("runoff.f64")),
+        scenario_integrity, QStringLiteral("runoff.f64")));
+    // scenario.json is compact and self-referential hashes are avoided:
+    // hashing its published bytes covers geometry, inputs and raster IDs.
+    addInput("scenario.json", sourceDigest(
+        QDir(scenario_folder).filePath(QStringLiteral("scenario.json"))));
     const QByteArray signature = hash.result();
     for (std::size_t index = 0; index < 16; ++index)
         identity.source_fingerprint[index] = std::uint8_t(signature.at(qsizetype(index)));
@@ -2877,8 +3026,8 @@ namespace Aowis::Hydrology
 namespace
 {
 // The derived depth file is published first and its manifest last. Both use
-// QSaveFile; the manifest is the only commit marker. Old, stale results are
-// never accepted if the DEM, rainfall, or redistribution file metadata changes.
+// QSaveFile; the manifest is the only commit marker. A content-derived
+// fingerprint follows DEM, rainfall, and redistribution cache bytes.
 QString inundationFile(const QString &scenario_folder, const QString &name)
 {
     return QDir(scenario_folder).filePath(name);
@@ -2897,9 +3046,9 @@ QString inundationFingerprint(const QString &job_id, const QString &scenario_id,
         throw std::runtime_error("Redistribution result not ready; submit redistribution first");
     QByteArray contents(reinterpret_cast<const char *>(identity.source_fingerprint.data()),
                         qsizetype(identity.source_fingerprint.size()));
-    contents += ':' + QByteArray::number(info.size()) + ':' +
-        QByteArray::number(info.lastModified().toMSecsSinceEpoch());
-    contents += QByteArrayLiteral(":static-inundation-v2");
+    contents += QByteArrayLiteral(":redistribution-sha256:") +
+        sourceDigest(redistribution_path).toLatin1();
+    contents += QByteArrayLiteral(":static-inundation-v2:content-fingerprint-v2");
     return QString::fromLatin1(QCryptographicHash::hash(contents,
         QCryptographicHash::Sha256).toHex());
 }

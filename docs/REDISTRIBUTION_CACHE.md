@@ -33,10 +33,12 @@ jobs or rainfall scenarios. Scenario and job IDs are UUIDs.
 1. Verify that the terrain analysis is completed and the requested scenario
    UUID exists. Result-page queries additionally require `offset >= 0`,
    `1 <= limit <= 100`.
-2. Read the scenario manifest and a **cheap metadata fingerprint** for the four
-   immutable inputs (original elevation, basin archive, runoff, scenario manifest).
+2. Read the scenario manifest and a **content-derived source fingerprint** for
+   the four immutable inputs (original elevation, basin archive, runoff,
+   scenario manifest). Source SHA-256 values are recorded when files are
+   published, and checked once per source version per service process.
 3. If the cache exists and matches the current job/scenario UUIDs, grid
-   dimensions, file fingerprint and archive version, validate its header and
+   dimensions, source-content fingerprint and archive version, validate its header and
    the requested page of records. Return the global totals and only those
    records. **No DEM is reloaded and no D8 routing is run.**
 4. If the cache is absent, stale, incomplete, or fails integrity checks,
@@ -142,18 +144,40 @@ of bounded pagination. A damaged record will be detected when its page is read.
 
 ## Cache invalidation and recovery
 
-The 16-byte source fingerprint is derived from SHA-256 over the file sizes and
-last-modified timestamps of `elevation.f32`, `basins.aowbin`, `runoff.f64` and
-`scenario.json`. This is intentionally inexpensive: the original source files
-can be much larger than the cache and rehashing every byte on every request
-would make pagination slow.
+The 16-byte source fingerprint is derived from SHA-256 over a domain-separated
+list containing the algorithm identity, grid dimensions, and the **SHA-256 of
+actual source bytes** for `elevation.f32`, `basins.aowbin`, `runoff.f64` and
+`scenario.json`. The terrain artifact identities are published in `job.json`;
+rainfall creation now publishes runoff and coverage identities in its
+`scenario.json`. The compact scenario manifest itself is hashed as a file,
+so there is no self-referential JSON hash. Pre-existing manifests without
+content inventories remain supported: the missing digests are calculated from
+the source files on demand.
 
-Hydrology never modifies those four files after publishing a completed analysis
-or scenario. External edits or file replacements are unsupported. Ordinary
-changes to their sizes or timestamps invalidate the cache automatically.
-A deliberately modified file that preserves *both* its previous size and
-modification timestamp is not guaranteed to be detected. Strong, end-to-end
-source-content hashing and multi-process locking remain future hardening work.
+For efficiency, the service memoizes verified SHA-256 digests per file and
+filesystem version. On Unix the change token includes inode/device plus
+nanosecond modification and metadata-change timestamps. Thus an ordinary
+same-length write followed by restoring the original modification time
+triggers re-verification; tampering with an immutable published source fails
+with an integrity error rather than being silently recomputed. A timestamp-
+only change without a content change **does not invalidate** the cache. A
+process restart starts with an empty memo; independently, terrain artifact
+integrity is checked at restart. Cache lookups do not rehash full rasters once
+verified for the current filesystem version.
+
+The new content fingerprint intentionally invalidates caches written by older
+binaries with timestamp-only fingerprints. Their input artifacts remain intact,
+and POST can rebuild derived caches. The archive format is unchanged.
+
+**Trust boundary:** authoritative source files are immutable after publication
+under the service contract. A process-local stat-token memo protects against
+ordinary accidental changes but is **not** a hostile-filesystem guarantee:
+manual concurrent writes, forged inode metadata, or filesystems with weak
+change timestamps can defeat this fast path. Strict audit environments must
+verify content from trusted storage or rehash it before use. SHA-256 here
+provides accidental-corruption and reproducibility identities, not access
+control. Future changes to redistribution mathematics must also bump the
+algorithm-identity tag.
 
 A cache is **safe to delete** manually while the server is stopped: the next
 request reconstructs it from the source files. Never delete the original DEM,

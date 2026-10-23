@@ -156,3 +156,12 @@ out-of-domain discharge. It does **not** infer timing or a flood-depth map.
 Read the [redistribution guide](RUNOFF_REDISTRIBUTION.md) for the endpoint,
 accounting formula and limitations. No SWMM execution or precipitation
 climatology is included.
+
+## Immutable raster identities
+
+Each new `scenario.json` includes an `artifact_integrity` inventory for
+`runoff.f64` and `coverage.f32`, giving the published byte lengths and
+SHA-256 values. The manifest remains the scenario's commit marker. These
+source identifiers are also used by redistribution cache validation. Existing
+scenarios without an inventory remain readable; their raster hashes are
+computed when needed. In-place mutation of published scenarios is unsupported.
