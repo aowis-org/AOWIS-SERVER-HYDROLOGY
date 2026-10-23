@@ -169,6 +169,15 @@ if(AOWIS_HYDROLOGY_BUILD_SERVER)
                     "$<TARGET_FILE:aowis-server-hydrology>")
             set_tests_properties(aowis-hydrology-server-config-cli PROPERTIES
                 LABELS "hydrology;aowis")
+            # API compatibility gate for HTTP-adapter replacements. This launches
+            # the real server with an isolated persistent directory and a tiny
+            # deterministic mock of Map's analysis-grade DEM endpoint.
+            add_test(NAME aowis-hydrology-http-contract
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_http_contract.py"
+                    "$<TARGET_FILE:aowis-server-hydrology>")
+            set_tests_properties(aowis-hydrology-http-contract PROPERTIES
+                LABELS "hydrology;aowis;http-contract" TIMEOUT 120 RUN_SERIAL TRUE)
         endif()
     endif()
 endif()

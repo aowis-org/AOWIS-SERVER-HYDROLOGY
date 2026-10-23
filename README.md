@@ -86,7 +86,10 @@ scripts. GDAL is optional for the separate GeoTIFF fixture library.
 
 The tests default to the service/REST build and cover pure-core algorithms,
 job persistence, terrain transport, configuration, and HTTP-facing service
-logic. Assertions remain enabled for Release tests. Core-only testing is
+logic. The `aowis-hydrology-http-contract` test runs the real server against
+an isolated deterministic Map mock, checking HTTP status/error contracts,
+binary rasters, independent numerical runs and restart persistence.
+Assertions remain enabled for Release tests. Core-only testing is
 available with `./compile_linux_tests.sh --both --core-only`. A normal CMake
 build also works:
 
