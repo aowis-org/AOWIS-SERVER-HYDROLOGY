@@ -124,7 +124,7 @@ Response contains `model`, `simulation_id`, `total_snapshots`, `offset`, `limit`
 | `total_storage_m3` | Sum of independently modeled reservoir storage (m³) |
 | `mass_balance_error_m3` | Residual of initial storage + inflow − storage − exterior discharge (m³) |
 
-The result also reports accepted/rejected adaptive substeps in the status. A small balance residual demonstrates accounting consistency, **not hydraulic calibration**. Halve the maximum substep size and compare stage/discharge histories to assess first-order time integration sensitivity.
+The result also reports accepted/rejected adaptive substeps and `equalization_limited_transfers` (control transfers capped at stage equalization, see [coupled reservoir routing](COUPLED_RESERVOIR_ROUTING.md)) in the status. Terminal task metadata is kept in memory for the 64 most recent simulations; older ones are served from their persisted manifest. A small balance residual demonstrates accounting consistency, **not hydraulic calibration**. Halve the maximum substep size and compare stage/discharge histories to assess first-order time integration sensitivity.
 
 The service bounds requests to 64 reservoirs, 128 connections, 64 outlets, 1,000 inflow intervals, 1,024 stage–storage knots per reservoir, 256 KiB submitted JSON, 8 queued/active tasks, and 100 returned snapshots per request. A dedicated single-worker pool prevents competing simulation tasks from overwhelming the general hydrology job pool. The core's own substep budget and physical-regime validation still apply.
 

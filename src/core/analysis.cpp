@@ -110,6 +110,129 @@ std::vector<float> priorityFlood(const ElevationGrid &grid,
     return filled;
 }
 
+// Steepest-descent D8 links on the given routing surface. Seeds flat
+// routing from each cell that already has a strictly lower neighbor or an open
+// domain boundary; multi-source BFS then propagates routes through
+// same-height plateaus without changing the elevations. A closed flat
+// depression keeps one deterministic sink per connected flat component.
+// Shared by analyze() and dryD8Downstream() so both produce identical links.
+void routeD8(const ElevationGrid &grid, const std::vector<float> &surface,
+             bool reject_interior_nodata,
+             const std::function<void()> &checkCancellation,
+             std::vector<std::int64_t> &downstream)
+{
+    const std::uint64_t count = std::uint64_t(grid.columns) * grid.rows;
+    downstream.assign(std::size_t(count), -1);
+    std::array<double, 8> row_distances = {};
+    std::uint64_t cached_row = std::numeric_limits<std::uint64_t>::max();
+    std::vector<std::uint8_t> flat_assigned(std::size_t(count), 0);
+    std::queue<std::uint64_t> flat_ready;
+    for (std::uint64_t index = 0; index < count; ++index)
+    {
+        if ((index & 4095U) == 0) checkCancellation();
+        if (!validCell(grid, index))
+            continue;
+        const std::uint64_t row = index / grid.columns;
+        const std::uint64_t column = index % grid.columns;
+        if (row != cached_row)
+        {
+            cached_row = row;
+            for (int direction = 0; direction < 8; ++direction)
+                row_distances[std::size_t(direction)] = rasterRowNeighborDistanceM(
+                    grid.geometry, grid.columns, std::uint32_t(row),
+                    NeighborDx[direction], NeighborDy[direction]);
+        }
+        const double elevation = surface[std::size_t(index)];
+        double highest_gradient = 0.0;
+        std::int64_t best = -1;
+        bool touches_open_boundary = column == 0 || row == 0 ||
+            column + 1 == grid.columns || row + 1 == grid.rows;
+        for (int direction = 0; direction < 8; ++direction)
+        {
+            std::uint64_t adjacent = 0;
+            if (!neighbor(grid, index, direction, &adjacent))
+                continue;
+            if (!validCell(grid, adjacent))
+            {
+                if (!reject_interior_nodata)
+                    touches_open_boundary = true;
+                continue;
+            }
+            const double gradient = (elevation - surface[std::size_t(adjacent)]) /
+                row_distances[std::size_t(direction)];
+            if (gradient > highest_gradient)
+            {
+                highest_gradient = gradient;
+                best = std::int64_t(adjacent);
+            }
+        }
+        downstream[std::size_t(index)] = best;
+        if (best >= 0 || touches_open_boundary)
+        {
+            flat_assigned[std::size_t(index)] = 1;
+            flat_ready.push(index);
+        }
+    }
+    const std::function<void()> routeFlats = [&]()
+    {
+        std::uint64_t steps = 0;
+        while (!flat_ready.empty())
+        {
+            if ((++steps & 4095U) == 0) checkCancellation();
+            const std::uint64_t current = flat_ready.front();
+            flat_ready.pop();
+            for (int direction = 0; direction < 8; ++direction)
+            {
+                std::uint64_t adjacent = 0;
+                if (!neighbor(grid, current, direction, &adjacent) ||
+                    flat_assigned[std::size_t(adjacent)] || !validCell(grid, adjacent) ||
+                    surface[std::size_t(current)] != surface[std::size_t(adjacent)])
+                    continue;
+                flat_assigned[std::size_t(adjacent)] = 1;
+                downstream[std::size_t(adjacent)] = std::int64_t(current);
+                flat_ready.push(adjacent);
+            }
+        }
+    };
+    routeFlats();
+    // A remaining equal-height component cannot reach any strictly lower
+    // cell or any boundary: preserve one true internal sink at its first
+    // (row-major) cell, and route the rest of that component to the sink.
+    for (std::uint64_t index = 0; index < count; ++index)
+    {
+        if ((index & 4095U) == 0) checkCancellation();
+        if (!validCell(grid, index) || flat_assigned[std::size_t(index)])
+            continue;
+        flat_assigned[std::size_t(index)] = 1;
+        flat_ready.push(index);
+        routeFlats();
+    }
+}
+
+void rejectInteriorNoData(const ElevationGrid &grid,
+                          const std::function<void()> &checkCancellation)
+{
+    for (std::uint32_t row = 1; row + 1 < grid.rows; ++row)
+    {
+        if ((row & 63U) == 0) checkCancellation();
+        for (std::uint32_t column = 1; column + 1 < grid.columns; ++column)
+        {
+            const std::uint64_t index = std::uint64_t(row) * grid.columns + column;
+            if (!validCell(grid, index))
+                throw std::invalid_argument("Missing interior DEM cell; fix source coverage before analysis");
+        }
+    }
+}
+
+std::function<void()> cancellationCheck(const std::atomic<bool> *cancel_requested)
+{
+    return [cancel_requested]()
+    {
+        if (cancel_requested != nullptr && cancel_requested->load(std::memory_order_relaxed))
+            throw std::runtime_error("Job canceled");
+    };
+}
+
 struct BreachStep
 {
     double cost_m3 = 0.0;
@@ -138,12 +261,14 @@ void carveConstrainedBreaches(const ElevationGrid &grid,
                              const std::vector<float> &original_fill,
                              const AnalysisOptions &options,
                              AnalysisResult &result,
+                             const std::vector<double> &row_areas,
                              const std::function<void()> &checkCancellation)
 {
-    AnalysisOptions preserve;
-    preserve.fill_depressions = false;
-    preserve.reject_interior_nodata = options.reject_interior_nodata;
-    const AnalysisResult unfilled = analyze(grid, preserve);
+    // Only the dry D8 links of the source DEM are needed to find closed pits.
+    // The interior NoData policy was already validated by analyze().
+    std::vector<std::int64_t> unfilled_downstream;
+    routeD8(grid, grid.elevations_m, options.reject_interior_nodata,
+            checkCancellation, unfilled_downstream);
     const std::uint32_t max_steps = options.maximum_breach_path_cells;
     const std::uint64_t count = std::uint64_t(grid.columns) * grid.rows;
     // Per-search state is localized to the configured maximum path radius,
@@ -157,7 +282,7 @@ void carveConstrainedBreaches(const ElevationGrid &grid,
     for (std::uint64_t sink = 0; sink < count; ++sink)
     {
         if ((sink & 4095U) == 0) checkCancellation();
-        if (unfilled.downstream[std::size_t(sink)] >= 0 ||
+        if (unfilled_downstream[std::size_t(sink)] >= 0 ||
             !std::isfinite(grid.elevations_m[std::size_t(sink)]) ||
             original_fill[std::size_t(sink)] <= grid.elevations_m[std::size_t(sink)])
             continue;
@@ -215,8 +340,7 @@ void carveConstrainedBreaches(const ElevationGrid &grid,
                     double(grid.elevations_m[std::size_t(next)]) - sink_height);
                 if (total_cut > options.maximum_breach_cut_depth_m)
                     continue;
-                const double area = rasterRowCellAreaM2(grid.geometry, grid.columns,
-                    std::uint32_t(next / grid.columns));
+                const double area = row_areas[std::size_t(next / grid.columns)];
                 // Tiny preference for shorter paths among equal excavation
                 // volumes. It is too small to affect metre-scale cut choices.
                 const double cost = current.cost_m3 + cut * area + 0.000001;
@@ -268,14 +392,18 @@ void carveConstrainedBreaches(const ElevationGrid &grid,
 AnalysisResult analyze(const ElevationGrid &grid, const AnalysisOptions &options,
                        const std::atomic<bool> *cancel_requested)
 {
-    const std::function<void()> checkCancellation = [cancel_requested]()
-    {
-        if (cancel_requested != nullptr && cancel_requested->load(std::memory_order_relaxed))
-            throw std::runtime_error("Job canceled");
-    };
+    const std::function<void()> checkCancellation = cancellationCheck(cancel_requested);
     checkCancellation();
     validateGrid(grid);
     const std::uint64_t count = std::uint64_t(grid.columns) * grid.rows;
+    // Geodesic cell areas are constant along a row and expensive (~2 us
+    // each): evaluate once per row for accumulation and breach costs.
+    std::vector<double> row_areas(std::size_t(grid.rows), 0.0);
+    for (std::uint32_t row = 0; row < grid.rows; ++row)
+    {
+        if ((row & 255U) == 0) checkCancellation();
+        row_areas[std::size_t(row)] = rasterRowCellAreaM2(grid.geometry, grid.columns, row);
+    }
     AnalysisResult result;
     result.source = grid;
     result.conditioned_elevations_m = grid.elevations_m;
@@ -284,18 +412,7 @@ AnalysisResult analyze(const ElevationGrid &grid, const AnalysisOptions &options
     result.upstream_area_m2.assign(std::size_t(count), 0.0);
 
     if (options.reject_interior_nodata)
-    {
-        for (std::uint32_t row = 1; row + 1 < grid.rows; ++row)
-        {
-            if ((row & 63U) == 0) checkCancellation();
-            for (std::uint32_t column = 1; column + 1 < grid.columns; ++column)
-            {
-                const std::uint64_t index = std::uint64_t(row) * grid.columns + column;
-                if (!validCell(grid, index))
-                    throw std::invalid_argument("Missing interior DEM cell; fix source coverage before analysis");
-            }
-        }
-    }
+        rejectInteriorNoData(grid, checkCancellation);
 
     // The diagnostic fill is always calculated from source elevation, never
     // from a breached or routed surface. That keeps physical storage metrics
@@ -321,7 +438,7 @@ AnalysisResult analyze(const ElevationGrid &grid, const AnalysisOptions &options
             options.maximum_breach_path_cells > 32 ||
             options.maximum_breach_candidates == 0)
             throw std::invalid_argument("Invalid constrained breach limits");
-        carveConstrainedBreaches(grid, filled, options, result, checkCancellation);
+        carveConstrainedBreaches(grid, filled, options, result, row_areas, checkCancellation);
     }
     for (std::uint64_t index = 0; index < count; ++index)
     {
@@ -361,109 +478,27 @@ AnalysisResult analyze(const ElevationGrid &grid, const AnalysisOptions &options
             ++result.breached_cell_count;
             const float cut = source - conditioned;
             result.maximum_breach_cut_m = std::max(result.maximum_breach_cut_m, cut);
-            result.breach_excavation_m3 += double(cut) * rasterRowCellAreaM2(
-                grid.geometry, grid.columns, std::uint32_t(index / grid.columns));
+            result.breach_excavation_m3 += double(cut) *
+                row_areas[std::size_t(index / grid.columns)];
         }
     }
 
-    // Compute actual downhill gradients and seed flat-routing from each cell
-    // that already has a strictly lower neighbor or an open domain boundary.
-    // Multi-source BFS then propagates routes through same-height plateaus
-    // without changing the elevations. A closed flat depression left intact
-    // has one deterministic sink per connected flat component.
-    std::array<double, 8> row_distances = {};
-    double row_area = 0.0;
-    std::uint64_t cached_row = std::numeric_limits<std::uint64_t>::max();
-    std::vector<std::uint8_t> flat_assigned(std::size_t(count), 0);
-    std::queue<std::uint64_t> flat_ready;
-    for (std::uint64_t index = 0; index < count; ++index)
+    // Per-cell area seeds the accumulation.
     {
-        if ((index & 4095U) == 0) checkCancellation();
-        if (!validCell(grid, index))
-            continue;
-        const std::uint64_t row = index / grid.columns;
-        const std::uint64_t column = index % grid.columns;
-        if (row != cached_row)
+        for (std::uint64_t index = 0; index < count; ++index)
         {
-            cached_row = row;
-            row_area = rasterRowCellAreaM2(grid.geometry, grid.columns,
-                                            std::uint32_t(row));
-            for (int direction = 0; direction < 8; ++direction)
-                row_distances[std::size_t(direction)] = rasterRowNeighborDistanceM(
-                    grid.geometry, grid.columns, std::uint32_t(row),
-                    NeighborDx[direction], NeighborDy[direction]);
-        }
-        const double depth = result.potential_fill_depth_m[std::size_t(index)];
-        result.potential_fill_volume_m3 += depth * row_area;
-        const double elevation = result.conditioned_elevations_m[std::size_t(index)];
-        double highest_gradient = 0.0;
-        std::int64_t best = -1;
-        bool touches_open_boundary = column == 0 || row == 0 ||
-            column + 1 == grid.columns || row + 1 == grid.rows;
-        for (int direction = 0; direction < 8; ++direction)
-        {
-            std::uint64_t adjacent = 0;
-            if (!neighbor(grid, index, direction, &adjacent))
+            if ((index & 4095U) == 0) checkCancellation();
+            if (!validCell(grid, index))
                 continue;
-            if (!validCell(grid, adjacent))
-            {
-                if (!options.reject_interior_nodata)
-                    touches_open_boundary = true;
-                continue;
-            }
-            const double gradient = (elevation -
-                result.conditioned_elevations_m[std::size_t(adjacent)]) /
-                row_distances[std::size_t(direction)];
-            if (gradient > highest_gradient)
-            {
-                highest_gradient = gradient;
-                best = std::int64_t(adjacent);
-            }
-        }
-        result.downstream[std::size_t(index)] = best;
-        result.upstream_cell_count[std::size_t(index)] = 1;
-        result.upstream_area_m2[std::size_t(index)] = row_area;
-        if (best >= 0 || touches_open_boundary)
-        {
-            flat_assigned[std::size_t(index)] = 1;
-            flat_ready.push(index);
+            const double row_area = row_areas[std::size_t(index / grid.columns)];
+            const double depth = result.potential_fill_depth_m[std::size_t(index)];
+            result.potential_fill_volume_m3 += depth * row_area;
+            result.upstream_cell_count[std::size_t(index)] = 1;
+            result.upstream_area_m2[std::size_t(index)] = row_area;
         }
     }
-    const std::function<void()> routeFlats = [&]()
-    {
-        std::uint64_t steps = 0;
-        while (!flat_ready.empty())
-        {
-            if ((++steps & 4095U) == 0) checkCancellation();
-            const std::uint64_t current = flat_ready.front();
-            flat_ready.pop();
-            for (int direction = 0; direction < 8; ++direction)
-            {
-                std::uint64_t adjacent = 0;
-                if (!neighbor(grid, current, direction, &adjacent) ||
-                    flat_assigned[std::size_t(adjacent)] || !validCell(grid, adjacent) ||
-                    result.conditioned_elevations_m[std::size_t(current)] !=
-                        result.conditioned_elevations_m[std::size_t(adjacent)])
-                    continue;
-                flat_assigned[std::size_t(adjacent)] = 1;
-                result.downstream[std::size_t(adjacent)] = std::int64_t(current);
-                flat_ready.push(adjacent);
-            }
-        }
-    };
-    routeFlats();
-    // A remaining equal-height component cannot reach any strictly lower
-    // cell or any boundary: preserve one true internal sink at its first
-    // (row-major) cell, and route the rest of that component to the sink.
-    for (std::uint64_t index = 0; index < count; ++index)
-    {
-        if ((index & 4095U) == 0) checkCancellation();
-        if (!validCell(grid, index) || flat_assigned[std::size_t(index)])
-            continue;
-        flat_assigned[std::size_t(index)] = 1;
-        flat_ready.push(index);
-        routeFlats();
-    }
+    routeD8(grid, result.conditioned_elevations_m, options.reject_interior_nodata,
+            checkCancellation, result.downstream);
 
     std::vector<std::uint8_t> inbound_count(std::size_t(count), 0);
     for (std::uint64_t index = 0; index < count; ++index)
@@ -502,6 +537,20 @@ AnalysisResult analyze(const ElevationGrid &grid, const AnalysisOptions &options
     if (processed_count != valid_count)
         throw std::runtime_error("Flow graph has a cycle (unexpected terrain-conditioning error)");
     return result;
+}
+
+std::vector<std::int64_t> dryD8Downstream(const ElevationGrid &grid,
+                                          bool reject_interior_nodata,
+                                          const std::atomic<bool> *cancel_requested)
+{
+    const std::function<void()> checkCancellation = cancellationCheck(cancel_requested);
+    checkCancellation();
+    validateGrid(grid);
+    if (reject_interior_nodata)
+        rejectInteriorNoData(grid, checkCancellation);
+    std::vector<std::int64_t> downstream;
+    routeD8(grid, grid.elevations_m, reject_interior_nodata, checkCancellation, downstream);
+    return downstream;
 }
 
 std::vector<std::uint8_t> delineateCatchmentWithReader(

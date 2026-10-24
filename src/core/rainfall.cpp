@@ -37,11 +37,6 @@ struct Edge
     Point b;
 };
 
-bool samePoint(const Point &a, const Point &b)
-{
-    return a.x == b.x && a.y == b.y;
-}
-
 Point toPixel(const RasterGeometry &geometry, const MapCoordinate &point)
 {
     double x = point.x;
@@ -130,12 +125,51 @@ Ring clipEdge(const Ring &source, int axis, double limit, bool keep_greater)
     return output;
 }
 
-Ring clippedRing(const Ring &ring, double x, double y)
+// Row strip [y, y+1] first, then the cell column [x, x+1]. The intersection
+// of convex half-planes is order independent; clipping each ring to its row
+// strip once per row reduces the per-cell clipping work from all ring
+// vertices to the few vertices inside that strip.
+Ring clipToRow(const Ring &ring, double y)
 {
-    Ring value = clipEdge(ring, 0, x, true);
-    value = clipEdge(value, 0, x + 1.0, false);
-    value = clipEdge(value, 1, y, true);
-    return clipEdge(value, 1, y + 1.0, false);
+    return clipEdge(clipEdge(ring, 1, y, true), 1, y + 1.0, false);
+}
+
+Ring clipToColumn(const Ring &ring, double x)
+{
+    return clipEdge(clipEdge(ring, 0, x, true), 0, x + 1.0, false);
+}
+
+struct RowPolygon
+{
+    Ring exterior;
+    std::vector<Ring> holes;
+    double west = 0.0;
+    double east = 0.0;
+};
+
+std::vector<RowPolygon> rowPolygons(const std::vector<Polygon> &polygons, double y)
+{
+    std::vector<RowPolygon> result;
+    for (const Polygon &polygon : polygons)
+    {
+        if (polygon.south <= y || polygon.north >= y + 1.0) continue;
+        RowPolygon strip;
+        strip.exterior = clipToRow(polygon.exterior, y);
+        if (strip.exterior.size() < 3) continue;
+        strip.west = strip.east = strip.exterior.front().x;
+        for (const Point &point : strip.exterior)
+        {
+            strip.west = std::min(strip.west, point.x);
+            strip.east = std::max(strip.east, point.x);
+        }
+        for (const Ring &hole : polygon.holes)
+        {
+            Ring cutout = clipToRow(hole, y);
+            if (cutout.size() >= 3) strip.holes.push_back(std::move(cutout));
+        }
+        result.push_back(std::move(strip));
+    }
+    return result;
 }
 
 std::vector<Interval> ringIntervals(const Ring &ring, double x)
@@ -232,22 +266,21 @@ double coveredLengthAt(const std::vector<ClippedPolygon> &polygons, double x)
 // Integrate the union of clipped polygon vertical spans. Critical x-events
 // are vertex positions and all projected segment intersections. Between
 // events, the boundaries are linear, so trapezoidal integration is exact.
-double cellCoverage(const std::vector<Polygon> &polygons, double x, double y)
+double cellCoverage(const std::vector<RowPolygon> &polygons, double x)
 {
     std::vector<ClippedPolygon> clipped;
     std::vector<double> breaks{x, x+1.0};
     std::vector<Edge> edges;
-    for (const Polygon &polygon : polygons)
+    for (const RowPolygon &polygon : polygons)
     {
-        if (polygon.east <= x || polygon.west >= x + 1.0 ||
-            polygon.south <= y || polygon.north >= y + 1.0) continue;
+        if (polygon.east <= x || polygon.west >= x + 1.0) continue;
         ClippedPolygon local;
-        local.exterior = clippedRing(polygon.exterior, x, y);
+        local.exterior = clipToColumn(polygon.exterior, x);
         if (local.exterior.size() < 3) continue;
         addEdges(local.exterior, &edges, &breaks);
         for (const Ring &hole : polygon.holes)
         {
-            Ring cutout = clippedRing(hole, x, y);
+            Ring cutout = clipToColumn(hole, x);
             if (cutout.size() >= 3)
             {
                 addEdges(cutout, &edges, &breaks);
@@ -367,10 +400,12 @@ RainfallRunoff calculateRainfallRunoff(const ElevationGrid &grid,
     {
         if (cancel_requested != nullptr && cancel_requested->load())
             throw std::runtime_error("Rainfall calculation canceled");
+        const std::vector<RowPolygon> row = rowPolygons(polygons, double(y));
+        if (row.empty()) continue;
         const double cell_area = rasterRowCellAreaM2(grid.geometry, grid.columns, y);
         for (std::uint32_t x = x0; x < x1; ++x)
         {
-            const double fraction = cellCoverage(polygons, x, y);
+            const double fraction = cellCoverage(row, double(x));
             if (fraction <= 1.0e-9) continue;
             const std::size_t index = std::size_t(y) * grid.columns + x;
             if (!std::isfinite(grid.elevations_m[index]))

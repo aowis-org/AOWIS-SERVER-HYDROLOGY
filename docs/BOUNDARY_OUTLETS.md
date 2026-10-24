@@ -101,7 +101,7 @@ The existing [temporal forcing adapter](TEMPORAL_RUNOFF_FORCING.md) separately r
 
 ## Stability, limits, and errors
 
-A candidate substep is rejected and halved if its simultaneous set of inflows/transfers/outflows would deplete a reservoir below zero, exceed its stage–storage curve, reverse an active interior head gradient, or lower a reservoir beneath an active outlet crest. This is a timestep *rejection*, not an unconstrained, silent clipping of outlet volume.
+A candidate substep is rejected and halved if its simultaneous set of inflows/transfers/outflows would deplete a reservoir below zero, exceed its stage–storage curve, let an interior control reverse its own head gradient, or lower a reservoir beneath an active outlet crest. Outlet volume is never clipped: this is a timestep *rejection*. Only interior controls are capped at stage equalization (see [coupled reservoir routing](COUPLED_RESERVOIR_ROUTING.md)); that cap is counted and reported.
 
 A very high crest discharge coefficient, very narrow stage–storage interval, or a large prescribed inflow can require smaller time steps. Compare results at two different `maximum_substep_seconds` values; first-order explicit integration is only approximate. The existing limits on substep count, cancellation, reservoir count and connection count remain. At most **200,000 combined internal connections and boundary outlets** are allowed; the caller is responsible for memory/CPU budgeting and correct physical configuration.
 

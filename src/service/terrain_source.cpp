@@ -105,7 +105,13 @@ QNetworkRequest makeRemoteRequest(const SourceConfig &source, const QString &dat
     const double north = geometry.geometry.origin_y - patch.row * geometry.geometry.pixel_height;
     const double south = north - patch.rows * geometry.geometry.pixel_height;
 
-    QUrl endpoint = source.map_url.resolved(QUrl(QStringLiteral("terrain/v1/analysis/grid")));
+    // QUrl::resolved() replaces the last path segment of a base without a
+    // trailing slash ("http://host/map" -> "http://host/terrain/..."), which
+    // silently drops a reverse-proxy mount prefix. Treat the base as a folder.
+    QUrl base = source.map_url;
+    if (!base.path().endsWith(QLatin1Char('/')))
+        base.setPath(base.path() + QLatin1Char('/'));
+    QUrl endpoint = base.resolved(QUrl(QStringLiteral("terrain/v1/analysis/grid")));
     QUrlQuery query;
     query.addQueryItem(QStringLiteral("dataset"), dataset);
     query.addQueryItem(QStringLiteral("west"), precise(west));

@@ -8,10 +8,23 @@ include(CTest)
 set(AOWIS_HYDROLOGY_GEOGRAPHICLIB_SOURCE
     "${CMAKE_CURRENT_SOURCE_DIR}/external/GeographicLib" CACHE PATH
     "GeographicLib source directory (default: Hydrology Git submodule)")
-if(NOT TARGET GeographicLib::GeographicLib)
+set(AOWIS_HYDROLOGY_VENDORED_GEOGRAPHICLIB OFF)
+if(NOT TARGET GeographicLib::GeographicLib AND NOT TARGET GeographicLib::GeographicLib_STATIC)
     if(EXISTS "${AOWIS_HYDROLOGY_GEOGRAPHICLIB_SOURCE}/CMakeLists.txt")
+        # Build the vendored copy as a static library only. GeographicLib's own
+        # option(BUILD_SHARED_LIBS ON) would otherwise create a global cache
+        # entry, link the executables against a build-tree .so and leak that
+        # default into a parent meta-build. Normal variables take precedence
+        # over option() (CMP0077 NEW in GeographicLib's 3.17 policy scope),
+        # and remain local to this directory scope.
+        set(BUILD_SHARED_LIBS OFF)
+        set(BUILD_BOTH_LIBS OFF)
+        # Embedder warning flags must never turn into -Werror on vendored code.
+        set(CONVERT_WARNINGS_TO_ERRORS OFF)
+        set(BUILD_MANPAGES OFF)
         add_subdirectory("${AOWIS_HYDROLOGY_GEOGRAPHICLIB_SOURCE}"
             "${CMAKE_CURRENT_BINARY_DIR}/geographiclib" EXCLUDE_FROM_ALL)
+        set(AOWIS_HYDROLOGY_VENDORED_GEOGRAPHICLIB ON)
     else()
         find_package(GeographicLib CONFIG QUIET)
         if(NOT TARGET GeographicLib::GeographicLib)
@@ -20,6 +33,14 @@ if(NOT TARGET GeographicLib::GeographicLib)
                 "or set AOWIS_HYDROLOGY_GEOGRAPHICLIB_SOURCE to an initialized GeographicLib source tree.")
         endif()
     endif()
+endif()
+# Prefer the static library whenever it is available, also when a parent
+# build already defined GeographicLib. The alias GeographicLib::GeographicLib
+# may resolve to a shared library in such builds.
+if(TARGET GeographicLib::GeographicLib_STATIC)
+    set(AOWIS_HYDROLOGY_GEOGRAPHICLIB_TARGET GeographicLib::GeographicLib_STATIC)
+else()
+    set(AOWIS_HYDROLOGY_GEOGRAPHICLIB_TARGET GeographicLib::GeographicLib)
 endif()
 
 add_library(aowis-hydrology-core STATIC
@@ -56,7 +77,7 @@ add_library(aowis-hydrology-core STATIC
 )
 add_library(AOWIS::Hydrology ALIAS aowis-hydrology-core)
 target_compile_features(aowis-hydrology-core PUBLIC cxx_std_20)
-target_link_libraries(aowis-hydrology-core PUBLIC GeographicLib::GeographicLib)
+target_link_libraries(aowis-hydrology-core PUBLIC ${AOWIS_HYDROLOGY_GEOGRAPHICLIB_TARGET})
 target_include_directories(aowis-hydrology-core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
 # Local, analysis-grade DEM mosaics are independent of Map and Qt. Keep GDAL
@@ -133,6 +154,7 @@ if(AOWIS_HYDROLOGY_BUILD_SERVICE)
         src/service/catchment_tasks.cpp
         src/service/coupled_simulation.cpp
         src/service/terrain_source.cpp
+        src/service/service_limits.h
     )
     add_library(AOWIS::HydrologyService ALIAS aowis-hydrology-service)
     target_compile_features(aowis-hydrology-service PUBLIC cxx_std_20)
@@ -164,6 +186,7 @@ if(AOWIS_HYDROLOGY_BUILD_SERVER)
         src/server/server.cpp
         src/server/server.h
         src/server/http_adapter.h
+        src/server/http_status.h
     )
     target_compile_features(aowis-server-hydrology PRIVATE cxx_std_20)
     target_link_libraries(aowis-server-hydrology PRIVATE
@@ -317,9 +340,43 @@ if(BUILD_TESTING)
         add_test(NAME aowis-hydrology-service COMMAND aowis-hydrology-service-test)
         set_tests_properties(aowis-hydrology-service PROPERTIES LABELS "hydrology;aowis")
 
+        add_executable(aowis-hydrology-http-status-test tests/test_http_status.cpp)
+        target_link_libraries(aowis-hydrology-http-status-test PRIVATE Qt6::Core)
+        add_test(NAME aowis-hydrology-http-status COMMAND aowis-hydrology-http-status-test)
+        set_tests_properties(aowis-hydrology-http-status PROPERTIES LABELS "hydrology;aowis")
+
         add_executable(aowis-hydrology-terrain-transport-test tests/test_terrain_transport.cpp)
         target_link_libraries(aowis-hydrology-terrain-transport-test PRIVATE AOWIS::HydrologyService)
         add_test(NAME aowis-hydrology-terrain-transport COMMAND aowis-hydrology-terrain-transport-test)
         set_tests_properties(aowis-hydrology-terrain-transport PROPERTIES LABELS "hydrology;aowis")
     endif()
+endif()
+
+# GeographicLib unconditionally calls enable_testing()/add_test() for its own
+# tool programs, which are excluded from the default build. Without this, a
+# plain `ctest` reports hundreds of "Not Run" failures. CTest reads
+# CTestCustom.cmake from the top-level build directory; list exactly the tests
+# registered by the vendored GeographicLib directory so they are skipped.
+if(BUILD_TESTING AND AOWIS_HYDROLOGY_VENDORED_GEOGRAPHICLIB)
+    get_property(AOWIS_HYDROLOGY_GEOGRAPHICLIB_TESTS
+        DIRECTORY "${AOWIS_HYDROLOGY_GEOGRAPHICLIB_SOURCE}/tests" PROPERTY TESTS)
+    if(AOWIS_HYDROLOGY_GEOGRAPHICLIB_TESTS)
+        string(REPLACE ";" "\"\n    \"" AOWIS_HYDROLOGY_IGNORED_TESTS
+               "${AOWIS_HYDROLOGY_GEOGRAPHICLIB_TESTS}")
+        file(WRITE "${CMAKE_BINARY_DIR}/CTestCustom.cmake"
+            "# Generated by AOWIS-SERVER-HYDROLOGY: skip vendored GeographicLib tests.\n"
+            "list(APPEND CTEST_CUSTOM_TESTS_IGNORE\n    \"${AOWIS_HYDROLOGY_IGNORED_TESTS}\"\n)\n")
+    endif()
+endif()
+
+# Deployment: `cmake --install <build> --prefix <dir>` installs the server
+# executable only. GeographicLib is linked statically, so the executable does
+# not depend on any library inside the build tree. Disabled by default when
+# Hydrology is a subproject so a parent build keeps control of installation.
+option(AOWIS_HYDROLOGY_INSTALL "Install the Hydrology server executable"
+       ${PROJECT_IS_TOP_LEVEL})
+if(AOWIS_HYDROLOGY_INSTALL AND AOWIS_HYDROLOGY_BUILD_SERVER)
+    include(GNUInstallDirs)
+    install(TARGETS aowis-server-hydrology
+            RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
 endif()

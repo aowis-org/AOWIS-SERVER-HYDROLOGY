@@ -5,6 +5,8 @@
 #include <aowis/hydrology/temporal_inflows.h>
 #include <aowis/hydrology/travel_time_inflows.h>
 
+#include "service_limits.h"
+
 #include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
@@ -594,7 +596,8 @@ PreparedForcing buildScenarioForcing(const QString &job_folder, const QJsonObjec
         QStringLiteral("rainfall-scenarios/") + input.scenario_id);
     const QString scenario_path = QDir(scenario_folder).filePath(QStringLiteral("scenario.json"));
     QFile file(scenario_path);
-    if (!file.open(QIODevice::ReadOnly) || file.size() <= 0 || file.size() > 262144)
+    if (!file.open(QIODevice::ReadOnly) || file.size() <= 0 ||
+        file.size() > Internal::MaximumScenarioManifestBytes)
         throw std::runtime_error("Unknown or invalid rainfall scenario");
     const QJsonDocument document = QJsonDocument::fromJson(file.readAll());
     requireSimulation(document.isObject(), "Invalid rainfall scenario manifest");
@@ -683,6 +686,8 @@ QJsonObject taskResponse(const QJsonObject &manifest)
         {QStringLiteral("model"), QStringLiteral("coupled_reservoir_routing_v1")},
         {QStringLiteral("accepted_substeps"), manifest.value(QStringLiteral("accepted_substeps"))},
         {QStringLiteral("rejected_substeps"), manifest.value(QStringLiteral("rejected_substeps"))},
+        {QStringLiteral("equalization_limited_transfers"),
+            manifest.value(QStringLiteral("equalization_limited_transfers"))},
         {QStringLiteral("scenario_forcing_result"),
             manifest.value(QStringLiteral("scenario_forcing_result"))}
     };
@@ -699,6 +704,7 @@ QJsonObject AnalysisService::startCoupledSimulation(const QString &id,
         if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
         return {};
     }
+    if (!completedJob(id, error)) return {}; // restored artifacts still being verified
     try
     {
         const QByteArray request_bytes = QJsonDocument(request).toJson(QJsonDocument::Compact);
@@ -743,6 +749,7 @@ QJsonObject AnalysisService::startCoupledSimulation(const QString &id,
             task->analysis_id = id;
             task->request = request;
             this->coupled_tasks.insert(id + QLatin1Char('/') + task->id, task);
+            this->coupled_task_order.enqueue(id + QLatin1Char('/') + task->id);
         }
         const QString folder = simulationFolder(QDir(this->config.output_directory).filePath(id), task->id);
         try
@@ -762,6 +769,7 @@ QJsonObject AnalysisService::startCoupledSimulation(const QString &id,
         {
             QMutexLocker locker(&this->coupled_tasks_mutex);
             this->coupled_tasks.remove(id + QLatin1Char('/') + task->id);
+            this->coupled_task_order.removeAll(id + QLatin1Char('/') + task->id);
             throw;
         }
         this->coupled_workers.start([this, task]() { runCoupledTask(task); });
@@ -782,6 +790,7 @@ void AnalysisService::runCoupledTask(const QSharedPointer<CoupledTask> &task)
     QString message;
     std::uint64_t accepted = 0;
     std::uint64_t rejected = 0;
+    std::uint64_t limited = 0;
     {
         QMutexLocker locker(&this->coupled_tasks_mutex);
         if (!task->cancelled.load()) task->state = QStringLiteral("running");
@@ -814,6 +823,7 @@ void AnalysisService::runCoupledTask(const QSharedPointer<CoupledTask> &task)
             input.options, &task->cancelled);
         accepted = result.accepted_substeps;
         rejected = result.rejected_substeps;
+        limited = result.equalization_limited_transfers;
         writeResult(folder, task->request, result, task->cancelled);
         if (!forcing_provenance.isEmpty())
         {
@@ -837,6 +847,7 @@ void AnalysisService::runCoupledTask(const QSharedPointer<CoupledTask> &task)
         manifest.insert(QStringLiteral("error"), message);
         manifest.insert(QStringLiteral("accepted_substeps"), double(accepted));
         manifest.insert(QStringLiteral("rejected_substeps"), double(rejected));
+        manifest.insert(QStringLiteral("equalization_limited_transfers"), double(limited));
         writeCoupledSimulationManifest(folder, manifest);
     }
     catch (const std::exception &)
@@ -847,6 +858,39 @@ void AnalysisService::runCoupledTask(const QSharedPointer<CoupledTask> &task)
     QMutexLocker locker(&this->coupled_tasks_mutex);
     task->state = final_state;
     task->error = message;
+    // The request (up to 256 KiB) is persisted in the manifest; do not keep it
+    // in memory for the lifetime of the process.
+    task->request = QJsonObject();
+    pruneCoupledTasksLocked();
+}
+
+// Caller holds coupled_tasks_mutex. Keeps all active tasks and at most 64
+// terminal ones; status of an evicted task is still served from its manifest.
+void AnalysisService::pruneCoupledTasksLocked()
+{
+    qsizetype terminal = 0;
+    for (const QString &key : std::as_const(this->coupled_task_order))
+    {
+        const QSharedPointer<CoupledTask> entry = this->coupled_tasks.value(key);
+        if (entry && entry->state != QStringLiteral("queued") &&
+            entry->state != QStringLiteral("running") &&
+            entry->state != QStringLiteral("cancel_requested")) ++terminal;
+    }
+    for (qsizetype index = 0; terminal > 64 && index < this->coupled_task_order.size();)
+    {
+        const QString key = this->coupled_task_order.at(index);
+        const QSharedPointer<CoupledTask> entry = this->coupled_tasks.value(key);
+        if (entry && (entry->state == QStringLiteral("queued") ||
+                      entry->state == QStringLiteral("running") ||
+                      entry->state == QStringLiteral("cancel_requested")))
+        {
+            ++index;
+            continue;
+        }
+        this->coupled_tasks.remove(key);
+        this->coupled_task_order.removeAt(index);
+        if (entry) --terminal;
+    }
 }
 
 QJsonObject AnalysisService::coupledSimulationStatus(const QString &id,

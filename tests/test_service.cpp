@@ -29,6 +29,10 @@
 #include <vector>
 #include <stdexcept>
 #include <limits>
+#include <filesystem>
+#if defined(Q_OS_UNIX)
+#include <unistd.h>
+#endif
 
 using namespace Aowis::Hydrology;
 
@@ -107,7 +111,53 @@ int main(int argc, char **argv)
         AnalysisService invalid_coupled(invalid);
         assert(!invalid_coupled.initialize(&error));
         assert(error.contains(QStringLiteral("max_coupled_dem_cells")));
+        for (const int slot_count : {0, 17})
+        {
+            invalid = configuration;
+            invalid.max_concurrent_heavy_queries = slot_count;
+            AnalysisService invalid_heavy(invalid);
+            assert(!invalid_heavy.initialize(&error));
+            assert(error.contains(QStringLiteral("max_concurrent_heavy_queries")));
+        }
     }
+#if defined(Q_OS_UNIX)
+    {
+        // A killed process never runs QTemporaryDir's destructor. Its spool
+        // (PID-tagged) is removed by the next service; a live owner's spool
+        // and recently used legacy spools are left alone.
+        QTemporaryDir spool_directory;
+        assert(spool_directory.isValid());
+        const QDir root(spool_directory.path());
+        const QString dead = QStringLiteral(".catchment-tasks-2147483646-AbCdEf");
+        const QString live = QStringLiteral(".catchment-tasks-%1-AbCdEf").arg(qint64(::getppid()));
+        const QString legacy_old = QStringLiteral(".catchment-tasks-OldOld");
+        const QString legacy_new = QStringLiteral(".catchment-tasks-NewNew");
+        for (const QString &name : {dead, live, legacy_old, legacy_new})
+        {
+            assert(root.mkpath(name));
+            QFile mask(root.filePath(name + QStringLiteral("/mask.u8")));
+            assert(mask.open(QIODevice::WriteOnly) && mask.write("x", 1) == 1);
+        }
+        std::filesystem::last_write_time(
+            std::filesystem::path(root.filePath(legacy_old).toStdString()),
+            std::filesystem::file_time_type::clock::now() - std::chrono::hours(48));
+        ServiceConfig spooled = configuration;
+        spooled.output_directory = spool_directory.path();
+        {
+            AnalysisService service(spooled);
+            QString error;
+            assert(service.initialize(&error));
+            assert(!root.exists(dead));
+            assert(root.exists(live));
+            assert(!root.exists(legacy_old));
+            assert(root.exists(legacy_new));
+        }
+        // The service's own spool is removed on orderly destruction.
+        const QStringList left = root.entryList({QStringLiteral(".catchment-tasks-*")},
+            QDir::Dirs | QDir::Hidden | QDir::NoDotAndDotDot);
+        assert(left.size() == 2 && left.contains(live) && left.contains(legacy_new));
+    }
+#endif
     {
         // Same sized terrain analyses must share a *running-cell* budget.
         // Jobs remain admitted and FIFO-queued while the budget is held.
@@ -143,6 +193,8 @@ int main(int argc, char **argv)
         AnalysisService service(limited);
         QString error;
         assert(service.initialize(&error));
+        // Restored analyses are hashed in the background before being served.
+        assert(service.waitForArtifactVerification(30000));
         const QString first = service.submit(smallRequest(), &error);
         assert(!first.isEmpty());
         {
@@ -170,6 +222,8 @@ int main(int argc, char **argv)
         impossible.max_active_terrain_cells = 100;
         AnalysisService rejected(impossible);
         assert(rejected.initialize(&error));
+        // Restored analyses are hashed in the background before being served.
+        assert(rejected.waitForArtifactVerification(30000));
         assert(rejected.submit(smallRequest(), &error).isEmpty());
         assert(error.contains(QStringLiteral("active terrain cell budget")));
         assert(rejected.terrainJobCapacity().value(QStringLiteral("outstanding")).toInt() == 0);
@@ -207,6 +261,8 @@ int main(int argc, char **argv)
         AnalysisService service(parallel);
         QString error;
         assert(service.initialize(&error));
+        // Restored analyses are hashed in the background before being served.
+        assert(service.waitForArtifactVerification(30000));
         const QString first = service.submit(smallRequest(), &error);
         const QString second = service.submit(smallRequest(), &error);
         assert(!first.isEmpty() && !second.isEmpty() && first != second && error.isEmpty());
@@ -275,6 +331,8 @@ int main(int argc, char **argv)
         AnalysisService service(configuration);
         QString error;
         assert(service.initialize(&error));
+        // Restored analyses are hashed in the background before being served.
+        assert(service.waitForArtifactVerification(30000));
         assert(!service.submit(AnalysisRequest(), &error).size());
         assert(!error.isEmpty());
         successful_id = service.submit(smallRequest(), &error);
@@ -626,6 +684,8 @@ int main(int argc, char **argv)
         AnalysisService limited(limited_config);
         QString error;
         assert(limited.initialize(&error));
+        // Restored analyses are hashed in the background before being served.
+        assert(limited.waitForArtifactVerification(30000));
         const QJsonObject saved = limited.job(successful_id);
         assert(saved.value(QStringLiteral("state")) == QStringLiteral("completed"));
         assert(saved.value(QStringLiteral("columns")).toInt() *
@@ -646,6 +706,8 @@ int main(int argc, char **argv)
         AnalysisService restored(configuration);
         QString error;
         assert(restored.initialize(&error));
+        // Restored analyses are hashed in the background before being served.
+        assert(restored.waitForArtifactVerification(30000));
         assert(restored.job(successful_id).value(QStringLiteral("stage_timings_ms")).toObject() ==
             saved_job_timings);
         assert(restored.job(successful_id).value(QStringLiteral("state")) ==
@@ -719,6 +781,8 @@ int main(int argc, char **argv)
             AnalysisService service(isolated);
             QString error;
             assert(service.initialize(&error));
+            // Restored analyses are hashed in the background before being served.
+            assert(service.waitForArtifactVerification(30000));
             id = service.submit(smallRequest(), &error);
             assert(!id.isEmpty() && error.isEmpty());
             waitForState(service, id, QStringLiteral("completed"));
@@ -747,6 +811,8 @@ int main(int argc, char **argv)
             AnalysisService service(isolated);
             QString error;
             assert(service.initialize(&error));
+            // Restored analyses are hashed in the background before being served.
+            assert(service.waitForArtifactVerification(30000));
             const QJsonObject status = service.job(id);
             assert(status.value(QStringLiteral("state")) == expected);
             if (!error_fragment.isEmpty())
@@ -838,6 +904,8 @@ int main(int argc, char **argv)
         AnalysisService service(configuration);
         QString error;
         assert(service.initialize(&error));
+        // Restored analyses are hashed in the background before being served.
+        assert(service.waitForArtifactVerification(30000));
         basin_job_id = service.submit(smallRequest(), &error);
         assert(!basin_job_id.isEmpty() && error.isEmpty());
         waitForState(service, basin_job_id, QStringLiteral("completed"));
@@ -1283,6 +1351,8 @@ int main(int argc, char **argv)
         AnalysisService restored(configuration);
         QString error;
         assert(restored.initialize(&error));
+        // Restored analyses are hashed in the background before being served.
+        assert(restored.waitForArtifactVerification(30000));
         assert(restored.job(basin_job_id).value(QStringLiteral("state")) == QStringLiteral("completed"));
         const QJsonObject saved_forcing = restored.coupledSimulationStatus(
             basin_job_id, scenario_coupled_simulation_id, &error);
@@ -1340,6 +1410,8 @@ int main(int argc, char **argv)
         AnalysisService service(configuration);
         QString error;
         assert(service.initialize(&error));
+        // Restored analyses are hashed in the background before being served.
+        assert(service.waitForArtifactVerification(30000));
         const QString job_id = service.submit(smallRequest(), &error);
         assert(!job_id.isEmpty() && error.isEmpty());
         waitForState(service, job_id, QStringLiteral("completed"));
@@ -1418,6 +1490,8 @@ int main(int argc, char **argv)
         AnalysisService service(configuration);
         QString error;
         assert(service.initialize(&error));
+        // Restored analyses are hashed in the background before being served.
+        assert(service.waitForArtifactVerification(30000));
         const QString id = service.submit(smallRequest(), &error);
         assert(!id.isEmpty());
         waitForState(service, id, QStringLiteral("failed"));
@@ -1433,6 +1507,9 @@ int main(int argc, char **argv)
         assert(rainfall_dir.isValid());
         ServiceConfig rainfall_config = configuration;
         rainfall_config.output_directory = rainfall_dir.path();
+        // The quota race below runs 12 synchronous creators at once; give
+        // each its own heavy-query slot so only the quota can refuse them.
+        rainfall_config.max_concurrent_heavy_queries = 16;
         rainfall_config.terrain_reader = [](const ElevationGrid &geometry, const QString &,
                                             const std::atomic<bool> &)
         {
@@ -1443,6 +1520,8 @@ int main(int argc, char **argv)
         AnalysisService service(rainfall_config);
         QString error;
         assert(service.initialize(&error));
+        // Restored analyses are hashed in the background before being served.
+        assert(service.waitForArtifactVerification(30000));
         const QString id = service.submit(smallRequest(), &error);
         assert(!id.isEmpty());
         waitForState(service, id, QStringLiteral("completed"));
@@ -1496,6 +1575,38 @@ int main(int argc, char **argv)
             .value(QStringLiteral("state")) == QStringLiteral("completed"));
         assert(service.rainfallScenarioTask(QStringLiteral("other"), task_id, &error).isEmpty());
         assert(error.contains(QStringLiteral("Unknown rainfall scenario task")));
+        // A manifest that could not be read back must never be committed:
+        // library callers are not bound by the HTTP body limit, and the
+        // stored GeoJSON geometry object is persisted as supplied.
+        {
+            QJsonObject padded = input;
+            const QString padding(1100000, QLatin1Char('x'));
+            if (padded.value(QStringLiteral("geometry")).isObject())
+            {
+                QJsonObject geometry = padded.value(QStringLiteral("geometry")).toObject();
+                geometry.insert(QStringLiteral("notes"), padding);
+                padded.insert(QStringLiteral("geometry"), geometry);
+            }
+            else
+                padded.insert(QStringLiteral("notes"), padding);
+            const qsizetype before = service.rainfallScenarios(id, &error).size();
+            assert(service.createRainfallScenario(id, padded, &error).isEmpty());
+            assert(error.contains(QStringLiteral("manifest exceeds 1 MiB")));
+            assert(service.rainfallScenarios(id, &error).size() == before);
+        }
+        // A damaged manifest is skipped by the listing instead of failing it.
+        {
+            const QString broken = QDir(rainfall_dir.path()).filePath(
+                id + QStringLiteral("/rainfall-scenarios/") +
+                QStringLiteral("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"));
+            assert(QDir().mkpath(broken));
+            QFile manifest(QDir(broken).filePath(QStringLiteral("scenario.json")));
+            assert(manifest.open(QIODevice::WriteOnly) && manifest.write("{not json") > 0);
+            manifest.close();
+            const QJsonArray listed = service.rainfallScenarios(id, &error);
+            assert(error.isEmpty() && listed.size() == 1);
+            assert(QDir(broken).removeRecursively());
+        }
         // An interrupted creation can leave a UUID directory without its
         // final manifest. It is not a committed scenario and must not consume
         // a quota slot on top of reservations held by active writers.
@@ -1551,6 +1662,8 @@ int main(int argc, char **argv)
         AnalysisService service(configuration);
         QString error;
         assert(service.initialize(&error));
+        // Restored analyses are hashed in the background before being served.
+        assert(service.waitForArtifactVerification(30000));
         const QString id = service.submit(smallRequest(), &error);
         assert(!id.isEmpty());
         assert(service.cancel(id));

@@ -65,7 +65,7 @@ double addToSubtree(std::uint64_t index, double water,
         const double remaining = std::max(0.0,
             cap - states[std::size_t(basin_index)].stored_in_subtree_m3);
         const double accepted = std::min(available, remaining);
-        Frame frame{basin_index, accepted, accepted};
+        Frame frame{basin_index, accepted, accepted, 0, {}, {}};
         if (weighted && !basin.child_indices.empty() && accepted > 0.0)
         {
             frame.weighted_children = basin.child_indices;
@@ -250,11 +250,10 @@ RunoffRedistribution redistributeWithAllocation(
         }
     }
 
-    AnalysisOptions dry_options;
-    dry_options.fill_depressions = false;
-    dry_options.breach_depressions = false;
-    dry_options.reject_interior_nodata = true;
-    const AnalysisResult flow = analyze(original_dem, dry_options, cancel_requested);
+    // Only the dry D8 links are needed; avoid analyze()'s priority flood and
+    // its additional per-cell rasters (about 44 bytes/cell of temporaries).
+    const std::vector<std::int64_t> dry_downstream =
+        dryD8Downstream(original_dem, true, cancel_requested);
     std::vector<std::uint8_t> incoming(std::size_t(cells), 0);
     std::vector<double> moving = runoff_volume_m3;
     RunoffRedistribution result;
@@ -265,7 +264,7 @@ RunoffRedistribution redistributeWithAllocation(
     {
         if ((cell & 4095U) == 0) checkCancellation(cancel_requested);
         result.generated_runoff_m3 += moving[std::size_t(cell)];
-        const std::int64_t next = flow.downstream[std::size_t(cell)];
+        const std::int64_t next = dry_downstream[std::size_t(cell)];
         if (next >= 0)
         {
             if (std::uint64_t(next) >= cells || ++incoming[std::size_t(next)] > 8)
@@ -281,7 +280,7 @@ RunoffRedistribution redistributeWithAllocation(
         if ((++visited & 4095U) == 0) checkCancellation(cancel_requested);
         const std::uint64_t cell = ready.front();
         ready.pop();
-        const std::int64_t next = flow.downstream[std::size_t(cell)];
+        const std::int64_t next = dry_downstream[std::size_t(cell)];
         const double water = moving[std::size_t(cell)];
         if (next >= 0)
         {

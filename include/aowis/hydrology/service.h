@@ -44,6 +44,8 @@ struct AnalysisRequest
     std::uint32_t maximum_breach_candidates = 2000;
 };
 
+struct CachedBasinHierarchy; // service-internal decoded hierarchy + UUID index
+
 // Used by standalone builds or tests to supply terrain without Map HTTP.
 // The callback runs on a worker thread and must be safe to invoke there.
 using TerrainReader = std::function<ElevationGrid(
@@ -71,6 +73,16 @@ struct ServiceConfig
     // proxy, NOT a guaranteed peak-RSS bound; rainfall/coupled tasks have
     // separate queues and can overlap terrain computations.
     std::uint64_t max_active_terrain_cells = 0;
+    // Synchronous whole-grid queries (channel networks, affected networks,
+    // basin storage/curves, uncached hierarchy loads, synchronous rainfall
+    // scenarios) each materialize full-grid arrays of up to 16 bytes/cell on
+    // the calling thread. At most this many run at once (1..16); further
+    // callers fail fast with "Heavy query capacity busy" instead of
+    // multiplying peak memory by the number of HTTP workers.
+    int max_concurrent_heavy_queries = 2;
+    // Decoded basin hierarchies (with a UUID index) kept in memory for
+    // basin listing/lookup, bounded by the total number of cached basins.
+    std::uint64_t hierarchy_cache_basins = 4000000;
     TerrainReader terrain_reader; // optional; defaults to Map HTTP/in-process adapter
 };
 
@@ -85,7 +97,15 @@ public:
     AnalysisService(const AnalysisService &) = delete;
     AnalysisService &operator=(const AnalysisService &) = delete;
 
+    // Removes catchment spools left behind by killed processes. SHA-256
+    // verification of restored analyses runs in the background; such a job
+    // reports "artifact_verification": "pending" and its data endpoints
+    // fail with "Analysis integrity verification in progress" until done.
     bool initialize(QString *error);
+    // Blocks until the background verification of restored analyses has
+    // finished (embedders wanting the former blocking startup call this right
+    // after initialize()). Returns false on timeout; -1 waits indefinitely.
+    bool waitForArtifactVerification(int timeout_ms = -1);
     QString submit(const AnalysisRequest &request, QString *error);
     QJsonObject job(const QString &id) const;
     QJsonArray jobs() const;
@@ -223,7 +243,7 @@ private:
         QString analysis_id;
         QString state = QStringLiteral("queued");
         QString error;
-        QJsonObject request;
+        QJsonObject request; // released once the worker finishes; on disk in the manifest
         std::atomic<bool> cancelled {false};
     };
     QJsonObject createRainfallScenarioImpl(const QString &id, const QJsonObject &request,
@@ -247,6 +267,13 @@ private:
                                            const std::atomic<bool> *cancel_requested,
                                            QString *error) const;
     QSharedPointer<Job> findJob(const QString &id) const;
+    // Completed AND integrity-verified job, or null with an error message.
+    QSharedPointer<Job> completedJob(const QString &id, QString *error) const;
+    // Decoded hierarchy with UUID index from the bounded cache. A cache miss
+    // takes a heavy-query slot while decoding. Throws on failure or when busy.
+    std::shared_ptr<const CachedBasinHierarchy> cachedHierarchy(const QSharedPointer<Job> &job) const;
+    void verifyRestoredArtifacts();
+    void pruneCoupledTasksLocked();
     QJsonObject jobJson(const QSharedPointer<Job> &job) const;
     void restoreJobs();
     void runJob(const QSharedPointer<Job> &job);
@@ -287,7 +314,17 @@ private:
     QThreadPool redistribution_workers;
     mutable QMutex coupled_tasks_mutex;
     QHash<QString, QSharedPointer<CoupledTask>> coupled_tasks;
+    QQueue<QString> coupled_task_order; // bounded terminal-status retention
     QThreadPool coupled_workers;
+    // Bounds concurrent synchronous whole-grid queries; see ServiceConfig.
+    mutable QSemaphore heavy_query_slots {0}; // released to the configured count in initialize()
+    mutable QMutex hierarchy_cache_mutex;
+    mutable QHash<QString, std::shared_ptr<const CachedBasinHierarchy>> hierarchy_cache;
+    mutable QQueue<QString> hierarchy_cache_order; // least recently used first
+    mutable std::uint64_t hierarchy_cache_size = 0;
+    bool initialized = false;
+    std::atomic<bool> stopping {false};
+    QThreadPool verification_workers;
     QHash<QString, QSharedPointer<Job>> job_map;
     QQueue<QSharedPointer<Job>> terrain_queue; // cancelable before worker dispatch
     int terrain_worker_slots = 0; // active runnable slots, guarded by jobs_mutex

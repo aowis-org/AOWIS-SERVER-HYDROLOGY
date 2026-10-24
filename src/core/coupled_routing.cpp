@@ -57,6 +57,34 @@ double levelAt(const SpillReservoirCurve &curve, double volume)
         (upper->water_level_m - lower.water_level_m);
 }
 
+// Largest transfer x in [0, limit] from a donor holding donor_volume (before
+// this transfer) to a receiver holding receiver_volume, such that the donor
+// stage does not fall below the receiver stage. The stage difference is
+// monotonically decreasing in x, so bisection on the piecewise-linear curves
+// converges to floating-point resolution.
+double equalizingTransfer(const SpillReservoirCurve &donor, double donor_volume,
+                          const SpillReservoirCurve &receiver, double receiver_volume,
+                          double limit)
+{
+    const auto difference = [&](double transfer)
+    {
+        return levelAt(donor, donor_volume - transfer) -
+               levelAt(receiver, receiver_volume + transfer);
+    };
+    if (limit <= 0.0 || difference(0.0) <= 0.0) return 0.0;
+    if (difference(limit) >= 0.0) return limit;
+    double low = 0.0;
+    double high = limit;
+    for (int iteration = 0; iteration < 80 && high - low > 0.0; ++iteration)
+    {
+        const double middle = 0.5 * (low + high);
+        if (middle <= low || middle >= high) break;
+        if (difference(middle) >= 0.0) low = middle;
+        else high = middle;
+    }
+    return low;
+}
+
 // Free broad-crested outlet rating (same rectangular critical-flow formula
 // as rateBroadCrestedSpill). It is deliberately NOT a DEM junction: boundary
 // geometry and the permanently free downstream condition are supplied.
@@ -242,6 +270,7 @@ CoupledRoutingResult routeCoupledReservoirsWithOutlets(
                                         cumulative_outflow));
     std::vector<double> changes(reservoirs.size(), 0.0);
     std::vector<double> proposed(connections.size(), 0.0);
+    std::vector<double> allowed_transfer(connections.size(), 0.0);
     std::vector<double> proposed_outflow(boundary_outlets.size(), 0.0);
     std::vector<double> candidate(storage.size(), 0.0);
     std::vector<double> current_levels(storage.size(), 0.0);
@@ -300,10 +329,63 @@ CoupledRoutingResult routeCoupledReservoirsWithOutlets(
                             "Nonfinite external boundary transfer volume");
                     changes[reservoir_index] -= proposed_outflow[o];
                 }
+                // Equalization limiter for internal controls. Rates are
+                // evaluated from START stages, but within one substep a
+                // control can pass at most the volume that equalizes the two
+                // stages it connects (given all other simultaneous changes):
+                // the exact stage ODE approaches but never crosses equal
+                // stages. Without this bound an orifice (Q ~ sqrt(head))
+                // forces explicit substeps ~ sqrt(head) near equalization and
+                // exhausts the substep budget as soon as two connected
+                // reservoirs approach a common level. Limiting is symmetric,
+                // so water balance is unaffected; every limited transfer is
+                // counted in equalization_limited_transfers. Crest and curve
+                // limits are deliberately NOT clipped: they still reject and
+                // subdivide the substep. A few passes settle interactions of
+                // controls sharing a reservoir; anything left unresolved is
+                // still caught by the rejection checks below.
+                for (std::size_t i = 0; i < reservoirs.size(); ++i)
+                    candidate[i] = storage[i] + changes[i];
+                std::uint64_t limited_in_step = 0;
+                for (int pass = 0; pass < 4; ++pass)
+                {
+                    // Jacobi update: every limit is evaluated against the SAME
+                    // candidate state and applied together, so the result does
+                    // not depend on the order in which connections are listed.
+                    bool limited = false;
+                    for (std::size_t c = 0; c < connections.size(); ++c)
+                    {
+                        allowed_transfer[c] = proposed[c];
+                        if (proposed[c] == 0.0) continue;
+                        const ConnectionIndices &ends = indices[c];
+                        const bool forward = proposed[c] > 0.0;
+                        const std::size_t donor = forward ? ends.first : ends.second;
+                        const std::size_t receiver = forward ? ends.second : ends.first;
+                        const double volume = std::abs(proposed[c]);
+                        const double allowed = equalizingTransfer(reservoirs[donor].curve,
+                            candidate[donor] + volume, reservoirs[receiver].curve,
+                            candidate[receiver] - volume, volume);
+                        if (allowed < volume)
+                        {
+                            allowed_transfer[c] = forward ? allowed : -allowed;
+                            limited = true;
+                        }
+                    }
+                    if (!limited) break;
+                    for (std::size_t c = 0; c < connections.size(); ++c)
+                    {
+                        if (allowed_transfer[c] == proposed[c]) continue;
+                        const ConnectionIndices &ends = indices[c];
+                        const double reduction = proposed[c] - allowed_transfer[c];
+                        candidate[ends.first] += reduction;
+                        candidate[ends.second] -= reduction;
+                        proposed[c] = allowed_transfer[c];
+                        ++limited_in_step;
+                    }
+                }
                 bool acceptable = true;
                 for (std::size_t i = 0; i < reservoirs.size(); ++i)
                 {
-                    candidate[i] = storage[i] + changes[i];
                     if (!std::isfinite(candidate[i]) || candidate[i] < 0.0 ||
                         candidate[i] > reservoirs[i].curve.points.back().stored_volume_m3)
                     {
@@ -318,18 +400,24 @@ CoupledRoutingResult routeCoupledReservoirsWithOutlets(
                     {
                         if (proposed[c] == 0.0) continue;
                         const ConnectionIndices &ends = indices[c];
-                        const double old_difference = current_levels[ends.first] - current_levels[ends.second];
-                        const double new_difference = candidate_levels[ends.first] - candidate_levels[ends.second];
+                        const bool forward = proposed[c] > 0.0;
+                        const std::size_t donor = forward ? ends.first : ends.second;
+                        const std::size_t receiver = forward ? ends.second : ends.first;
                         const double tolerance = 1e-12 * std::max({1.0, std::abs(current_levels[ends.first]),
                                                         std::abs(current_levels[ends.second])});
-                        if ((old_difference > 0.0 && new_difference < -tolerance) ||
-                            (old_difference < 0.0 && new_difference > tolerance))
+                        // Reject only an overshoot caused by THIS control: the
+                        // receiver may legitimately end higher than the donor
+                        // because of its own inflow or other controls.
+                        const double without_this = levelAt(reservoirs[donor].curve,
+                                candidate[donor] + std::abs(proposed[c])) -
+                            levelAt(reservoirs[receiver].curve,
+                                candidate[receiver] - std::abs(proposed[c]));
+                        const double with_this = candidate_levels[donor] - candidate_levels[receiver];
+                        if (without_this >= 0.0 && with_this < -tolerance)
                             acceptable = false;
                         if (connections[c].type == CoupledControlType::CalibratedBroadCrestedWeir)
                         {
-                            const double donor_level = proposed[c] > 0.0 ?
-                                candidate_levels[ends.first] : candidate_levels[ends.second];
-                            if (donor_level + tolerance < connections[c].weir.crest_elevation_m)
+                            if (candidate_levels[donor] + tolerance < connections[c].weir.crest_elevation_m)
                                 acceptable = false;
                         }
                         else
@@ -376,6 +464,7 @@ CoupledRoutingResult routeCoupledReservoirsWithOutlets(
                     require(new_remaining < remaining, "Coupled timestep made no progress");
                     remaining = new_remaining;
                     ++result.accepted_substeps;
+                    result.equalization_limited_transfers += limited_in_step;
                     break;
                 }
                 require(result.accepted_substeps + result.rejected_substeps < options.maximum_substeps,

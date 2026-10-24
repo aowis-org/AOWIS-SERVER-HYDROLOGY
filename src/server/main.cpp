@@ -11,6 +11,15 @@
 #include <QStandardPaths>
 #include <QTextStream>
 
+#include <algorithm>
+#include <cstdlib>
+#include <thread>
+
+#if defined(Q_OS_UNIX)
+#include <csignal>
+#include <pthread.h>
+#endif
+
 
 namespace
 {
@@ -39,6 +48,18 @@ http_max_queued_requests=32
 http_read_timeout_s=15
 http_write_timeout_s=30
 http_keep_alive_timeout_s=5
+; Synchronous whole-grid queries (channel networks, basin storage, uncached
+; basin hierarchies, synchronous rainfall scenarios) allowed at once (1..16).
+; Each can hold up to 16 bytes per DEM cell; others get HTTP 429.
+max_concurrent_heavy_queries=2
+; Decoded basin hierarchies kept in memory, as a total basin count.
+hierarchy_cache_basins=4000000
+; Optional shared secret (16..256 printable ASCII characters). When set, all
+; routes except GET /status require "X-API-Key: <key>" or
+; "Authorization: Bearer <key>".
+api_key=
+; A non-loopback listen_address requires api_key unless this is true.
+allow_unauthenticated_remote=false
 
 [terrain]
 dataset=copernicus-glo30
@@ -53,6 +74,35 @@ max_concurrent_requests=4
 ; to AOWIS::HydrologyService; the executable always uses Map REST.
 )INI");
 }
+
+#if defined(Q_OS_UNIX)
+// SIGINT/SIGTERM are blocked in every thread (the mask is inherited by
+// threads created later) and received synchronously by one watcher thread,
+// which asks the Qt event loop to quit. main() then returns normally, so the
+// server and the service shut down in order: HTTP stops, jobs are canceled
+// and joined, and the transient catchment spool is removed. A second signal
+// during a stuck shutdown terminates immediately.
+void blockTerminationSignals(sigset_t *set)
+{
+    sigemptyset(set);
+    sigaddset(set, SIGINT);
+    sigaddset(set, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, set, nullptr);
+}
+
+void startTerminationWatcher(const sigset_t &set)
+{
+    std::thread([set]()
+    {
+        int received = 0;
+        if (sigwait(&set, &received) != 0) return;
+        QMetaObject::invokeMethod(QCoreApplication::instance(), &QCoreApplication::quit,
+                                  Qt::QueuedConnection);
+        if (sigwait(&set, &received) == 0)
+            std::_Exit(128 + received);
+    }).detach();
+}
+#endif
 
 bool loadConfig(const QString &file_path, bool explicitly_requested,
                 Aowis::Hydrology::ServerConfig *config, QString *error)
@@ -155,6 +205,45 @@ bool loadConfig(const QString &file_path, bool explicitly_requested,
         !readHttpInt(QStringLiteral("http_keep_alive_timeout_s"), 5, 1, 120,
                      &config->http_keep_alive_timeout_s))
         return false;
+    if (!readHttpInt(QStringLiteral("max_concurrent_heavy_queries"), 2, 1, 16,
+                     &config->max_concurrent_heavy_queries))
+        return false;
+    const qulonglong hierarchy_basins = settings.value(
+        QStringLiteral("server/hierarchy_cache_basins"), 4000000).toString().toULongLong(&valid);
+    if (!valid || hierarchy_basins > 100000000ULL)
+    {
+        *error = QStringLiteral("server/hierarchy_cache_basins must be between 0 and 100000000");
+        return false;
+    }
+    config->hierarchy_cache_basins = std::uint64_t(hierarchy_basins);
+    const QString api_key = settings.value(QStringLiteral("server/api_key")).toString();
+    if (!api_key.isEmpty() &&
+        (api_key.size() < 16 || api_key.size() > 256 ||
+         !std::all_of(api_key.cbegin(), api_key.cend(), [](QChar character)
+             { return character.unicode() > 0x20 && character.unicode() < 0x7f; })))
+    {
+        *error = QStringLiteral("server/api_key must be 16..256 printable ASCII characters without spaces");
+        return false;
+    }
+    config->api_key = api_key.toLatin1();
+    const QString allow_remote = settings.value(
+        QStringLiteral("server/allow_unauthenticated_remote"), QStringLiteral("false"))
+        .toString().trimmed().toLower();
+    if (allow_remote != QStringLiteral("true") && allow_remote != QStringLiteral("false"))
+    {
+        *error = QStringLiteral("server/allow_unauthenticated_remote must be true or false");
+        return false;
+    }
+    // The HTTP API can submit, cancel and read every analysis. Never expose
+    // it beyond this host without a key unless that is explicitly intended
+    // (for example behind an authenticating reverse proxy).
+    if (!config->listen_address.isLoopback() && config->api_key.isEmpty() &&
+        allow_remote != QStringLiteral("true"))
+    {
+        *error = QStringLiteral("Non-loopback server/listen_address requires server/api_key "
+                                "(or allow_unauthenticated_remote=true behind an authenticating proxy)");
+        return false;
+    }
     const QString output_path = settings.value(QStringLiteral("server/output_directory")).toString().trimmed();
     if (!output_path.isEmpty())
         config->output_directory = QFileInfo(output_path).isAbsolute()
@@ -217,6 +306,10 @@ bool loadConfig(const QString &file_path, bool explicitly_requested,
 
 int main(int argc, char *argv[])
 {
+#if defined(Q_OS_UNIX)
+    sigset_t termination_signals;
+    blockTerminationSignals(&termination_signals);
+#endif
     QCoreApplication application(argc, argv);
     QCoreApplication::setApplicationName(QStringLiteral("aowis-server-hydrology"));
     QCommandLineParser parser;
@@ -313,6 +406,9 @@ int main(int argc, char *argv[])
         output << "Hydrology configuration valid: " << config_path << '\n';
         return 0;
     }
+#if defined(Q_OS_UNIX)
+    startTerminationWatcher(termination_signals);
+#endif
     Aowis::Hydrology::Server server(config);
     if (!server.start(&error))
     {
@@ -322,5 +418,8 @@ int main(int argc, char *argv[])
     output << "Hydrology server listening on " << config.listen_address.toString()
            << ':' << config.port << '\n';
     output.flush();
-    return application.exec();
+    const int status = application.exec();
+    output << "Hydrology server stopping\n";
+    output.flush();
+    return status;
 }

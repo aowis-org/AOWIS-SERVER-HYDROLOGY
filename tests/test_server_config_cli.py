@@ -3,7 +3,12 @@
 
 import os
 from pathlib import Path
+import signal
+import socket
 import subprocess
+import time
+import urllib.error
+import urllib.request
 import sys
 import tempfile
 import unittest
@@ -143,6 +148,86 @@ class ServerConfigurationCliTests(unittest.TestCase):
                           "http_write_timeout_s=30\n"
                           "http_keep_alive_timeout_s=3\n", encoding="utf-8")
         self.run_cli("--config", target, "--check-config")
+
+    def test_heavy_query_and_cache_limits(self):
+        target = self.root / "heavy.ini"
+        for setting, key in (
+            ("max_concurrent_heavy_queries=0", "max_concurrent_heavy_queries"),
+            ("max_concurrent_heavy_queries=17", "max_concurrent_heavy_queries"),
+            ("hierarchy_cache_basins=-1", "hierarchy_cache_basins"),
+            ("hierarchy_cache_basins=100000001", "hierarchy_cache_basins"),
+        ):
+            with self.subTest(setting=setting):
+                target.write_text("[server]\n" + setting + "\n", encoding="utf-8")
+                self.assertIn(key, self.run_cli("--config", target,
+                                               "--check-config", success=False).stderr)
+        target.write_text("[server]\nmax_concurrent_heavy_queries=16\n"
+                          "hierarchy_cache_basins=0\n", encoding="utf-8")
+        self.run_cli("--config", target, "--check-config")
+
+    def test_remote_listen_requires_api_key(self):
+        target = self.root / "remote.ini"
+        target.write_text("[server]\nlisten_address=0.0.0.0\n", encoding="utf-8")
+        self.assertIn("api_key", self.run_cli("--config", target, "--check-config",
+                                              success=False).stderr)
+        for setting in ("api_key=short", "api_key=contains a space123",
+                        "allow_unauthenticated_remote=maybe"):
+            with self.subTest(setting=setting):
+                target.write_text("[server]\n" + setting + "\n", encoding="utf-8")
+                self.run_cli("--config", target, "--check-config", success=False)
+        target.write_text("[server]\nlisten_address=0.0.0.0\n"
+                          "api_key=0123456789abcdef\n", encoding="utf-8")
+        self.run_cli("--config", target, "--check-config")
+        target.write_text("[server]\nlisten_address=0.0.0.0\n"
+                          "allow_unauthenticated_remote=true\n", encoding="utf-8")
+        self.run_cli("--config", target, "--check-config")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "POSIX signals")
+    def test_api_key_and_graceful_sigterm_shutdown(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        output = self.root / "analyses"
+        key = "0123456789abcdef-key"
+        target = self.root / "runtime.ini"
+        target.write_text(f"[server]\nport={port}\noutput_directory={output}\n"
+                          f"api_key={key}\n[terrain]\nmap_url=http://127.0.0.1:9/\n",
+                          encoding="utf-8")
+        process = subprocess.Popen([str(self.executable), "--config", str(target)],
+                                   env=self.environment, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertIn("listening", process.stdout.readline())
+            base = f"http://127.0.0.1:{port}"
+
+            # Never route loopback test requests through an environment proxy.
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+            def status(path, headers=None):
+                request = urllib.request.Request(base + path, headers=headers or {})
+                try:
+                    with opener.open(request, timeout=10) as response:
+                        return response.status
+                except urllib.error.HTTPError as error:
+                    return error.code
+
+            self.assertEqual(status("/status"), 200)
+            self.assertEqual(status("/v1/jobs"), 401)
+            self.assertEqual(status("/v1/jobs", {"X-API-Key": "wrong-key-0123456"}), 401)
+            self.assertEqual(status("/v1/jobs", {"X-API-Key": key}), 200)
+            self.assertEqual(status("/v1/jobs", {"Authorization": "Bearer " + key}), 200)
+            spools = list(output.glob(".catchment-tasks-*"))
+            self.assertEqual(len(spools), 1)
+            self.assertIn(f"-{process.pid}-", spools[0].name)
+            process.send_signal(signal.SIGTERM)
+            self.assertEqual(process.wait(timeout=30), 0)
+            self.assertEqual(list(output.glob(".catchment-tasks-*")), [])
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            process.stdout.close()
+            process.stderr.close()
 
     def test_equals_form_is_compatible(self):
         target = self.root / "equals" / "custom.ini"

@@ -4,6 +4,7 @@
 // Minimal typed bridge from the service's Qt value types to cpp-httplib.
 // There is no Qt HttpServer dependency and no QObjects cross HTTP threads.
 #include <httplib.h>
+#include "http_status.h"
 #include <QByteArray>
 #include <QString>
 #include <QUrl>
@@ -33,10 +34,7 @@ private:
 class HttpResponse
 {
 public:
-    enum class StatusCode : int {
-        Ok = 200, Created = 201, Accepted = 202, BadRequest = 400,
-        NotFound = 404, Conflict = 409, InternalServerError = 500
-    };
+    using StatusCode = HttpStatus;
     HttpResponse(QByteArray mime, QByteArray body,
                  StatusCode status = StatusCode::Ok)
         : mime(std::move(mime)), data(std::move(body)), status(int(status)) {}

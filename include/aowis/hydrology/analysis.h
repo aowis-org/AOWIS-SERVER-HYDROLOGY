@@ -76,6 +76,15 @@ AnalysisResult analyze(const ElevationGrid &grid,
                        const AnalysisOptions &options = {},
                        const std::atomic<bool> *cancel_requested = nullptr);
 
+// Dry D8 links of the UNMODIFIED DEM (no fill, no breach), identical to
+// analyze(grid, {fill_depressions=false, breach_depressions=false,
+// reject_interior_nodata}).downstream, but without the priority flood and the
+// seven additional per-cell rasters analyze() allocates. Used by static
+// redistribution, travel-time forcing and breach candidate detection.
+std::vector<std::int64_t> dryD8Downstream(const ElevationGrid &grid,
+                                          bool reject_interior_nodata = true,
+                                          const std::atomic<bool> *cancel_requested = nullptr);
+
 // Returns one byte per cell; 1 for contributing upstream cells (including the
 // selected outlet), zero otherwise. This operates on the complete analysis
 // domain, not only the viewport or the user's visible polygon.

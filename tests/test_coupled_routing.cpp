@@ -143,7 +143,10 @@ int main()
         triple, {left, right}, {{200.0, {0.0, 0.0, 0.0}}}, coarse);
     const CoupledRoutingResult reversed = routeCoupledReservoirs(
         triple, {right, left}, {{200.0, {0.0, 0.0, 0.0}}}, coarse);
-    assert(normal.rejected_substeps > 0);
+    // The coarse step is detected either as a rejected substep or as an
+    // equalization-limited transfer; both remain order independent.
+    assert(normal.rejected_substeps + normal.equalization_limited_transfers > 0);
+    assert(normal.equalization_limited_transfers == reversed.equalization_limited_transfers);
     for (std::size_t i = 0; i < triple.size(); ++i)
         assert(near(normal.snapshots.back().storage_m3[i], reversed.snapshots.back().storage_m3[i]));
     assert(near(normal.snapshots.back().total_storage_m3, 3800.0));
@@ -229,4 +232,60 @@ int main()
         {reservoir(42, 100.0)}, {}, {{1.0, {12.0}}, {2.0, {25.0}}}, options);
     assert(near(standalone.snapshots.back().storage_m3[0], 137.0));
     assert(near(standalone.snapshots.back().cumulative_inflow_m3, 37.0));
+
+    // Regression: an orifice (Q ~ sqrt(head)) previously exhausted the
+    // substep budget as soon as both stages approached equality (about 21 s
+    // for this pair), because explicit substeps had to shrink with
+    // sqrt(head). Long runs must now complete with full substeps and settle
+    // at the common level without crossing it.
+    {
+        const CoupledRoutingOptions defaults;
+        for (const double duration : {60.0, 3600.0, 86400.0})
+        {
+            const CoupledRoutingResult settled = routeCoupledReservoirs(
+                {reservoir(10, 1300.0), reservoir(20, 1100.0)}, {orifice(10, 20)},
+                {{duration, {0.0, 0.0}}}, defaults);
+            const CoupledRoutingSnapshot &last = settled.snapshots.back();
+            assert(settled.accepted_substeps <= std::uint64_t(duration) + 1);
+            assert(settled.equalization_limited_transfers > 0);
+            assert(near(last.water_level_m[0], last.water_level_m[1], 1e-9));
+            assert(near(last.storage_m3[0], 1200.0, 1e-9));
+            assert(near(last.total_storage_m3, 2400.0));
+            assert(std::abs(last.mass_balance_error_m3) < 1e-7);
+        }
+
+        // Before equalization the limiter is inactive and the scheme still
+        // converges to the analytic solution. Equal 100 m2 reservoirs give
+        // d(head)/dt = -2 C sqrt(head) / A, so sqrt(head) falls linearly.
+        const double c = rateFullySubmergedOrifice(orifice(10, 20).junction,
+            orifice(10, 20).orifice, 12.0, 11.0).signed_discharge_m3_s;
+        const double analytic_head = std::pow(std::sqrt(2.0) - c * 10.0 / 100.0, 2.0);
+        CoupledRoutingOptions fine_steps;
+        fine_steps.maximum_substep_seconds = 0.001;
+        fine_steps.maximum_substeps = 100000;
+        const CoupledRoutingResult early = routeCoupledReservoirs(
+            {reservoir(10, 1300.0), reservoir(20, 1100.0)}, {orifice(10, 20)},
+            {{10.0, {0.0, 0.0}}}, fine_steps);
+        const double head = early.snapshots.back().water_level_m[0] -
+                            early.snapshots.back().water_level_m[1];
+        assert(early.equalization_limited_transfers == 0);
+        assert(std::abs(head - analytic_head) < 2e-3);
+
+        // Equalized reservoirs with unequal inflow: the receiver may rise
+        // above the donor because of its own inflow. That is physical and
+        // must not trigger an endless rejection cascade (weir and orifice).
+        for (const CoupledConnection &control : {orifice(10, 20), weir(10, 20)})
+        {
+            const double start = control.type == CoupledControlType::CalibratedBroadCrestedWeir
+                ? 1100.0 : 1200.0;
+            const CoupledRoutingResult wet = routeCoupledReservoirs(
+                {reservoir(10, start), reservoir(20, start)}, {control},
+                {{3600.0, {0.0, 400.0}}, {3600.0, {0.0, 0.0}}}, defaults);
+            const CoupledRoutingSnapshot &end = wet.snapshots.back();
+            assert(wet.accepted_substeps <= 7201);
+            assert(near(end.total_storage_m3, 2.0 * start + 400.0));
+            assert(std::abs(end.mass_balance_error_m3) < 1e-7);
+            assert(end.connection_transfer_m3[0] < 0.0); // flows back towards 10
+        }
+    }
 }

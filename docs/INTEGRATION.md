@@ -107,6 +107,20 @@ uses Map REST; optional GDAL GeoTIFF readers are for testing/development.
   scenario creation remains supported. Scenario-count admission is atomic for
   concurrent library callers. Task status is transient, persisted scenario
   archives are not.
+- Synchronous whole-grid queries share `ServiceConfig::max_concurrent_heavy_queries`
+  slots (1–16, default 2): channel networks, affected networks, basin storage
+  and curves, uncached hierarchy loads and rainfall scenario creation. A
+  synchronous caller fails fast with `Heavy query capacity busy; retry later`
+  (HTTP 429); asynchronous rainfall tasks wait cancellably. Decoded
+  hierarchies plus their UUID index are cached up to
+  `ServiceConfig::hierarchy_cache_basins` basins (least recently used first).
+- `initialize()` checks restored analyses structurally and hashes their
+  artifacts in a background worker. Until that finishes such a job reports
+  `artifact_verification: "pending"` and data methods return
+  `Analysis integrity verification in progress; retry later`. Embedders that
+  prefer the former blocking startup call `waitForArtifactVerification()`
+  right after `initialize()`. Catchment spools are named after the owning PID;
+  `initialize()` removes spools of processes that no longer exist.
 - Active terrain-worker cells are bounded independently by
   `max_active_terrain_cells` (0 inherits `max_cells`, or explicit 4..400000000).
   The service checks individual job feasibility before creating a job folder

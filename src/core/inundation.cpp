@@ -40,6 +40,7 @@ struct Cell
 std::vector<Cell> connectedBelowSpill(
     const ElevationGrid &dem, const DepressionBasin &basin,
     std::vector<std::uint32_t> &visited, std::uint32_t stamp,
+    std::vector<double> &row_areas,
     std::uint64_t *budget, const std::atomic<bool> *cancel_requested)
 {
     const std::uint64_t count = std::uint64_t(dem.columns) * dem.rows;
@@ -59,8 +60,12 @@ std::vector<Cell> connectedBelowSpill(
         const std::uint64_t index = ready.front();
         ready.pop();
         const double height = dem.elevations_m[std::size_t(index)];
-        const double area = rasterRowCellAreaM2(dem.geometry, dem.columns,
-            std::uint32_t(index / dem.columns));
+        // Geodesic cell areas are constant along a row and expensive
+        // (~2 us each); evaluate each row once for the whole reconstruction.
+        double &area = row_areas[std::size_t(index / dem.columns)];
+        if (std::isnan(area))
+            area = rasterRowCellAreaM2(dem.geometry, dem.columns,
+                std::uint32_t(index / dem.columns));
         result.push_back({index, height, area});
         const std::int64_t x = std::int64_t(index % dem.columns);
         const std::int64_t y = std::int64_t(index / dem.columns);
@@ -235,6 +240,8 @@ StaticInundation reconstructStaticInundation(
         throw std::runtime_error("Static inundation raster exceeds cell budget");
     result.depth_m.assign(std::size_t(count), 0.0f);
     std::vector<std::uint32_t> visited(std::size_t(count), 0);
+    std::vector<double> row_areas(std::size_t(original_dem.rows),
+                                  std::numeric_limits<double>::quiet_NaN());
     std::uint32_t stamp = 0;
     std::uint64_t budget = maximum_visited_cells;
     for (const std::uint64_t root_index : active_basins)
@@ -246,7 +253,7 @@ StaticInundation reconstructStaticInundation(
         const DepressionBasin &basin = hierarchy.basins[std::size_t(root_index)];
         const BasinRedistributionState &state = redistribution.basins[std::size_t(root_index)];
         std::vector<Cell> cells = connectedBelowSpill(original_dem, basin, visited, stamp,
-            &budget, cancel_requested);
+            row_areas, &budget, cancel_requested);
         double capacity = 0.0;
         for (const Cell &cell : cells)
             capacity += (basin.spill_elevation_m - cell.height) * cell.area;

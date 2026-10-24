@@ -152,11 +152,10 @@ TravelTimeRunoffForcing travelTimeInflowsFromRaster(
         }
     }
 
-    AnalysisOptions dry_options;
-    dry_options.fill_depressions = false;
-    dry_options.breach_depressions = false;
-    dry_options.reject_interior_nodata = true;
-    const AnalysisResult flow = analyze(original_dem, dry_options, cancel_requested);
+    // Only the dry D8 links are needed; avoid analyze()'s priority flood and
+    // its additional per-cell rasters (about 44 bytes/cell of temporaries).
+    const std::vector<std::int64_t> dry_downstream =
+        dryD8Downstream(original_dem, true, cancel_requested);
 
     // Reversed topological order propagates each terminal and path distance
     // back to every contributing cell without quadratic per-source tracing.
@@ -166,7 +165,7 @@ TravelTimeRunoffForcing travelTimeInflowsFromRaster(
     for (std::uint64_t cell = 0; cell < cell_count; ++cell)
     {
         if ((cell & 4095U) == 0) checkCancellation(cancel_requested);
-        const std::int64_t next = flow.downstream[std::size_t(cell)];
+        const std::int64_t next = dry_downstream[std::size_t(cell)];
         if (next >= 0)
         {
             require(std::uint64_t(next) < cell_count &&
@@ -182,7 +181,7 @@ TravelTimeRunoffForcing travelTimeInflowsFromRaster(
         const std::uint64_t cell = ready.front();
         ready.pop();
         order.push_back(cell);
-        const std::int64_t next = flow.downstream[std::size_t(cell)];
+        const std::int64_t next = dry_downstream[std::size_t(cell)];
         if (next >= 0 && --incoming[std::size_t(next)] == 0)
             ready.push(std::uint64_t(next));
     }
@@ -210,7 +209,7 @@ TravelTimeRunoffForcing travelTimeInflowsFromRaster(
     {
         if ((position & 4095U) == 0) checkCancellation(cancel_requested);
         const std::uint64_t cell = order[position - 1];
-        const std::int64_t next = flow.downstream[std::size_t(cell)];
+        const std::int64_t next = dry_downstream[std::size_t(cell)];
         if (next < 0)
         {
             if (boundary(original_dem, cell)) terminal[std::size_t(cell)] = -1;

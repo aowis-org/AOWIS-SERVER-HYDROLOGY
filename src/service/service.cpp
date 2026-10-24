@@ -5,6 +5,9 @@
 #include <aowis/hydrology/redistribution_archive.h>
 #include <aowis/hydrology/spatial_queries.h>
 
+#include "service_limits.h"
+
+#include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QByteArrayView>
 #include <QDir>
@@ -33,7 +36,10 @@
 #include <utility>
 
 #if defined(Q_OS_UNIX)
+#include <cerrno>
+#include <csignal>
 #include <sys/stat.h>
+#include <sys/types.h>
 #endif
 
 namespace Aowis::Hydrology
@@ -60,6 +66,10 @@ struct AnalysisService::Job
     QJsonObject stage_timings_ms;
     QJsonObject terrain_fetch_details;
     QJsonObject artifact_integrity;
+    // "verified" (published or hashed in this process), "pending" (restored
+    // with a SHA-256 inventory, background check not finished) or "legacy"
+    // (pre-inventory analysis: size and hierarchy checksum only).
+    QString artifact_verification = QStringLiteral("verified");
     std::chrono::steady_clock::time_point queued_at{};
     std::atomic<bool> cancelled {false};
 };
@@ -95,6 +105,14 @@ struct AnalysisService::RedistributionTask
     std::atomic<bool> cancelled {false};
 };
 
+// Immutable decoded hierarchy of one completed analysis plus the UUIDv5 ->
+// position index, so a basin lookup is O(1) instead of one SHA-1 per basin.
+struct CachedBasinHierarchy
+{
+    DepressionHierarchy hierarchy;
+    QHash<QString, std::uint64_t> index_by_uuid;
+};
+
 namespace
 {
 bool safeJobId(const QString &id)
@@ -104,6 +122,80 @@ bool safeJobId(const QString &id)
         {
             return character.isLetterOrNumber() || character == QChar('-');
         });
+}
+
+const QString HeavyQueryBusy = QStringLiteral("Heavy query capacity busy; retry later");
+const QString VerificationPending =
+    QStringLiteral("Analysis integrity verification in progress; retry later");
+
+// Admission for synchronous whole-grid queries. A synchronous caller (no
+// cancellation flag) fails fast when all slots are taken; a cancellable
+// background worker waits for a slot.
+class HeavyQuerySlot final
+{
+public:
+    HeavyQuerySlot(QSemaphore &semaphore, const std::atomic<bool> *cancel_requested)
+        : admission(semaphore)
+    {
+        if (cancel_requested == nullptr)
+        {
+            this->held = this->admission.tryAcquire();
+            return;
+        }
+        while (!cancel_requested->load())
+        {
+            if (this->admission.tryAcquire(1, 50))
+            {
+                this->held = true;
+                return;
+            }
+        }
+    }
+    ~HeavyQuerySlot()
+    {
+        if (this->held) this->admission.release();
+    }
+    HeavyQuerySlot(const HeavyQuerySlot &) = delete;
+    HeavyQuerySlot &operator=(const HeavyQuerySlot &) = delete;
+    bool acquired() const { return this->held; }
+
+private:
+    QSemaphore &admission;
+    bool held = false;
+};
+
+// Remove catchment spools left behind by processes that no longer exist.
+// ".catchment-tasks-<pid>-XXXXXX" belongs to <pid>; it is removed only when
+// that process is gone. Spools of older versions carry no PID and are removed
+// once untouched for a day. Only transient task masks are ever stored there.
+void removeStaleCatchmentSpools(const QString &output_directory)
+{
+    const QDir output(output_directory);
+    const QStringList entries = output.entryList({QStringLiteral(".catchment-tasks-*")},
+        QDir::Dirs | QDir::Hidden | QDir::NoDotAndDotDot | QDir::NoSymLinks);
+    for (const QString &name : entries)
+    {
+        const QString suffix = name.mid(QStringLiteral(".catchment-tasks-").size());
+        const qsizetype dash = suffix.indexOf(QLatin1Char('-'));
+        bool numeric = false;
+        const qint64 pid = dash > 0 ? suffix.left(dash).toLongLong(&numeric) : 0;
+        bool stale = false;
+        if (numeric && pid > 0)
+        {
+            if (pid == QCoreApplication::applicationPid()) continue;
+#if defined(Q_OS_UNIX)
+            stale = ::kill(pid_t(pid), 0) != 0 && errno == ESRCH;
+#endif
+        }
+        else
+        {
+            const QDateTime modified = QFileInfo(output.filePath(name)).lastModified();
+            stale = modified.isValid() &&
+                modified.secsTo(QDateTime::currentDateTime()) > 24 * 3600;
+        }
+        if (stale)
+            QDir(output.filePath(name)).removeRecursively();
+    }
 }
 
 // IEEE754 and integer arrays are written to stable little-endian files.
@@ -256,9 +348,14 @@ bool verifyBasinArchive(QFile &file, std::uint32_t columns, std::uint32_t rows,
     return true;
 }
 
+// With hash_contents == false only the structure is checked: file presence,
+// exact lengths, the basin archive checksum and the inventory format. The
+// SHA-256 of every raster (tens of bytes per cell) is compared only when
+// hash_contents is true; that pass is cancellable through stop.
 bool verifyPrimaryArtifacts(const QString &folder, std::uint32_t columns,
                             std::uint32_t rows, const QJsonObject &identities,
-                            QString *reason)
+                            QString *reason, bool hash_contents = true,
+                            const std::atomic<bool> *stop = nullptr)
 {
     const std::uint64_t cells = std::uint64_t(columns) * rows;
     // Validate manifest geometry before doing multiplication, I/O or hashing.
@@ -313,6 +410,8 @@ bool verifyPrimaryArtifacts(const QString &folder, std::uint32_t columns,
                 *reason = QStringLiteral("Invalid artifact identity: %1").arg(name);
                 return false;
             }
+            if (!hash_contents)
+                continue;
             if (!file.seek(0))
             {
                 *reason = QStringLiteral("Cannot rewind artifact: %1").arg(name);
@@ -321,6 +420,11 @@ bool verifyPrimaryArtifacts(const QString &folder, std::uint32_t columns,
             QCryptographicHash hash(QCryptographicHash::Sha256);
             while (!file.atEnd())
             {
+                if (stop != nullptr && stop->load())
+                {
+                    *reason = QStringLiteral("Artifact verification interrupted");
+                    return false;
+                }
                 const QByteArray chunk = file.read(1024 * 1024);
                 if (chunk.isEmpty())
                 {
@@ -427,18 +531,17 @@ ElevationGrid loadOriginalElevation(const QString &folder, const ElevationGrid &
     return source;
 }
 
-const DepressionBasin &findBasin(const DepressionHierarchy &hierarchy,
-                                 const QString &job_id, const QString &uuid)
+const DepressionBasin &findBasin(const CachedBasinHierarchy &cached,
+                                 const QString &uuid)
 {
     const QUuid requested(QStringLiteral("{") + uuid + QStringLiteral("}"));
     if (requested.isNull())
         throw std::invalid_argument("Invalid basin UUID");
-    for (const DepressionBasin &basin : hierarchy.basins)
-    {
-        if (basinUuid(job_id, basin.index) == uuid.toLower())
-            return basin;
-    }
-    throw std::invalid_argument("Unknown basin UUID");
+    const QHash<QString, std::uint64_t>::const_iterator found =
+        cached.index_by_uuid.constFind(requested.toString(QUuid::WithoutBraces));
+    if (found == cached.index_by_uuid.cend())
+        throw std::invalid_argument("Unknown basin UUID");
+    return cached.hierarchy.basins[std::size_t(found.value())];
 }
 
 QJsonObject basinJson(const DepressionHierarchy &hierarchy, const QString &job_id,
@@ -657,6 +760,7 @@ AnalysisService::AnalysisService(const ServiceConfig &config)
     this->catchment_workers.setMaxThreadCount(1);
     this->redistribution_workers.setMaxThreadCount(1);
     this->coupled_workers.setMaxThreadCount(1);
+    this->verification_workers.setMaxThreadCount(1);
 }
 
 AnalysisService::~AnalysisService()
@@ -664,6 +768,8 @@ AnalysisService::~AnalysisService()
     // Finish any active work before member objects (including the job map and
     // the shared Map source) can be destroyed. QThreadPool alone would be
     // destroyed after the job map due to member destruction order.
+    this->stopping.store(true);
+    this->verification_workers.waitForDone();
     {
         QMutexLocker locker(&this->jobs_mutex);
         for (const QSharedPointer<Job> &job : std::as_const(this->job_map))
@@ -745,6 +851,18 @@ bool AnalysisService::initialize(QString *error)
             *error = QStringLiteral("max_outstanding_analyses must be between max_concurrent_analyses and 64");
         return false;
     }
+    if (this->config.max_concurrent_heavy_queries < 1 ||
+        this->config.max_concurrent_heavy_queries > 16)
+    {
+        if (error != nullptr)
+            *error = QStringLiteral("max_concurrent_heavy_queries must be between 1 and 16");
+        return false;
+    }
+    if (this->initialized)
+    {
+        if (error != nullptr) *error = QStringLiteral("Hydrology service is already initialized");
+        return false;
+    }
     this->workers.setMaxThreadCount(this->config.max_concurrent_analyses);
     if (this->config.output_directory.isEmpty() ||
         !QDir().mkpath(this->config.output_directory))
@@ -753,17 +871,32 @@ bool AnalysisService::initialize(QString *error)
             *error = QStringLiteral("Cannot create hydrology output directory");
         return false;
     }
+    removeStaleCatchmentSpools(this->config.output_directory);
     // Keep transient catchment masks separate from persisted scientific
     // results. QTemporaryDir removes them only after the workers have joined.
+    // The owner PID in the name lets a later instance remove the spool of a
+    // killed process (whose destructor never ran) without touching the spool
+    // of another live service sharing the directory.
     this->catchment_spool = std::make_unique<QTemporaryDir>(
-        QDir(this->config.output_directory).filePath(QStringLiteral(".catchment-tasks-XXXXXX")));
+        QDir(this->config.output_directory).filePath(QStringLiteral(".catchment-tasks-%1-XXXXXX")
+            .arg(QCoreApplication::applicationPid())));
     if (!this->catchment_spool->isValid())
     {
         if (error != nullptr) *error = QStringLiteral("Cannot create catchment task spool");
         return false;
     }
+    // Only a fully successful initialization opens admission; a failed call
+    // above may be retried after fixing its cause.
+    this->initialized = true;
+    this->heavy_query_slots.release(this->config.max_concurrent_heavy_queries);
     restoreJobs();
+    this->verification_workers.start([this]() { verifyRestoredArtifacts(); });
     return true;
+}
+
+bool AnalysisService::waitForArtifactVerification(int timeout_ms)
+{
+    return this->verification_workers.waitForDone(timeout_ms);
 }
 
 QString AnalysisService::jobDirectory(const QString &id) const
@@ -775,6 +908,109 @@ QSharedPointer<AnalysisService::Job> AnalysisService::findJob(const QString &id)
 {
     QMutexLocker locker(&this->jobs_mutex);
     return this->job_map.value(id);
+}
+
+QSharedPointer<AnalysisService::Job> AnalysisService::completedJob(const QString &id,
+                                                                   QString *error) const
+{
+    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
+    QMutexLocker locker(&this->jobs_mutex);
+    if (!item || item->state != QStringLiteral("completed"))
+    {
+        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
+        return {};
+    }
+    if (item->artifact_verification == QStringLiteral("pending"))
+    {
+        if (error != nullptr) *error = VerificationPending;
+        return {};
+    }
+    return item;
+}
+
+std::shared_ptr<const CachedBasinHierarchy> AnalysisService::cachedHierarchy(
+    const QSharedPointer<Job> &job) const
+{
+    {
+        QMutexLocker locker(&this->hierarchy_cache_mutex);
+        const std::shared_ptr<const CachedBasinHierarchy> cached =
+            this->hierarchy_cache.value(job->id);
+        if (cached)
+        {
+            this->hierarchy_cache_order.removeOne(job->id);
+            this->hierarchy_cache_order.enqueue(job->id);
+            return cached;
+        }
+    }
+    // Decoding plus one UUIDv5 per basin is the expensive part; done once per
+    // analysis while the entry stays cached. Completed analyses are immutable.
+    std::shared_ptr<CachedBasinHierarchy> loaded = std::make_shared<CachedBasinHierarchy>();
+    {
+        const HeavyQuerySlot slot(this->heavy_query_slots, nullptr);
+        if (!slot.acquired()) throw std::runtime_error(HeavyQueryBusy.toStdString());
+        loaded->hierarchy = loadHierarchy(jobDirectory(job->id), job->grid.columns, job->grid.rows);
+        loaded->index_by_uuid.reserve(qsizetype(loaded->hierarchy.basins.size()));
+        for (const DepressionBasin &basin : loaded->hierarchy.basins)
+            loaded->index_by_uuid.insert(basinUuid(job->id, basin.index), basin.index);
+    }
+    const std::uint64_t size = std::max<std::uint64_t>(1, loaded->hierarchy.basins.size());
+    QMutexLocker locker(&this->hierarchy_cache_mutex);
+    if (size <= this->config.hierarchy_cache_basins && !this->hierarchy_cache.contains(job->id))
+    {
+        while (this->hierarchy_cache_size + size > this->config.hierarchy_cache_basins &&
+               !this->hierarchy_cache_order.isEmpty())
+        {
+            const QString evicted = this->hierarchy_cache_order.dequeue();
+            const std::shared_ptr<const CachedBasinHierarchy> old =
+                this->hierarchy_cache.take(evicted);
+            if (old)
+                this->hierarchy_cache_size -= std::max<std::uint64_t>(1, old->hierarchy.basins.size());
+        }
+        this->hierarchy_cache.insert(job->id, loaded);
+        this->hierarchy_cache_order.enqueue(job->id);
+        this->hierarchy_cache_size += size;
+    }
+    return loaded;
+}
+
+void AnalysisService::verifyRestoredArtifacts()
+{
+    // Restored analyses with a SHA-256 inventory are hashed here, after the
+    // service (and an HTTP listener) is already available. Their data is not
+    // served until this check passes; see completedJob().
+    QList<QSharedPointer<Job>> pending;
+    {
+        QMutexLocker locker(&this->jobs_mutex);
+        QStringList ids = this->job_map.keys();
+        ids.sort();
+        for (const QString &id : std::as_const(ids))
+        {
+            const QSharedPointer<Job> candidate = this->job_map.value(id);
+            if (candidate->artifact_verification == QStringLiteral("pending"))
+                pending.append(candidate);
+        }
+    }
+    for (const QSharedPointer<Job> &next : std::as_const(pending))
+    {
+        if (this->stopping.load()) return;
+        QString reason;
+        const bool valid = verifyPrimaryArtifacts(jobDirectory(next->id), next->grid.columns,
+            next->grid.rows, next->artifact_integrity, &reason, true, &this->stopping);
+        if (this->stopping.load()) return;
+        {
+            QMutexLocker locker(&this->jobs_mutex);
+            if (valid)
+                next->artifact_verification = QStringLiteral("verified");
+            else
+            {
+                next->artifact_verification = QStringLiteral("verified");
+                next->state = QStringLiteral("failed");
+                next->error = QStringLiteral("Invalid completed analysis artifacts: %1; rerun analysis")
+                    .arg(reason);
+            }
+        }
+        if (!valid) writeManifest(next);
+    }
 }
 
 QJsonObject AnalysisService::jobJson(const QSharedPointer<Job> &job) const
@@ -817,6 +1053,8 @@ QJsonObject AnalysisService::jobJson(const QSharedPointer<Job> &job) const
         result.insert(QStringLiteral("terrain_fetch_details"), job->terrain_fetch_details);
     if (!job->artifact_integrity.isEmpty())
         result.insert(QStringLiteral("artifact_integrity"), job->artifact_integrity);
+    if (job->state == QStringLiteral("completed"))
+        result.insert(QStringLiteral("artifact_verification"), job->artifact_verification);
     return result;
 }
 
@@ -894,12 +1132,20 @@ void AnalysisService::restoreJobs()
                  (!saved.value(QStringLiteral("artifact_integrity")).isObject() ||
                   job->artifact_integrity.isEmpty())) ||
                 !verifyPrimaryArtifacts(jobDirectory(id), job->grid.columns,
-                                        job->grid.rows, job->artifact_integrity, &reason))
+                                        job->grid.rows, job->artifact_integrity, &reason,
+                                        false))
             {
                 job->state = QStringLiteral("failed");
                 job->error = QStringLiteral("Invalid completed analysis artifacts: %1; rerun analysis")
                     .arg(reason.isEmpty() ? QStringLiteral("Invalid artifact inventory") : reason);
                 damaged_artifacts = true;
+            }
+            else
+            {
+                // Content hashes (tens of bytes per cell) are checked in the
+                // background instead of blocking startup for every job.
+                job->artifact_verification = job->artifact_integrity.isEmpty()
+                    ? QStringLiteral("legacy") : QStringLiteral("pending");
             }
         }
         if (job->state != QStringLiteral("completed") && job->state != QStringLiteral("failed") &&
@@ -1022,6 +1268,9 @@ void AnalysisService::runJob(const QSharedPointer<Job> &job)
         writeManifest(job);
         const Clock::time_point analysis_started = Clock::now();
         AnalysisResult result = analyze(source, job->options, &job->cancelled);
+        // analyze() keeps its own copy in result.source; release the fetched
+        // grid so the job does not hold the elevations twice while saving.
+        std::vector<float>().swap(source.elevations_m);
         record_stage(QStringLiteral("d8_analysis"), analysis_started);
         if (job->cancelled.load())
             throw std::runtime_error("Job canceled");
@@ -1364,12 +1613,8 @@ QByteArray AnalysisService::rasterWindow(const QString &id, const QString &layer
     int x, int y, int width, int height, QString *error) const
 {
     if (error != nullptr) error->clear();
-    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
-    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
-    {
-        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
-        return {};
-    }
+    const QSharedPointer<Job> item = completedJob(id, error);
+    if (!item) return {};
     const Layer spec = layerSpec(layer);
     if (spec.bytes_per_cell == 0 || x < 0 || y < 0 || width < 1 || height < 1 ||
         width > 512 || height > 512 || std::int64_t(x) + width > item->grid.columns ||
@@ -1399,13 +1644,9 @@ QByteArray AnalysisService::catchmentImpl(const QString &id, int x, int y,
     const std::atomic<bool> *cancel_requested, QString *error) const
 {
     if (error != nullptr) error->clear();
-    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
-    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
-    {
-        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
-        return {};
-    }
-    if (x < 0 || y < 0 || x >= item->grid.columns || y >= item->grid.rows)
+    const QSharedPointer<Job> item = completedJob(id, error);
+    if (!item) return {};
+    if (x < 0 || y < 0 || std::uint32_t(x) >= item->grid.columns || std::uint32_t(y) >= item->grid.rows)
     {
         if (error != nullptr) *error = QStringLiteral("Invalid catchment outlet cell");
         return {};
@@ -1478,13 +1719,9 @@ QJsonObject AnalysisService::downstreamTrace(const QString &id, int x, int y,
                                                QString *error) const
 {
     if (error != nullptr) error->clear();
-    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
-    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
-    {
-        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
-        return {};
-    }
-    if (x < 0 || y < 0 || x >= item->grid.columns || y >= item->grid.rows ||
+    const QSharedPointer<Job> item = completedJob(id, error);
+    if (!item) return {};
+    if (x < 0 || y < 0 || std::uint32_t(x) >= item->grid.columns || std::uint32_t(y) >= item->grid.rows ||
         !std::isfinite(maximum_distance_km) || maximum_distance_km <= 0.0 ||
         maximum_distance_km > 1000.0)
     {
@@ -1577,12 +1814,8 @@ QJsonObject AnalysisService::channelNetwork(const QString &id,
                                              QString *error) const
 {
     if (error != nullptr) error->clear();
-    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
-    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
-    {
-        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
-        return {};
-    }
+    const QSharedPointer<Job> item = completedJob(id, error);
+    if (!item) return {};
     if (!std::isfinite(minimum_area_km2) || minimum_area_km2 <= 0.0 ||
         minimum_area_km2 > 1.0e9)
     {
@@ -1591,6 +1824,8 @@ QJsonObject AnalysisService::channelNetwork(const QString &id,
     }
     try
     {
+        const HeavyQuerySlot slot(this->heavy_query_slots, nullptr);
+        if (!slot.acquired()) throw std::runtime_error(HeavyQueryBusy.toStdString());
         const AnalysisResult result = readStoredChannelGraph(item->grid, jobDirectory(id));
         return channelNetworkJson(extractChannelNetwork(result,
             minimum_area_km2 * 1.0e6, 25000, 2000), item->grid);
@@ -1606,12 +1841,8 @@ QJsonObject AnalysisService::channelNetworkWindow(const QString &id,
     double minimum_area_km2, const DrainageWindow &window, QString *error) const
 {
     if (error != nullptr) error->clear();
-    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
-    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
-    {
-        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
-        return {};
-    }
+    const QSharedPointer<Job> item = completedJob(id, error);
+    if (!item) return {};
     if (!std::isfinite(minimum_area_km2) || minimum_area_km2 <= 0.0 ||
         minimum_area_km2 > 1.0e9)
     {
@@ -1620,6 +1851,8 @@ QJsonObject AnalysisService::channelNetworkWindow(const QString &id,
     }
     try
     {
+        const HeavyQuerySlot slot(this->heavy_query_slots, nullptr);
+        if (!slot.acquired()) throw std::runtime_error(HeavyQueryBusy.toStdString());
         const AnalysisResult graph = readStoredChannelGraph(item->grid, jobDirectory(id));
         QJsonObject output = channelNetworkJson(extractWindowChannelNetwork(
             graph, minimum_area_km2 * 1.0e6, window), item->grid);
@@ -1638,13 +1871,9 @@ QJsonObject AnalysisService::watershedBoundary(const QString &id, int x, int y,
                                                 QString *error) const
 {
     if (error != nullptr) error->clear();
-    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
-    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
-    {
-        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
-        return {};
-    }
-    if (x < 0 || y < 0 || x >= item->grid.columns || y >= item->grid.rows)
+    const QSharedPointer<Job> item = completedJob(id, error);
+    if (!item) return {};
+    if (x < 0 || y < 0 || std::uint32_t(x) >= item->grid.columns || std::uint32_t(y) >= item->grid.rows)
     {
         if (error != nullptr) *error = QStringLiteral("Invalid watershed outlet");
         return {};
@@ -1696,12 +1925,8 @@ QJsonObject AnalysisService::affectedNetwork(const QString &id,
                                               QString *error) const
 {
     if (error != nullptr) error->clear();
-    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
-    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
-    {
-        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
-        return {};
-    }
+    const QSharedPointer<Job> item = completedJob(id, error);
+    if (!item) return {};
     const QJsonValue threshold_value = request.value(QStringLiteral("min_upstream_area_km2"));
     if (!threshold_value.isDouble() || !std::isfinite(threshold_value.toDouble()) ||
         threshold_value.toDouble() <= 0.0 || threshold_value.toDouble() > 1.0e9)
@@ -1728,6 +1953,8 @@ QJsonObject AnalysisService::affectedNetwork(const QString &id,
             window.south = input.value(QStringLiteral("south")).toDouble();
             window.north = input.value(QStringLiteral("north")).toDouble();
         }
+        const HeavyQuerySlot slot(this->heavy_query_slots, nullptr);
+        if (!slot.acquired()) throw std::runtime_error(HeavyQueryBusy.toStdString());
         const AnalysisResult graph = readStoredChannelGraph(item->grid, jobDirectory(id));
         const PolygonDrainageResult affected = downstreamNetworkFromPolygon(
             graph, polygons, threshold_value.toDouble() * 1.0e6, window);
@@ -1753,12 +1980,8 @@ QJsonObject AnalysisService::affectedNetwork(const QString &id,
 QJsonObject AnalysisService::basins(const QString &id, int offset, int limit, QString *error) const
 {
     if (error != nullptr) error->clear();
-    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
-    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
-    {
-        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
-        return {};
-    }
+    const QSharedPointer<Job> item = completedJob(id, error);
+    if (!item) return {};
     if (offset < 0 || limit < 1 || limit > 100)
     {
         if (error != nullptr) *error = QStringLiteral("Invalid basin pagination (limit 1..100)");
@@ -1766,8 +1989,8 @@ QJsonObject AnalysisService::basins(const QString &id, int offset, int limit, QS
     }
     try
     {
-        const DepressionHierarchy hierarchy = loadHierarchy(jobDirectory(id),
-            item->grid.columns, item->grid.rows);
+        const std::shared_ptr<const CachedBasinHierarchy> cached = cachedHierarchy(item);
+        const DepressionHierarchy &hierarchy = cached->hierarchy;
         QJsonArray page;
         for (std::size_t index = std::size_t(offset);
              index < hierarchy.basins.size() && page.size() < limit; ++index)
@@ -1793,17 +2016,12 @@ QJsonObject AnalysisService::basin(const QString &id, const QString &basin_uuid,
                                   QString *error) const
 {
     if (error != nullptr) error->clear();
-    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
-    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
-    {
-        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
-        return {};
-    }
+    const QSharedPointer<Job> item = completedJob(id, error);
+    if (!item) return {};
     try
     {
-        const DepressionHierarchy hierarchy = loadHierarchy(jobDirectory(id),
-            item->grid.columns, item->grid.rows);
-        return basinJson(hierarchy, id, findBasin(hierarchy, id, basin_uuid));
+        const std::shared_ptr<const CachedBasinHierarchy> cached = cachedHierarchy(item);
+        return basinJson(cached->hierarchy, id, findBasin(*cached, basin_uuid));
     }
     catch (const std::exception &ex)
     {
@@ -1816,12 +2034,8 @@ QJsonObject AnalysisService::basinStorage(const QString &id, const QString &basi
                                           double level_m, QString *error) const
 {
     if (error != nullptr) error->clear();
-    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
-    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
-    {
-        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
-        return {};
-    }
+    const QSharedPointer<Job> item = completedJob(id, error);
+    if (!item) return {};
     if (!std::isfinite(level_m))
     {
         if (error != nullptr) *error = QStringLiteral("Invalid basin water level");
@@ -1830,9 +2044,11 @@ QJsonObject AnalysisService::basinStorage(const QString &id, const QString &basi
     try
     {
         const QString folder = jobDirectory(id);
-        const DepressionHierarchy hierarchy = loadHierarchy(folder, item->grid.columns,
-                                                              item->grid.rows);
-        const DepressionBasin &selected = findBasin(hierarchy, id, basin_uuid);
+        const std::shared_ptr<const CachedBasinHierarchy> cached = cachedHierarchy(item);
+        const DepressionHierarchy &hierarchy = cached->hierarchy;
+        const DepressionBasin &selected = findBasin(*cached, basin_uuid);
+        const HeavyQuerySlot slot(this->heavy_query_slots, nullptr);
+        if (!slot.acquired()) throw std::runtime_error(HeavyQueryBusy.toStdString());
         const ElevationGrid elevation = loadOriginalElevation(folder, item->grid);
         const BasinStorageState storage = basinStorageAtLevel(elevation, hierarchy,
                                                               selected.index, level_m);
@@ -1853,12 +2069,8 @@ QJsonObject AnalysisService::basinStorageCurve(const QString &id, const QString 
                                                int samples, QString *error) const
 {
     if (error != nullptr) error->clear();
-    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
-    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
-    {
-        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
-        return {};
-    }
+    const QSharedPointer<Job> item = completedJob(id, error);
+    if (!item) return {};
     if (samples < 2 || samples > 16)
     {
         if (error != nullptr) *error = QStringLiteral("Invalid basin curve sample count (2..16)");
@@ -1867,11 +2079,13 @@ QJsonObject AnalysisService::basinStorageCurve(const QString &id, const QString 
     try
     {
         const QString folder = jobDirectory(id);
-        const DepressionHierarchy hierarchy = loadHierarchy(folder, item->grid.columns,
-                                                              item->grid.rows);
-        const DepressionBasin &selected = findBasin(hierarchy, id, basin_uuid);
+        const std::shared_ptr<const CachedBasinHierarchy> cached = cachedHierarchy(item);
+        const DepressionHierarchy &hierarchy = cached->hierarchy;
+        const DepressionBasin &selected = findBasin(*cached, basin_uuid);
         if (!std::isfinite(selected.spill_elevation_m))
             throw std::invalid_argument("Basin has no known spill elevation");
+        const HeavyQuerySlot slot(this->heavy_query_slots, nullptr);
+        if (!slot.acquired()) throw std::runtime_error(HeavyQueryBusy.toStdString());
         const ElevationGrid elevation = loadOriginalElevation(folder, item->grid);
         QJsonArray curve;
         for (int index = 0; index < samples; ++index)
@@ -1912,8 +2126,10 @@ QJsonObject loadRainfallManifest(const QString &folder, const QString &uuid)
     if (parsed.isNull() || parsed.toString(QUuid::WithoutBraces) != uuid)
         throw std::invalid_argument("Invalid rainfall scenario UUID");
     QFile file(QDir(folder).filePath(uuid + QStringLiteral("/scenario.json")));
-    if (!file.open(QIODevice::ReadOnly) || file.size() > 262144)
+    if (!file.open(QIODevice::ReadOnly))
         throw std::invalid_argument("Unknown rainfall scenario UUID");
+    if (file.size() > Internal::MaximumScenarioManifestBytes)
+        throw std::runtime_error("Corrupt rainfall scenario manifest: exceeds 1 MiB");
     const QJsonDocument document = QJsonDocument::fromJson(file.readAll());
     const QJsonObject object = document.object();
     if (!document.isObject() || object.value(QStringLiteral("id")) != uuid)
@@ -1933,12 +2149,8 @@ QJsonObject AnalysisService::createRainfallScenarioImpl(
     const std::atomic<bool> *cancel_requested, QString *error) const
 {
     if (error != nullptr) error->clear();
-    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
-    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
-    {
-        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
-        return {};
-    }
+    const QSharedPointer<Job> item = completedJob(id, error);
+    if (!item) return {};
     try
     {
         for (const QString &name : {QStringLiteral("depth_mm"),
@@ -1993,6 +2205,13 @@ QJsonObject AnalysisService::createRainfallScenarioImpl(
         };
         const std::unique_ptr<const AnalysisService, decltype(release_reservation)> reservation(
             this, release_reservation);
+        // Whole-DEM load plus two full-grid result rasters: admitted through
+        // the shared heavy-query slots (synchronous callers fail fast,
+        // background tasks wait cancellably).
+        const HeavyQuerySlot slot(this->heavy_query_slots, cancel_requested);
+        if (!slot.acquired())
+            throw std::runtime_error(cancel_requested != nullptr
+                ? "Rainfall scenario canceled" : HeavyQueryBusy.toStdString());
         const ElevationGrid source = loadOriginalElevation(
             jobDirectory(id), item->grid, cancel_requested);
         const RainfallRunoff result = calculateRainfallRunoff(source, scenario,
@@ -2045,6 +2264,10 @@ QJsonObject AnalysisService::createRainfallScenarioImpl(
                 throw std::runtime_error("Rainfall scenario canceled");
             QSaveFile file(QDir(folder).filePath(QStringLiteral("scenario.json")));
             const QByteArray json_bytes = QJsonDocument(summary).toJson(QJsonDocument::Compact);
+            // Never commit a manifest that loadRainfallManifest() would refuse:
+            // it would consume quota yet remain unreadable.
+            if (json_bytes.size() > Internal::MaximumScenarioManifestBytes)
+                throw std::invalid_argument("Invalid rainfall scenario: manifest exceeds 1 MiB");
             if (!file.open(QIODevice::WriteOnly) ||
                 file.write(json_bytes) != json_bytes.size() || !file.commit())
                 throw std::runtime_error("Cannot persist rainfall scenario manifest");
@@ -2091,13 +2314,8 @@ QJsonObject AnalysisService::startRainfallScenario(
     const QString &id, const QJsonObject &request, QString *error)
 {
     if (error != nullptr) error->clear();
-    const QSharedPointer<Job> job_item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
-    if (!job_item || jobJson(job_item).value(QStringLiteral("state")) !=
-                     QStringLiteral("completed"))
-    {
-        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
-        return {};
-    }
+    const QSharedPointer<Job> job_item = completedJob(id, error);
+    if (!job_item) return {};
     // Reject structurally invalid input at submission time. All expensive
     // raster work and geometric intersection stays on the worker thread.
     try
@@ -2271,12 +2489,8 @@ bool AnalysisService::cancelRainfallScenarioTask(
 QJsonArray AnalysisService::rainfallScenarios(const QString &id, QString *error) const
 {
     if (error != nullptr) error->clear();
-    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
-    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
-    {
-        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
-        return {};
-    }
+    const QSharedPointer<Job> item = completedJob(id, error);
+    if (!item) return {};
     try
     {
         QJsonArray output;
@@ -2286,8 +2500,15 @@ QJsonArray AnalysisService::rainfallScenarios(const QString &id, QString *error)
             QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
         for (const QString &uuid : identifiers)
         {
-            if (QFileInfo::exists(QDir(folder).filePath(uuid + QStringLiteral("/scenario.json"))))
-                output.append(loadRainfallManifest(folder, uuid));
+            if (!QFileInfo::exists(QDir(folder).filePath(uuid + QStringLiteral("/scenario.json"))))
+                continue;
+            // One damaged manifest must not hide every other scenario.
+            try { output.append(loadRainfallManifest(folder, uuid)); }
+            catch (const std::exception &ex)
+            {
+                qWarning("Skipping unreadable rainfall scenario %s/%s: %s",
+                         qPrintable(id), qPrintable(uuid), ex.what());
+            }
         }
         return output;
     }
@@ -2302,12 +2523,8 @@ QJsonObject AnalysisService::rainfallScenario(
     const QString &id, const QString &scenario_uuid, QString *error) const
 {
     if (error != nullptr) error->clear();
-    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
-    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
-    {
-        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
-        return {};
-    }
+    const QSharedPointer<Job> item = completedJob(id, error);
+    if (!item) return {};
     try
     {
         return loadRainfallManifest(QDir(jobDirectory(id)).filePath(
@@ -2325,12 +2542,8 @@ QByteArray AnalysisService::rainfallRunoffWindow(
     int x, int y, int width, int height, QString *error) const
 {
     if (error != nullptr) error->clear();
-    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
-    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
-    {
-        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
-        return {};
-    }
+    const QSharedPointer<Job> item = completedJob(id, error);
+    if (!item) return {};
     if (x < 0 || y < 0 || width <= 0 || height <= 0 ||
         width > 4096 || height > 4096 || std::uint64_t(width) * height > 1000000 ||
         std::uint64_t(x) + width > item->grid.columns ||
@@ -2711,12 +2924,8 @@ QJsonObject AnalysisService::rainfallRedistributionImpl(
     QString *error) const
 {
     if (error != nullptr) error->clear();
-    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
-    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
-    {
-        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
-        return {};
-    }
+    const QSharedPointer<Job> item = completedJob(id, error);
+    if (!item) return {};
     if (offset < 0 || limit < 1 || limit > 100)
     {
         if (error != nullptr) *error = QStringLiteral("Invalid redistribution pagination (limit 1..100)");
@@ -2841,12 +3050,8 @@ QJsonObject AnalysisService::rainfallRedistributionStatus(
     const QString &id, const QString &scenario_uuid, QString *error) const
 {
     if (error != nullptr) error->clear();
-    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
-    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
-    {
-        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
-        return {};
-    }
+    const QSharedPointer<Job> item = completedJob(id, error);
+    if (!item) return {};
     try
     {
         const QString folder = jobDirectory(id);
@@ -3232,12 +3437,8 @@ QJsonObject AnalysisService::staticInundationStatus(
     const QString &id, const QString &scenario_uuid, QString *error) const
 {
     if (error != nullptr) error->clear();
-    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
-    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
-    {
-        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
-        return {};
-    }
+    const QSharedPointer<Job> item = completedJob(id, error);
+    if (!item) return {};
     try
     {
         const QString job_folder = jobDirectory(id);
@@ -3438,12 +3639,8 @@ QByteArray AnalysisService::staticInundationDepthWindow(
     int x, int y, int width, int height, QString *error) const
 {
     if (error != nullptr) error->clear();
-    const QSharedPointer<Job> item = safeJobId(id) ? findJob(id) : QSharedPointer<Job>();
-    if (!item || jobJson(item).value(QStringLiteral("state")) != QStringLiteral("completed"))
-    {
-        if (error != nullptr) *error = QStringLiteral("Unknown or incomplete job");
-        return {};
-    }
+    const QSharedPointer<Job> item = completedJob(id, error);
+    if (!item) return {};
     if (x < 0 || y < 0 || width <= 0 || height <= 0 || width > 4096 || height > 4096 ||
         std::uint64_t(width) * height > 1000000 ||
         std::uint64_t(x) + width > item->grid.columns ||

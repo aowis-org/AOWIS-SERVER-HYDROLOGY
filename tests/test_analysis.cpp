@@ -371,5 +371,40 @@ int main()
     catch (const std::runtime_error &) { interrupted = true; }
     assert(interrupted);
 
+    // dryD8Downstream() must reproduce analyze()'s unfilled links exactly,
+    // including flats, closed pits and permitted NoData holes, because
+    // redistribution and travel-time forcing rely on the identical graph.
+    {
+        ElevationGrid terrain = grid;
+        terrain.columns = 37;
+        terrain.rows = 23;
+        terrain.elevations_m.assign(std::size_t(terrain.columns) * terrain.rows, 0.0f);
+        std::uint32_t state = 12345;
+        for (std::size_t i = 0; i < terrain.elevations_m.size(); ++i)
+        {
+            state = state * 1664525u + 1013904223u;
+            // Coarse quantization creates many flats and closed pits.
+            terrain.elevations_m[i] = float(std::uint32_t(state >> 24) % 12) +
+                0.25f * float((i % terrain.columns) / 9);
+        }
+        AnalysisOptions unfilled;
+        unfilled.fill_depressions = false;
+        assert(dryD8Downstream(terrain) == analyze(terrain, unfilled).downstream);
+
+        terrain.elevations_m[5 * terrain.columns + 7] = std::numeric_limits<float>::quiet_NaN();
+        terrain.elevations_m[11 * terrain.columns + 20] = std::numeric_limits<float>::quiet_NaN();
+        unfilled.reject_interior_nodata = false;
+        assert(dryD8Downstream(terrain, false) == analyze(terrain, unfilled).downstream);
+        bool rejected = false;
+        try { (void)dryD8Downstream(terrain, true); }
+        catch (const std::invalid_argument &) { rejected = true; }
+        assert(rejected);
+        std::atomic<bool> stop {true};
+        bool stopped = false;
+        try { (void)dryD8Downstream(terrain, false, &stop); }
+        catch (const std::runtime_error &) { stopped = true; }
+        assert(stopped);
+    }
+
     std::cout << "Hydrology core tests passed\n";
 }

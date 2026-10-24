@@ -127,9 +127,19 @@ command if any tracked submodule is missing; a handoff ZIP must never silently
 omit required build dependencies. The resulting ZIP contains ordinary source
 files and can be reviewed or built without separately cloning submodules.
 
-The project reuses a `GeographicLib::GeographicLib` target supplied by a parent
-build when present. `tools/setup_geographiclib.sh` is available for initial
-submodule setup. No dependency is downloaded implicitly by CMake.
+The vendored GeographicLib is always built as a **static** library
+(`GeographicLib::GeographicLib_STATIC`), so executables never depend on a
+shared library inside the build tree, and its `BUILD_SHARED_LIBS` default does
+not leak into a parent build. A parent build may supply GeographicLib first;
+Hydrology then links `GeographicLib::GeographicLib_STATIC` when that target
+exists, otherwise `GeographicLib::GeographicLib`. GeographicLib's own tool
+tests are skipped by a generated `CTestCustom.cmake`, so a plain `ctest`
+runs only Hydrology tests. `tools/setup_geographiclib.sh` is available for
+initial submodule setup. No dependency is downloaded implicitly by CMake.
+
+A top-level build installs the server executable with
+`cmake --install build --prefix /opt/aowis` (option `AOWIS_HYDROLOGY_INSTALL`,
+default ON only when Hydrology is the top-level project).
 
 ### Linked-library and standalone use
 
@@ -193,6 +203,10 @@ http_max_queued_requests=32
 http_read_timeout_s=15
 http_write_timeout_s=30
 http_keep_alive_timeout_s=5
+max_concurrent_heavy_queries=2
+hierarchy_cache_basins=4000000
+api_key=
+allow_unauthenticated_remote=false
 
 [terrain]
 dataset=copernicus-glo30
@@ -242,6 +256,40 @@ with four requests per worker may have 16 Map requests outstanding. The
 borrowed in-process Map interface remains sequential. Increasing workers can
 multiply peak RAM; benchmark representative requests before doing so.
 Configuration changes require a server restart.
+
+**Synchronous whole-grid queries** (channel networks, affected networks,
+basin storage and curves, uncached basin hierarchies, synchronous rainfall
+scenarios) materialize full-grid arrays of up to 16 bytes per cell on the
+HTTP worker thread. At most `max_concurrent_heavy_queries` (1–16, default 2)
+run at once; further requests receive HTTP `429` ("Heavy query capacity
+busy") instead of multiplying peak memory by `http_workers`. Asynchronous
+rainfall tasks wait for the same slots. Decoded basin hierarchies with their
+UUID index are cached up to `hierarchy_cache_basins` basins in total (0
+disables the cache), so basin paging and lookups no longer decode the archive
+or compute one UUID per basin on every request.
+
+**Authentication:** with `api_key` set (16–256 printable ASCII characters),
+every route except `GET /status` requires `X-API-Key: <key>` or
+`Authorization: Bearer <key>`; otherwise `401`. A non-loopback
+`listen_address` is refused without `api_key` unless
+`allow_unauthenticated_remote=true` is set explicitly (for example behind an
+authenticating reverse proxy). `map_url` may carry a path prefix
+(`http://proxy/map` and `http://proxy/map/` are equivalent).
+
+**Startup and shutdown:** restored analyses are checked structurally (files,
+lengths, hierarchy checksum) during startup; the SHA-256 content check runs in
+the background after the listener is up. Until it finishes, the job reports
+`"artifact_verification": "pending"` and its data endpoints answer `503`
+("Analysis integrity verification in progress"). Corrupted analyses then turn
+`failed`. SIGINT/SIGTERM stop the server in order (HTTP, jobs, workers) and
+remove the transient catchment spool; spools of killed processes are removed
+by the next start.
+
+**HTTP status codes** for service errors follow one table
+(`src/server/http_status.h`): `429` capacity/busy/queue full (including the
+redistribution, inundation and coupled-simulation queues, formerly `409`),
+`503` verification pending, `409` not completed / not ready / no active task,
+`404` unknown entity, `400` rejected input, `500` storage corruption or I/O.
 
 Map must support `GET /terrain/v1/analysis/grid`, returning row-major,
 north-to-south float32 little-endian source heights sampled at requested cell

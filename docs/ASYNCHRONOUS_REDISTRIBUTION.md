@@ -114,8 +114,10 @@ valid cache will be removed; once published, a valid cache remains reusable.
 - `400 Bad Request`: malformed pagination or invalid identifiers/parameters.
 - `404 Not Found`: unknown/incomplete analysis job (and source-loading errors
   carry their error message; do not mistake a missing scenario for success).
-- `409 Conflict`: result is not ready, the eight-task queue is full, or there
-  is no active task to cancel.
+- `409 Conflict`: result is not ready, or there is no active task to cancel.
+- `429 Too Many Requests`: the eight-task queue is full (formerly `409`).
+- `503 Service Unavailable`: the analysis was restored after a restart and its
+  artifacts are still being verified.
 - `500 Internal Server Error`: unreadable, inconsistent, or otherwise invalid
   source data, or a filesystem/calculation failure.
 

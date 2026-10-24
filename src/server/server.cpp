@@ -1,4 +1,5 @@
 #include "server.h"
+#include "http_status.h"
 
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -6,6 +7,7 @@
 #include <QUrlQuery>
 #include <cmath>
 #include <cstddef>
+#include <string>
 
 namespace Aowis::Hydrology
 {
@@ -49,7 +51,38 @@ ServiceConfig serviceConfig(const ServerConfig &config)
     result.max_concurrent_analyses = config.max_concurrent_analyses;
     result.max_outstanding_analyses = config.max_outstanding_analyses;
     result.max_active_terrain_cells = config.max_active_terrain_cells;
+    result.max_concurrent_heavy_queries = config.max_concurrent_heavy_queries;
+    result.hierarchy_cache_basins = config.hierarchy_cache_basins;
     return result;
+}
+
+// Length-independent comparison so response timing does not reveal how many
+// leading characters of a guessed key were correct.
+bool sameSecret(const std::string &presented, const QByteArray &expected)
+{
+    unsigned char difference = presented.size() == std::size_t(expected.size()) ? 0 : 1;
+    for (std::size_t index = 0; index < presented.size(); ++index)
+        difference |= static_cast<unsigned char>(presented[index]) ^
+            static_cast<unsigned char>(expected.isEmpty() ? 0 :
+                expected.at(qsizetype(index % std::size_t(expected.size()))));
+    return difference == 0;
+}
+
+bool authorized(const httplib::Request &request, const QByteArray &api_key)
+{
+    if (api_key.isEmpty()) return true;
+    if (request.has_header("X-API-Key") &&
+        sameSecret(request.get_header_value("X-API-Key"), api_key))
+        return true;
+    const std::string bearer = "Bearer ";
+    if (request.has_header("Authorization"))
+    {
+        const std::string value = request.get_header_value("Authorization");
+        if (value.size() > bearer.size() && value.compare(0, bearer.size(), bearer) == 0 &&
+            sameSecret(value.substr(bearer.size()), api_key))
+            return true;
+    }
+    return false;
 }
 } // namespace
 
@@ -65,8 +98,20 @@ Server::Server(const ServerConfig &config)
     // before entering the route's body reader. Chunked/decoded bodies remain
     // guarded by the transport's payload limit below.
     this->http.set_payload_max_length(maxHttpBodyBytes);
-    this->http.set_pre_routing_handler([](const httplib::Request &request,
-                                          httplib::Response &response) {
+    this->http.set_pre_routing_handler([api_key = config.api_key](
+                                           const httplib::Request &request,
+                                           httplib::Response &response) {
+        // Health/status stays open for probes; everything else needs the key
+        // when one is configured. Checked before any body is read.
+        if (!(request.method == "GET" && request.path == "/status") &&
+            !authorized(request, api_key))
+        {
+            response.status = httplib::StatusCode::Unauthorized_401;
+            response.set_header("WWW-Authenticate", "Bearer");
+            response.set_content(R"({"error":"Missing or invalid API key"})",
+                                 "application/json");
+            return httplib::Server::HandlerResponse::Handled;
+        }
         if (request.has_header("Content-Length") &&
             request.get_header_value_u64("Content-Length") > maxHttpBodyBytes)
         {
@@ -136,6 +181,8 @@ void Server::setupRoutes()
                 ? this->config.maximum_cells : this->config.max_active_terrain_cells)},
             {QStringLiteral("http_workers"), this->config.http_workers},
             {QStringLiteral("http_max_queued_requests"), this->config.http_max_queued_requests},
+            {QStringLiteral("max_concurrent_heavy_queries"), this->config.max_concurrent_heavy_queries},
+            {QStringLiteral("authentication_required"), !this->config.api_key.isEmpty()},
             {QStringLiteral("terrain_jobs"), this->service.terrainJobCapacity()},
             {QStringLiteral("map_requests_per_analysis"), this->config.source.max_concurrent_requests}});
     });
@@ -189,10 +236,7 @@ void Server::setupRoutes()
         QString error;
         const QString id = this->service.submit(analysis, &error);
         if (id.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Terrain analysis capacity"))
-                ? static_cast<Status>(429) // Too Many Requests (all supported Qt 6 releases)
-                : error.startsWith(QStringLiteral("Cannot"))
-                ? Status::InternalServerError : Status::BadRequest);
+            return errorResponse(error, statusForError(error, Status::BadRequest));
         return jsonResponse(this->service.job(id), Status::Accepted);
     });
 
@@ -237,8 +281,7 @@ void Server::setupRoutes()
         QString error;
         const QJsonObject result = this->service.basins(id, offset, limit, &error);
         if (!error.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Invalid"))
-                ? Status::BadRequest : Status::InternalServerError);
+            return errorResponse(error, statusForError(error, Status::InternalServerError));
         return jsonResponse(result);
     });
 
@@ -252,9 +295,7 @@ void Server::setupRoutes()
         QString error;
         const QJsonObject result = this->service.basin(id, basin_uuid, &error);
         if (!error.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Unknown basin"))
-                ? Status::NotFound : error.startsWith(QStringLiteral("Invalid"))
-                ? Status::BadRequest : Status::InternalServerError);
+            return errorResponse(error, statusForError(error, Status::InternalServerError));
         return jsonResponse(result);
     });
 
@@ -274,10 +315,7 @@ void Server::setupRoutes()
         QString error;
         const QJsonObject result = this->service.basinStorage(id, basin_uuid, level, &error);
         if (!error.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Invalid")) ||
-                error.startsWith(QStringLiteral("Water level"))
-                ? Status::BadRequest : error.startsWith(QStringLiteral("Unknown basin"))
-                ? Status::NotFound : Status::InternalServerError);
+            return errorResponse(error, statusForError(error, Status::InternalServerError));
         return jsonResponse(result);
     });
 
@@ -297,9 +335,7 @@ void Server::setupRoutes()
         QString error;
         const QJsonObject result = this->service.basinStorageCurve(id, basin_uuid, samples, &error);
         if (!error.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Invalid"))
-                ? Status::BadRequest : error.startsWith(QStringLiteral("Unknown basin"))
-                ? Status::NotFound : Status::InternalServerError);
+            return errorResponse(error, statusForError(error, Status::InternalServerError));
         return jsonResponse(result);
     });
 
@@ -324,8 +360,7 @@ void Server::setupRoutes()
         QString error;
         const QByteArray data = this->service.rasterWindow(id, layer, x, y, width, height, &error);
         if (!error.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Invalid"))
-                ? Status::BadRequest : Status::InternalServerError);
+            return errorResponse(error, statusForError(error, Status::InternalServerError));
         return HttpResponse(mime, data);
     });
 
@@ -352,8 +387,7 @@ void Server::setupRoutes()
         QString error;
         const QJsonObject feature = this->service.downstreamTrace(id, x, y, distance_km, &error);
         if (!error.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Invalid"))
-                ? Status::BadRequest : Status::InternalServerError);
+            return errorResponse(error, statusForError(error, Status::InternalServerError));
         return jsonResponse(feature);
     });
 
@@ -390,9 +424,7 @@ void Server::setupRoutes()
         }
         else feature_collection = this->service.channelNetwork(id, area_km2, &error);
         if (!error.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Invalid")) ||
-                error.startsWith(QStringLiteral("Too many"))
-                ? Status::BadRequest : Status::InternalServerError);
+            return errorResponse(error, statusForError(error, Status::InternalServerError));
         return jsonResponse(feature_collection);
     });
 
@@ -411,10 +443,7 @@ void Server::setupRoutes()
         QString error;
         const QJsonObject result = this->service.watershedBoundary(id, x, y, &error);
         if (!error.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Catchment calculation busy"))
-                ? static_cast<Status>(429) : error.startsWith(QStringLiteral("Invalid")) ||
-                error.startsWith(QStringLiteral("Too many"))
-                ? Status::BadRequest : Status::InternalServerError);
+            return errorResponse(error, statusForError(error, Status::InternalServerError));
         return jsonResponse(result);
     });
 
@@ -434,9 +463,7 @@ void Server::setupRoutes()
         QString error;
         const QJsonObject result = this->service.affectedNetwork(id, document.object(), &error);
         if (!error.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Invalid")) ||
-                error.startsWith(QStringLiteral("Too many"))
-                ? Status::BadRequest : Status::InternalServerError);
+            return errorResponse(error, statusForError(error, Status::InternalServerError));
         return jsonResponse(result);
     });
 
@@ -459,11 +486,7 @@ void Server::setupRoutes()
         QString error;
         const QJsonObject result = this->service.createRainfallScenario(id, document.object(), &error);
         if (!error.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Invalid")) ||
-                error.startsWith(QStringLiteral("Too many")) ||
-                error.startsWith(QStringLiteral("Antimeridian")) ||
-                error.startsWith(QStringLiteral("Rainfall polygons"))
-                ? Status::BadRequest : Status::InternalServerError);
+            return errorResponse(error, statusForError(error, Status::InternalServerError));
         return jsonResponse(result, Status::Created);
     });
 
@@ -482,11 +505,7 @@ void Server::setupRoutes()
         QString error;
         const QJsonObject result = this->service.startRainfallScenario(id, document.object(), &error);
         if (!error.isEmpty())
-            return errorResponse(error,
-                error.startsWith(QStringLiteral("Rainfall scenario queue full"))
-                    ? static_cast<Status>(429) :
-                error.startsWith(QStringLiteral("Unknown"))
-                    ? Status::NotFound : Status::BadRequest);
+            return errorResponse(error, statusForError(error, Status::BadRequest));
         return jsonResponse(result, Status::Accepted);
     });
 
@@ -496,7 +515,7 @@ void Server::setupRoutes()
     {
         QString error;
         const QJsonObject result = this->service.rainfallScenarioTask(id, task_id, &error);
-        if (!error.isEmpty()) return errorResponse(error, Status::NotFound);
+        if (!error.isEmpty()) return errorResponse(error, statusForError(error, Status::NotFound));
         return jsonResponse(result);
     });
 
@@ -506,7 +525,7 @@ void Server::setupRoutes()
     {
         QString error;
         if (!this->service.cancelRainfallScenarioTask(id, task_id, &error))
-            return errorResponse(error, Status::NotFound);
+            return errorResponse(error, statusForError(error, Status::NotFound));
         return jsonResponse(this->service.rainfallScenarioTask(id, task_id, &error),
                             Status::Accepted);
     });
@@ -519,7 +538,7 @@ void Server::setupRoutes()
         QString error;
         const QJsonArray items = this->service.rainfallScenarios(id, &error);
         if (!error.isEmpty())
-            return errorResponse(error, Status::InternalServerError);
+            return errorResponse(error, statusForError(error, Status::InternalServerError));
         return jsonResponse(QJsonObject{{QStringLiteral("scenarios"), items}});
     });
 
@@ -531,9 +550,7 @@ void Server::setupRoutes()
         QString error;
         const QJsonObject result = this->service.rainfallScenario(id, scenario_id, &error);
         if (!error.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Invalid")) ||
-                error.startsWith(QStringLiteral("Unknown"))
-                ? Status::NotFound : Status::InternalServerError);
+            return errorResponse(error, statusForError(error, Status::InternalServerError));
         return jsonResponse(result);
     });
 
@@ -555,9 +572,7 @@ void Server::setupRoutes()
         const QByteArray output = this->service.rainfallRunoffWindow(
             id, scenario_id, x, y, width, height, &error);
         if (!error.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Invalid"))
-                ? Status::BadRequest : error.startsWith(QStringLiteral("Unknown"))
-                ? Status::NotFound : Status::InternalServerError);
+            return errorResponse(error, statusForError(error, Status::InternalServerError));
         return HttpResponse(QByteArrayLiteral("application/vnd.aowis.raster-f64le"), output);
     });
 
@@ -570,10 +585,7 @@ void Server::setupRoutes()
         const QJsonObject result = this->service.startRainfallRedistribution(
             id, scenario_id, &error);
         if (!error.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Invalid"))
-                ? Status::BadRequest : error.startsWith(QStringLiteral("Unknown"))
-                ? Status::NotFound : error.startsWith(QStringLiteral("Redistribution queue full"))
-                ? Status::Conflict : Status::InternalServerError);
+            return errorResponse(error, statusForError(error, Status::InternalServerError));
         return jsonResponse(result, result.value(QStringLiteral("cache_ready")).toBool()
             ? Status::Ok : Status::Accepted);
     });
@@ -586,9 +598,7 @@ void Server::setupRoutes()
         const QJsonObject result = this->service.rainfallRedistributionStatus(
             id, scenario_id, &error);
         if (!error.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Invalid"))
-                ? Status::BadRequest : error.startsWith(QStringLiteral("Unknown"))
-                ? Status::NotFound : Status::InternalServerError);
+            return errorResponse(error, statusForError(error, Status::InternalServerError));
         return jsonResponse(result);
     });
 
@@ -598,7 +608,7 @@ void Server::setupRoutes()
     {
         QString error;
         if (!this->service.cancelRainfallRedistribution(id, scenario_id, &error))
-            return errorResponse(error, Status::Conflict);
+            return errorResponse(error, statusForError(error, Status::Conflict));
         return jsonResponse(QJsonObject{{QStringLiteral("state"),
             QStringLiteral("cancel_requested")}}, Status::Accepted);
     });
@@ -626,10 +636,7 @@ void Server::setupRoutes()
         const QJsonObject result = this->service.rainfallRedistributionReady(
             id, scenario_id, offset, limit, &error);
         if (!error.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Invalid"))
-                ? Status::BadRequest : error.startsWith(QStringLiteral("Unknown"))
-                ? Status::NotFound : error.startsWith(QStringLiteral("Redistribution result not ready"))
-                ? Status::Conflict : Status::InternalServerError);
+            return errorResponse(error, statusForError(error, Status::InternalServerError));
         return jsonResponse(result);
     });
 
@@ -644,11 +651,7 @@ void Server::setupRoutes()
         QString error;
         const QJsonObject result = this->service.startStaticInundation(id, scenario_id, &error);
         if (!error.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Invalid"))
-                ? Status::BadRequest : error.startsWith(QStringLiteral("Unknown"))
-                ? Status::NotFound : error.startsWith(QStringLiteral("Redistribution result not ready")) ||
-                error.startsWith(QStringLiteral("Inundation queue full"))
-                ? Status::Conflict : Status::InternalServerError);
+            return errorResponse(error, statusForError(error, Status::InternalServerError));
         return jsonResponse(result, result.value(QStringLiteral("cache_ready")).toBool()
             ? Status::Ok : Status::Accepted);
     });
@@ -660,9 +663,7 @@ void Server::setupRoutes()
         QString error;
         const QJsonObject result = this->service.staticInundationStatus(id, scenario_id, &error);
         if (!error.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Invalid"))
-                ? Status::BadRequest : error.startsWith(QStringLiteral("Unknown"))
-                ? Status::NotFound : Status::InternalServerError);
+            return errorResponse(error, statusForError(error, Status::InternalServerError));
         return jsonResponse(result);
     });
 
@@ -672,7 +673,7 @@ void Server::setupRoutes()
     {
         QString error;
         if (!this->service.cancelStaticInundation(id, scenario_id, &error))
-            return errorResponse(error, Status::Conflict);
+            return errorResponse(error, statusForError(error, Status::Conflict));
         return jsonResponse(QJsonObject{{QStringLiteral("state"),
             QStringLiteral("cancel_requested")}}, Status::Accepted);
     });
@@ -693,12 +694,7 @@ void Server::setupRoutes()
         const QByteArray result = this->service.staticInundationDepthWindow(
             id, scenario_id, x, y, width, height, &error);
         if (!error.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Invalid inundation raster window"))
-                ? Status::BadRequest : error.startsWith(QStringLiteral("Unknown"))
-                ? Status::NotFound : error.startsWith(QStringLiteral("Inundation unavailable")) ||
-                  error.startsWith(QStringLiteral("Inundation result not ready")) ||
-                  error.startsWith(QStringLiteral("Redistribution result not ready"))
-                ? Status::Conflict : Status::InternalServerError);
+            return errorResponse(error, statusForError(error, Status::InternalServerError));
         return HttpResponse(QByteArrayLiteral("application/vnd.aowis.raster-f32le"), result);
     });
 
@@ -718,12 +714,7 @@ void Server::setupRoutes()
         QString error;
         const QJsonObject result = this->service.startCoupledSimulation(id, document.object(), &error);
         if (!error.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Invalid")) ||
-                error.startsWith(QStringLiteral("Duplicate")) ||
-                error.startsWith(QStringLiteral("Coupled DEM cell limit exceeded"))
-                ? Status::BadRequest : error.startsWith(QStringLiteral("Unknown"))
-                ? Status::NotFound : error.startsWith(QStringLiteral("Coupled simulation queue full"))
-                ? Status::Conflict : Status::InternalServerError);
+            return errorResponse(error, statusForError(error, Status::InternalServerError));
         return jsonResponse(result, Status::Accepted);
     });
 
@@ -734,8 +725,7 @@ void Server::setupRoutes()
         QString error;
         const QJsonObject result = this->service.coupledSimulationStatus(id, simulation_id, &error);
         if (!error.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Unknown"))
-                ? Status::NotFound : Status::InternalServerError);
+            return errorResponse(error, statusForError(error, Status::InternalServerError));
         return jsonResponse(result);
     });
 
@@ -756,10 +746,7 @@ void Server::setupRoutes()
         const QJsonObject result = this->service.coupledSimulationSnapshots(
             id, simulation_id, offset, limit, &error);
         if (!error.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Invalid"))
-                ? Status::BadRequest : error.startsWith(QStringLiteral("Unknown"))
-                ? Status::NotFound : error.startsWith(QStringLiteral("Coupled simulation result not ready"))
-                ? Status::Conflict : Status::InternalServerError);
+            return errorResponse(error, statusForError(error, Status::InternalServerError));
         return jsonResponse(result);
     });
 
@@ -769,7 +756,7 @@ void Server::setupRoutes()
     {
         QString error;
         if (!this->service.cancelCoupledSimulation(id, simulation_id, &error))
-            return errorResponse(error, Status::Conflict);
+            return errorResponse(error, statusForError(error, Status::Conflict));
         return jsonResponse(QJsonObject{{QStringLiteral("state"),
             QStringLiteral("cancel_requested")}}, Status::Accepted);
     });
@@ -800,12 +787,7 @@ void Server::setupRoutes()
             id, object.value(QStringLiteral("x")).toInt(),
             object.value(QStringLiteral("y")).toInt(), &error);
         if (!error.isEmpty())
-            return errorResponse(error,
-                error.startsWith(QStringLiteral("Catchment task queue full"))
-                    ? static_cast<Status>(429) :
-                error.startsWith(QStringLiteral("Unknown")) ? Status::NotFound :
-                error.startsWith(QStringLiteral("Analysis not completed")) ? Status::Conflict :
-                Status::BadRequest);
+            return errorResponse(error, statusForError(error, Status::BadRequest));
         return jsonResponse(result, Status::Accepted);
     });
 
@@ -815,7 +797,7 @@ void Server::setupRoutes()
     {
         QString error;
         const QJsonObject result = this->service.catchmentTask(id, task_id, &error);
-        if (!error.isEmpty()) return errorResponse(error, Status::NotFound);
+        if (!error.isEmpty()) return errorResponse(error, statusForError(error, Status::NotFound));
         return jsonResponse(result);
     });
 
@@ -826,9 +808,7 @@ void Server::setupRoutes()
         QString error;
         const QByteArray mask = this->service.catchmentTaskMask(id, task_id, &error);
         if (!error.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Unknown"))
-                ? Status::NotFound : error.startsWith(QStringLiteral("Catchment result not ready"))
-                ? Status::Conflict : Status::InternalServerError);
+            return errorResponse(error, statusForError(error, Status::InternalServerError));
         return HttpResponse(QByteArrayLiteral("application/vnd.aowis.catchment-u8"), mask);
     });
 
@@ -838,7 +818,7 @@ void Server::setupRoutes()
     {
         QString error;
         if (!this->service.cancelCatchmentTask(id, task_id, &error))
-            return errorResponse(error, Status::NotFound);
+            return errorResponse(error, statusForError(error, Status::NotFound));
         return jsonResponse(this->service.catchmentTask(id, task_id, &error), Status::Accepted);
     });
 
@@ -857,9 +837,7 @@ void Server::setupRoutes()
         QString error;
         const QByteArray data = this->service.catchment(id, x, y, &error);
         if (!error.isEmpty())
-            return errorResponse(error, error.startsWith(QStringLiteral("Invalid"))
-                ? Status::BadRequest : error.startsWith(QStringLiteral("Catchment calculation busy"))
-                ? static_cast<Status>(429) : Status::InternalServerError);
+            return errorResponse(error, statusForError(error, Status::InternalServerError));
         return HttpResponse(QByteArrayLiteral("application/vnd.aowis.catchment-u8"), data);
     });
 }

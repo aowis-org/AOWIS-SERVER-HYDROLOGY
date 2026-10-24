@@ -95,12 +95,21 @@ struct CoupledRoutingResult
     std::vector<CoupledRoutingSnapshot> snapshots;
     std::uint64_t accepted_substeps = 0;
     std::uint64_t rejected_substeps = 0;
+    // Accepted control transfers that were capped at stage equalization
+    // within their substep (see routeCoupledReservoirs). Nonzero values flag
+    // runs where the configured substep is coarse relative to equalization.
+    std::uint64_t equalization_limited_transfers = 0;
 };
 
 // Explicit finite-volume / reservoir routing, with every control evaluated
 // against the SAME start-of-substep stages and applied simultaneously.
-// Rejected substeps are halved if they would leave a stage-storage curve,
-// drain a weir donor below its crest, or reverse a control's head gradient.
+// Each internal control's substep volume is limited to the volume that would
+// equalize the stages it connects, so near-equalized reservoirs advance with
+// full substeps (an explicit sqrt-head orifice law otherwise stalls). Substeps
+// are still rejected and halved if they would leave a stage-storage curve,
+// drain a weir donor or an outlet reservoir below its crest, or let a control
+// itself reverse its head gradient. Reversal caused by inflow or other
+// controls is physical and accepted.
 // Unsupported partial orifice regimes fail explicitly; no guessed hydraulics.
 // Closed network only (no boundary outflow or negative inflow). Throws for
 // invalid parameters, excessive work, unsupported regimes or cancellation.

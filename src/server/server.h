@@ -29,6 +29,11 @@ struct ServerConfig
     int http_read_timeout_s = 15;
     int http_write_timeout_s = 30;
     int http_keep_alive_timeout_s = 5;
+    int max_concurrent_heavy_queries = 2;
+    std::uint64_t hierarchy_cache_basins = 4000000;
+    // When non-empty, every route except GET /status requires this key in an
+    // "X-API-Key" header or as "Authorization: Bearer <key>".
+    QByteArray api_key;
 };
 
 // Transport adapter; application and numerical state belong to AnalysisService.

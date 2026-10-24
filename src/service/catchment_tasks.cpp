@@ -71,9 +71,11 @@ QJsonObject AnalysisService::startCatchment(const QString &id, int x, int y, QSt
         if (error) *error = QStringLiteral("Unknown job");
         return {};
     }
-    if (item.value(QStringLiteral("state")) != QStringLiteral("completed"))
+    QString unavailable;
+    if (!completedJob(id, &unavailable)) // also waits for restored-artifact verification
     {
-        if (error) *error = QStringLiteral("Analysis not completed");
+        if (error) *error = unavailable == QStringLiteral("Unknown or incomplete job")
+            ? QStringLiteral("Analysis not completed") : unavailable;
         return {};
     }
     if (x < 0 || y < 0 || x >= item.value(QStringLiteral("columns")).toInt() ||
@@ -189,8 +191,9 @@ QByteArray AnalysisService::catchmentTaskMask(const QString &id,
     const QString &task_id, QString *error) const
 {
     if (error) error->clear();
-    // Hold the mutex while opening and reading: task eviction also removes
-    // spool files under this mutex.
+    // Open under the mutex (task eviction removes spool files under it); an
+    // open descriptor stays valid after unlink, so the up to grid-sized read
+    // happens without blocking status polls and the catchment worker.
     QMutexLocker lock(&this->catchment_tasks_mutex);
     const auto task = this->catchment_tasks.value(task_id);
     if (!task || task->analysis_id != id)
@@ -209,7 +212,14 @@ QByteArray AnalysisService::catchmentTaskMask(const QString &id,
         if (error) *error = QStringLiteral("Catchment result unavailable");
         return {};
     }
-    return file.readAll();
+    lock.unlock();
+    const QByteArray mask = file.readAll();
+    if (mask.size() != file.size())
+    {
+        if (error) *error = QStringLiteral("Catchment result unavailable");
+        return {};
+    }
+    return mask;
 }
 
 bool AnalysisService::cancelCatchmentTask(const QString &id,
