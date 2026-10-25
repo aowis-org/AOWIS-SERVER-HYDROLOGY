@@ -86,6 +86,29 @@ PolygonDrainageResult downstreamNetworkFromPolygon(
     std::uint64_t maximum_selected_channel_cells = 25000,
     std::uint32_t maximum_segments = 2000);
 
+// Reader-based variants for persisted graphs: identical results, but memory
+// proportional to the selected/affected cells (bounded by the budgets above)
+// instead of tens of bytes per grid cell. The window query reads the area
+// raster once; the polygon query reads areas only inside the polygons'
+// bounding box (geographic grids) and links only along the traced paths.
+ChannelNetwork extractWindowChannelNetwork(
+    const RasterGeometry &geometry, std::uint32_t columns, std::uint32_t rows,
+    const DownstreamReader &downstream, const UpstreamAreaReader &upstream_area,
+    double minimum_upstream_area_m2, const DrainageWindow &window,
+    std::uint64_t maximum_selected_channel_cells = 25000,
+    std::uint32_t maximum_segments = 2000);
+
+PolygonDrainageResult downstreamNetworkFromPolygon(
+    const RasterGeometry &geometry, std::uint32_t columns, std::uint32_t rows,
+    const DownstreamReader &downstream, const UpstreamAreaReader &upstream_area,
+    const std::vector<GeographicPolygon> &polygons,
+    double minimum_upstream_area_m2,
+    const DrainageWindow &window = {},
+    std::uint64_t maximum_source_cells = 100000,
+    std::uint64_t maximum_affected_cells = 250000,
+    std::uint64_t maximum_selected_channel_cells = 25000,
+    std::uint32_t maximum_segments = 2000);
+
 // Cell-edge vertex converted to WGS84. Do not use pixelCentreWgs84 here.
 MapCoordinate gridVertexWgs84(const RasterGeometry &geometry,
                               const GridVertex &vertex);

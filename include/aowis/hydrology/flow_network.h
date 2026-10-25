@@ -86,5 +86,32 @@ ChannelNetwork extractChannelNetwork(const AnalysisResult &result,
                                      std::uint64_t maximum_selected_cells = 25000,
                                      std::uint32_t maximum_segments = 2000);
 
+// Random-access reader of the persisted contributing-area raster (m2).
+using UpstreamAreaReader = std::function<double(std::uint64_t)>;
+
+// Reader-based extraction for persisted graphs. Memory is proportional to the
+// SELECTED channel cells (bounded by maximum_selected_cells), not to the
+// grid: one sequential pass reads the area raster, and downstream links are
+// read only for selected cells. Results are identical to the overload above.
+ChannelNetwork extractChannelNetwork(const RasterGeometry &geometry,
+                                     std::uint32_t columns, std::uint32_t rows,
+                                     const DownstreamReader &downstream,
+                                     const UpstreamAreaReader &upstream_area,
+                                     double minimum_upstream_area_m2,
+                                     std::uint64_t maximum_selected_cells = 25000,
+                                     std::uint32_t maximum_segments = 2000);
+
+// Build the network for an explicit cell selection: strictly ascending cell
+// indices whose areas (parallel vector) are the full-domain contributing
+// areas. Links leaving the selection end a segment. Used by the window and
+// polygon queries; callers enforce their own selection budget.
+ChannelNetwork channelNetworkFromCells(const RasterGeometry &geometry,
+                                       std::uint32_t columns, std::uint32_t rows,
+                                       const std::vector<std::uint64_t> &selected_cells,
+                                       const std::vector<double> &selected_areas_m2,
+                                       const DownstreamReader &downstream,
+                                       double threshold_m2,
+                                       std::uint32_t maximum_segments);
+
 } // namespace Aowis::Hydrology
 #endif

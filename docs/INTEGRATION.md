@@ -107,9 +107,14 @@ uses Map REST; optional GDAL GeoTIFF readers are for testing/development.
   scenario creation remains supported. Scenario-count admission is atomic for
   concurrent library callers. Task status is transient, persisted scenario
   archives are not.
-- Synchronous whole-grid queries share `ServiceConfig::max_concurrent_heavy_queries`
-  slots (1–16, default 2): channel networks, affected networks, basin storage
-  and curves, uncached hierarchy loads and rainfall scenario creation. A
+- Persisted rasters are read through memory maps. Channel, window and polygon
+  network queries use the reader-based core overloads (`extractChannelNetwork`,
+  `extractWindowChannelNetwork`, `downstreamNetworkFromPolygon`,
+  `basinStorageAtLevel` taking readers), whose memory is proportional to the
+  selected cells; the `AnalysisResult` overloads wrap them with identical
+  results. Full-grid scans still share `ServiceConfig::max_concurrent_heavy_queries`
+  slots (1–16, default 2): channel networks, affected networks, uncached
+  hierarchy loads and rainfall scenario creation. A
   synchronous caller fails fast with `Heavy query capacity busy; retry later`
   (HTTP 429); asynchronous rainfall tasks wait cancellably. Decoded
   hierarchies plus their UUID index are cached up to

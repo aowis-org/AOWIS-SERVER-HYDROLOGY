@@ -5,6 +5,7 @@
 #include <limits>
 #include <queue>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 namespace Aowis::Hydrology
@@ -113,118 +114,165 @@ FlowTrace traceDownstream(const AnalysisResult &result,
         [&result](std::uint64_t i) { return result.conditioned_elevations_m[std::size_t(i)]; });
 }
 
+ChannelNetwork channelNetworkFromCells(const RasterGeometry &geometry,
+                                       std::uint32_t columns, std::uint32_t rows,
+                                       const std::vector<std::uint64_t> &selected_cells,
+                                       const std::vector<double> &selected_areas_m2,
+                                       const DownstreamReader &downstream,
+                                       double threshold_m2,
+                                       std::uint32_t maximum_segments)
+{
+    validateRasterGeometry(geometry, columns, rows);
+    const std::uint64_t count = std::uint64_t(columns) * rows;
+    if (selected_cells.size() != selected_areas_m2.size() || !downstream ||
+        maximum_segments == 0)
+        throw std::invalid_argument("Invalid channel-network cell selection");
+    for (std::size_t i = 0; i < selected_cells.size(); ++i)
+        if (selected_cells[i] >= count || (i > 0 && selected_cells[i] <= selected_cells[i - 1]))
+            throw std::invalid_argument("Channel-network selection must be ascending grid cells");
+    const std::size_t n = selected_cells.size();
+    ChannelNetwork network;
+    network.threshold_m2 = threshold_m2;
+    network.selected_cells = n;
+    std::unordered_map<std::uint64_t, std::size_t> position;
+    position.reserve(n);
+    for (std::size_t i = 0; i < n; ++i)
+        position.emplace(selected_cells[i], i);
+    // Downstream cell and its position inside the selection (-1 if outside).
+    std::vector<std::int64_t> next_cell(n, -1);
+    std::vector<std::int64_t> next_local(n, -1);
+    std::vector<std::uint8_t> incoming(n, 0);
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        const std::int64_t next = downstream(selected_cells[i]);
+        checkNext(selected_cells[i], next, columns, rows);
+        next_cell[i] = next;
+        if (next < 0) continue;
+        const std::unordered_map<std::uint64_t, std::size_t>::const_iterator found =
+            position.find(std::uint64_t(next));
+        if (found == position.cend()) continue;
+        next_local[i] = std::int64_t(found->second);
+        ++incoming[found->second];
+    }
+    std::vector<std::uint8_t> remaining = incoming;
+    std::vector<std::uint16_t> order(n, 0);
+    std::vector<std::uint16_t> max_order(n, 0);
+    std::vector<std::uint8_t> max_count(n, 0);
+    std::queue<std::size_t> ready;
+    for (std::size_t i = 0; i < n; ++i)
+        if (incoming[i] == 0) ready.push(i);
+    std::uint64_t processed = 0;
+    while (!ready.empty())
+    {
+        const std::size_t cell = ready.front();
+        ready.pop();
+        ++processed;
+        const std::uint16_t best = max_order[cell];
+        order[cell] = best == 0 ? 1 : std::uint16_t(best + (max_count[cell] >= 2 ? 1 : 0));
+        const std::int64_t next = next_local[cell];
+        if (next >= 0)
+        {
+            const std::size_t target = std::size_t(next);
+            if (order[cell] > max_order[target])
+            {
+                max_order[target] = order[cell];
+                max_count[target] = 1;
+            }
+            else if (order[cell] == max_order[target])
+                ++max_count[target];
+            if (--remaining[target] == 0)
+                ready.push(target);
+        }
+    }
+    if (processed != n)
+        throw std::runtime_error("Channel graph contains a cycle");
+
+    std::vector<std::uint8_t> node(n, 0);
+    std::vector<std::size_t> node_positions;
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        if (incoming[i] != 1 || next_local[i] < 0)
+        {
+            node[i] = 1;
+            node_positions.push_back(i);
+            network.nodes.push_back({selected_cells[i], incoming[i], order[i]});
+        }
+    }
+    for (const std::size_t start : node_positions)
+    {
+        if (next_local[start] < 0) continue;
+        if (network.segments.size() >= maximum_segments)
+            throw std::invalid_argument("Too many channel segments; raise the accumulation threshold");
+        ChannelSegment segment;
+        segment.id = selected_cells[start];
+        segment.from_cell = selected_cells[start];
+        segment.strahler_order = order[start];
+        segment.cells.push_back(selected_cells[start]);
+        std::size_t current = start;
+        for (std::uint64_t traversed = 0; traversed < n; ++traversed)
+        {
+            const std::int64_t following = next_local[current];
+            if (following < 0)
+                throw std::runtime_error("Channel segment terminates outside selected network");
+            segment.length_m += lengthM(geometry, columns, selected_cells[current],
+                                        std::uint64_t(next_cell[current]));
+            current = std::size_t(following);
+            segment.cells.push_back(selected_cells[current]);
+            if (node[current]) break;
+            if (traversed + 1 == n)
+                throw std::runtime_error("Channel segment has no downstream junction or outlet");
+        }
+        segment.to_cell = selected_cells[current];
+        segment.upstream_area_at_end_m2 = selected_areas_m2[current];
+        network.segments.push_back(std::move(segment));
+    }
+    return network;
+}
+
+ChannelNetwork extractChannelNetwork(const RasterGeometry &geometry,
+                                     std::uint32_t columns, std::uint32_t rows,
+                                     const DownstreamReader &downstream,
+                                     const UpstreamAreaReader &upstream_area,
+                                     double minimum_upstream_area_m2,
+                                     std::uint64_t maximum_selected_cells,
+                                     std::uint32_t maximum_segments)
+{
+    validateRasterGeometry(geometry, columns, rows);
+    if (!downstream || !upstream_area)
+        throw std::invalid_argument("Incomplete flow graph for channel extraction");
+    if (!std::isfinite(minimum_upstream_area_m2) || minimum_upstream_area_m2 <= 0.0 ||
+        maximum_selected_cells == 0 || maximum_segments == 0)
+        throw std::invalid_argument("Invalid channel-network extraction limits");
+    const std::uint64_t count = std::uint64_t(columns) * rows;
+    std::vector<std::uint64_t> cells;
+    std::vector<double> areas;
+    for (std::uint64_t index = 0; index < count; ++index)
+    {
+        const double area = upstream_area(index);
+        if (!(area >= minimum_upstream_area_m2)) continue;
+        if (cells.size() >= maximum_selected_cells)
+            throw std::invalid_argument("Too many selected channel cells; raise the accumulation threshold");
+        cells.push_back(index);
+        areas.push_back(area);
+    }
+    return channelNetworkFromCells(geometry, columns, rows, cells, areas, downstream,
+                                   minimum_upstream_area_m2, maximum_segments);
+}
+
 ChannelNetwork extractChannelNetwork(const AnalysisResult &result,
                                      double minimum_upstream_area_m2,
                                      std::uint64_t maximum_selected_cells,
                                      std::uint32_t maximum_segments)
 {
-    const std::uint32_t columns = result.source.columns;
-    const std::uint32_t rows = result.source.rows;
-    validateRasterGeometry(result.source.geometry, columns, rows);
-    const std::uint64_t count = std::uint64_t(columns) * rows;
+    const std::uint64_t count = std::uint64_t(result.source.columns) * result.source.rows;
+    validateRasterGeometry(result.source.geometry, result.source.columns, result.source.rows);
     if (result.downstream.size() != count || result.upstream_area_m2.size() != count)
         throw std::invalid_argument("Incomplete flow graph for channel extraction");
-    if (!std::isfinite(minimum_upstream_area_m2) || minimum_upstream_area_m2 <= 0.0 ||
-        maximum_selected_cells == 0 || maximum_segments == 0)
-        throw std::invalid_argument("Invalid channel-network extraction limits");
-    ChannelNetwork network;
-    network.threshold_m2 = minimum_upstream_area_m2;
-    std::vector<std::uint8_t> selected(std::size_t(count), 0);
-    for (std::uint64_t index = 0; index < count; ++index)
-    {
-        if (result.upstream_area_m2[std::size_t(index)] >= minimum_upstream_area_m2)
-        {
-            selected[std::size_t(index)] = 1;
-            ++network.selected_cells;
-            if (network.selected_cells > maximum_selected_cells)
-                throw std::invalid_argument("Too many selected channel cells; raise the accumulation threshold");
-        }
-    }
-    std::vector<std::uint8_t> incoming(std::size_t(count), 0);
-    for (std::uint64_t index = 0; index < count; ++index)
-    {
-        if (!selected[std::size_t(index)]) continue;
-        const std::int64_t next = result.downstream[std::size_t(index)];
-        checkNext(index, next, columns, rows);
-        if (next >= 0 && selected[std::size_t(next)])
-            ++incoming[std::size_t(next)];
-    }
-    std::vector<std::uint8_t> remaining = incoming;
-    std::vector<std::uint16_t> order(std::size_t(count), 0);
-    std::vector<std::uint16_t> max_order(std::size_t(count), 0);
-    std::vector<std::uint8_t> max_count(std::size_t(count), 0);
-    std::queue<std::uint64_t> ready;
-    for (std::uint64_t index = 0; index < count; ++index)
-        if (selected[std::size_t(index)] && incoming[std::size_t(index)] == 0)
-            ready.push(index);
-    std::uint64_t processed = 0;
-    while (!ready.empty())
-    {
-        const std::uint64_t cell = ready.front();
-        ready.pop();
-        ++processed;
-        const std::uint16_t best = max_order[std::size_t(cell)];
-        order[std::size_t(cell)] = best == 0 ? 1 :
-            std::uint16_t(best + (max_count[std::size_t(cell)] >= 2 ? 1 : 0));
-        const std::int64_t next = result.downstream[std::size_t(cell)];
-        if (next >= 0 && selected[std::size_t(next)])
-        {
-            if (order[std::size_t(cell)] > max_order[std::size_t(next)])
-            {
-                max_order[std::size_t(next)] = order[std::size_t(cell)];
-                max_count[std::size_t(next)] = 1;
-            }
-            else if (order[std::size_t(cell)] == max_order[std::size_t(next)])
-                ++max_count[std::size_t(next)];
-            if (--remaining[std::size_t(next)] == 0)
-                ready.push(std::uint64_t(next));
-        }
-    }
-    if (processed != network.selected_cells)
-        throw std::runtime_error("Channel graph contains a cycle");
-
-    std::vector<std::uint8_t> node(std::size_t(count), 0);
-    for (std::uint64_t index = 0; index < count; ++index)
-    {
-        if (!selected[std::size_t(index)]) continue;
-        const std::int64_t next = result.downstream[std::size_t(index)];
-        if (incoming[std::size_t(index)] != 1 || next < 0 ||
-            !selected[std::size_t(next)])
-        {
-            node[std::size_t(index)] = 1;
-            network.nodes.push_back({index, incoming[std::size_t(index)], order[std::size_t(index)]});
-        }
-    }
-    for (const ChannelNode &start : network.nodes)
-    {
-        const std::int64_t next = result.downstream[std::size_t(start.cell_index)];
-        if (next < 0 || !selected[std::size_t(next)]) continue;
-        if (network.segments.size() >= maximum_segments)
-            throw std::invalid_argument("Too many channel segments; raise the accumulation threshold");
-        ChannelSegment segment;
-        segment.id = start.cell_index;
-        segment.from_cell = start.cell_index;
-        segment.strahler_order = start.strahler_order;
-        segment.cells.push_back(start.cell_index);
-        std::uint64_t current = start.cell_index;
-        for (std::uint64_t traversed = 0; traversed < network.selected_cells; ++traversed)
-        {
-            const std::int64_t next_cell = result.downstream[std::size_t(current)];
-            if (next_cell < 0 || !selected[std::size_t(next_cell)])
-                throw std::runtime_error("Channel segment terminates outside selected network");
-            segment.length_m += lengthM(result.source.geometry, columns,
-                                       current, std::uint64_t(next_cell));
-            current = std::uint64_t(next_cell);
-            segment.cells.push_back(current);
-            if (node[std::size_t(current)]) break;
-            if (traversed + 1 == network.selected_cells)
-                throw std::runtime_error("Channel segment has no downstream junction or outlet");
-        }
-        segment.to_cell = current;
-        segment.upstream_area_at_end_m2 = result.upstream_area_m2[std::size_t(current)];
-        network.segments.push_back(std::move(segment));
-    }
-    return network;
+    return extractChannelNetwork(result.source.geometry, result.source.columns,
+        result.source.rows,
+        [&result](std::uint64_t i) { return result.downstream[std::size_t(i)]; },
+        [&result](std::uint64_t i) { return result.upstream_area_m2[std::size_t(i)]; },
+        minimum_upstream_area_m2, maximum_selected_cells, maximum_segments);
 }
 
 } // namespace Aowis::Hydrology

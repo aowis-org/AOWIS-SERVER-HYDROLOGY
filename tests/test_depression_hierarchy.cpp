@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <functional>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -299,4 +300,29 @@ int main()
     try { (void)buildDepressionHierarchy(paired, true, &cancelled); }
     catch (const std::runtime_error &) { rejected = true; }
     assert(rejected);
+
+    // Reader-based storage queries read only the basin and its neighbours
+    // and match the in-memory overload exactly.
+    {
+        const DepressionHierarchy hierarchy = buildDepressionHierarchy(single);
+        const std::uint64_t cells = std::uint64_t(single.columns) * single.rows;
+        std::uint64_t reads = 0;
+        const std::function<float(std::uint64_t)> elevation = [&](std::uint64_t cell)
+        {
+            assert(cell < cells);
+            ++reads;
+            return single.elevations_m[std::size_t(cell)];
+        };
+        for (const double level : {12.0, 13.5})
+        {
+            reads = 0;
+            const BasinStorageState mapped = basinStorageAtLevel(single.geometry,
+                single.columns, single.rows, elevation, hierarchy, 0, level);
+            const BasinStorageState dense = basinStorageAtLevel(single, hierarchy, 0, level);
+            assert(mapped.water_volume_m3 == dense.water_volume_m3);
+            assert(mapped.inundated_cells == dense.inundated_cells);
+            assert(mapped.inundated_cell_area_m2 == dense.inundated_cell_area_m2);
+            assert(reads <= 9 * mapped.inundated_cells);
+        }
+    }
 }

@@ -3,9 +3,14 @@
 #endif
 #include <aowis/hydrology/spatial_queries.h>
 
+#include <aowis/hydrology/analysis.h>
+
 #include <cassert>
 #include <cmath>
+#include <cstdint>
 #include <stdexcept>
+#include <unordered_set>
+#include <vector>
 
 using namespace Aowis::Hydrology;
 
@@ -164,5 +169,86 @@ int main()
     try { (void)downstreamNetworkFromPolygon(result, {malformed}, 100000.0); }
     catch (const std::invalid_argument &) { rejected = true; }
     assert(rejected);
+
+    // Reader-based queries on a larger synthetic terrain: identical results
+    // to the in-memory overloads while reading only the cells they need.
+    {
+        ElevationGrid terrain;
+        terrain.columns = 120;
+        terrain.rows = 90;
+        terrain.geometry = grid().geometry;
+        terrain.geometry.pixel_width = 0.0003;
+        terrain.geometry.pixel_height = 0.0003;
+        terrain.elevations_m.resize(std::size_t(terrain.columns) * terrain.rows);
+        for (std::size_t i = 0; i < terrain.elevations_m.size(); ++i)
+        {
+            const double x = double(i % terrain.columns);
+            const double y = double(i / terrain.columns);
+            terrain.elevations_m[i] = float(200.0 - 0.5 * x - 0.3 * y +
+                4.0 * std::sin(0.21 * x) * std::cos(0.17 * y));
+        }
+        const AnalysisResult flow = analyze(terrain);
+        const std::uint64_t cells = std::uint64_t(terrain.columns) * terrain.rows;
+        std::uint64_t link_reads = 0;
+        std::uint64_t area_reads = 0;
+        std::unordered_set<std::uint64_t> area_cells;
+        const DownstreamReader links = [&](std::uint64_t cell)
+        {
+            assert(cell < cells);
+            ++link_reads;
+            return flow.downstream[std::size_t(cell)];
+        };
+        const UpstreamAreaReader areas = [&](std::uint64_t cell)
+        {
+            assert(cell < cells);
+            ++area_reads;
+            area_cells.insert(cell);
+            return flow.upstream_area_m2[std::size_t(cell)];
+        };
+        const auto same = [](const ChannelNetwork &a, const ChannelNetwork &b)
+        {
+            if (a.selected_cells != b.selected_cells || a.nodes.size() != b.nodes.size() ||
+                a.segments.size() != b.segments.size())
+                return false;
+            for (std::size_t i = 0; i < a.segments.size(); ++i)
+                if (a.segments[i].cells != b.segments[i].cells ||
+                    a.segments[i].strahler_order != b.segments[i].strahler_order ||
+                    a.segments[i].length_m != b.segments[i].length_m)
+                    return false;
+            return true;
+        };
+        const double threshold = 400000.0;
+        const ChannelNetwork full = extractChannelNetwork(terrain.geometry, terrain.columns,
+            terrain.rows, links, areas, threshold, 25000, 2000);
+        assert(full.selected_cells > 0 && !full.segments.empty());
+        assert(same(full, extractChannelNetwork(flow, threshold, 25000, 2000)));
+        // One sequential pass over the area raster; links only for selected cells.
+        assert(area_reads == cells);
+        assert(link_reads == full.selected_cells);
+
+        const DrainageWindow window{8.006, 50.0 - 0.02, 8.024, 50.0 - 0.004};
+        link_reads = 0;
+        const ChannelNetwork clipped = extractWindowChannelNetwork(terrain.geometry,
+            terrain.columns, terrain.rows, links, areas, threshold, window);
+        assert(same(clipped, extractWindowChannelNetwork(flow, threshold, window)));
+        assert(link_reads == clipped.selected_cells);
+
+        // The polygon query reads areas only around the polygon and along
+        // the traced downstream paths, never the whole raster.
+        GeographicPolygon square;
+        square.exterior = ring(8.009, 49.991, 8.012, 49.994);
+        link_reads = 0;
+        area_reads = 0;
+        area_cells.clear();
+        const PolygonDrainageResult affected = downstreamNetworkFromPolygon(terrain.geometry,
+            terrain.columns, terrain.rows, links, areas, {square}, threshold);
+        const PolygonDrainageResult dense = downstreamNetworkFromPolygon(flow, {square}, threshold);
+        assert(affected.source_cells == dense.source_cells && affected.source_cells > 0);
+        assert(affected.downstream_affected_cells == dense.downstream_affected_cells);
+        assert(affected.affected_boundary_cells == dense.affected_boundary_cells);
+        assert(same(affected.network, dense.network));
+        assert(area_cells.size() < cells / 10);
+        assert(link_reads <= affected.downstream_affected_cells + affected.network.selected_cells);
+    }
     return 0;
 }

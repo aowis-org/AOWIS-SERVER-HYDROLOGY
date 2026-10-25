@@ -257,12 +257,16 @@ borrowed in-process Map interface remains sequential. Increasing workers can
 multiply peak RAM; benchmark representative requests before doing so.
 Configuration changes require a server restart.
 
-**Synchronous whole-grid queries** (channel networks, affected networks,
-basin storage and curves, uncached basin hierarchies, synchronous rainfall
-scenarios) materialize full-grid arrays of up to 16 bytes per cell on the
-HTTP worker thread. At most `max_concurrent_heavy_queries` (1–16, default 2)
-run at once; further requests receive HTTP `429` ("Heavy query capacity
-busy") instead of multiplying peak memory by `http_workers`. Asynchronous
+**Stored-result queries read persisted rasters through memory maps** instead
+of loading them: channel networks, windowed and polygon-affected networks
+allocate memory proportional to the selected/affected cells only (a 40M-cell
+network query fell from about 960 MB of heap to 2 MB), and basin storage and
+curves read only the basin's cells plus a one-bit-per-cell visited set.
+Mapped pages are shared, reclaimable page cache. Queries that still scan or
+materialize whole grids (channel networks, affected networks, uncached basin
+hierarchies, synchronous rainfall scenarios) are limited to
+`max_concurrent_heavy_queries` (1–16, default 2) at once; further requests
+receive HTTP `429` ("Heavy query capacity busy"). Asynchronous
 rainfall tasks wait for the same slots. Decoded basin hierarchies with their
 UUID index are cached up to `hierarchy_cache_basins` basins in total (0
 disables the cache), so basin paging and lookups no longer decode the archive

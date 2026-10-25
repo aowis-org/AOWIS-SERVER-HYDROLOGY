@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -669,36 +670,66 @@ std::vector<GeographicPolygon> parseGeoJsonPolygons(const QJsonObject &object)
     return polygons;
 }
 
-AnalysisResult readStoredChannelGraph(const ElevationGrid &geometry, const QString &directory)
+// Read-only memory map of one persisted fixed-size raster. Queries read only
+// the cells they need; untouched pages are never loaded, and touched pages
+// are reclaimable page cache rather than per-request heap allocations.
+class MappedRaster final
 {
-    const std::uint64_t cells = std::uint64_t(geometry.columns) * geometry.rows;
-    QFile links(QDir(directory).filePath(QStringLiteral("downstream.i64")));
-    QFile areas(QDir(directory).filePath(QStringLiteral("upstream-area.f64")));
-    if (!links.open(QIODevice::ReadOnly) || !areas.open(QIODevice::ReadOnly) ||
-        links.size() != qint64(cells * 8) || areas.size() != qint64(cells * 8))
-        throw std::runtime_error("Missing or incomplete stored flow graph");
-    AnalysisResult result;
-    result.source = geometry;
-    result.downstream.resize(std::size_t(cells));
-    result.upstream_area_m2.resize(std::size_t(cells));
-    constexpr qsizetype chunk_cells = 4096;
-    for (std::uint64_t offset = 0; offset < cells; offset += chunk_cells)
+public:
+    MappedRaster(const QString &path, std::uint64_t expected_bytes, const char *problem)
+        : file(path)
     {
-        const qsizetype bytes = qsizetype(std::min<std::uint64_t>(chunk_cells, cells - offset)) * 8;
-        const QByteArray link_data = links.read(bytes);
-        const QByteArray area_data = areas.read(bytes);
-        if (link_data.size() != bytes || area_data.size() != bytes)
-            throw std::runtime_error("Truncated persisted channel data");
-        for (qsizetype index = 0; index < bytes / 8; ++index)
-        {
-            const std::size_t cell = std::size_t(offset + std::uint64_t(index));
-            result.downstream[cell] = downstreamValue(link_data.constData() + index * 8);
-            const quint64 bits = qFromLittleEndian<quint64>(area_data.constData() + index * 8);
-            std::memcpy(&result.upstream_area_m2[cell], &bits, sizeof(bits));
-        }
+        if (!this->file.open(QIODevice::ReadOnly) ||
+            std::uint64_t(this->file.size()) != expected_bytes)
+            throw std::runtime_error(problem);
+        this->data = this->file.map(0, qint64(expected_bytes));
+        if (this->data == nullptr)
+            throw std::runtime_error(problem);
     }
-    return result;
-}
+    MappedRaster(const MappedRaster &) = delete;
+    MappedRaster &operator=(const MappedRaster &) = delete;
+    const uchar *bytes() const { return this->data; }
+
+private:
+    QFile file;
+    uchar *data = nullptr;
+};
+
+// Stored D8 graph (downstream links + contributing area) through mapped
+// readers; nothing proportional to the grid is allocated.
+struct StoredFlowGraph
+{
+    StoredFlowGraph(const ElevationGrid &geometry, const QString &directory)
+        : links(QDir(directory).filePath(QStringLiteral("downstream.i64")),
+                std::uint64_t(geometry.columns) * geometry.rows * 8,
+                "Missing or incomplete stored flow graph"),
+          areas(QDir(directory).filePath(QStringLiteral("upstream-area.f64")),
+                std::uint64_t(geometry.columns) * geometry.rows * 8,
+                "Missing or incomplete stored flow graph")
+    {
+    }
+    DownstreamReader downstream() const
+    {
+        const uchar *base = this->links.bytes();
+        return [base](std::uint64_t cell)
+        {
+            return downstreamValue(reinterpret_cast<const char *>(base + cell * 8));
+        };
+    }
+    UpstreamAreaReader upstreamArea() const
+    {
+        const uchar *base = this->areas.bytes();
+        return [base](std::uint64_t cell)
+        {
+            const quint64 bits = qFromLittleEndian<quint64>(base + cell * 8);
+            double area = 0.0;
+            std::memcpy(&area, &bits, sizeof(area));
+            return area;
+        };
+    }
+    MappedRaster links;
+    MappedRaster areas;
+};
 
 QJsonObject channelNetworkJson(const ChannelNetwork &network,
                                const ElevationGrid &grid)
@@ -1826,8 +1857,9 @@ QJsonObject AnalysisService::channelNetwork(const QString &id,
     {
         const HeavyQuerySlot slot(this->heavy_query_slots, nullptr);
         if (!slot.acquired()) throw std::runtime_error(HeavyQueryBusy.toStdString());
-        const AnalysisResult result = readStoredChannelGraph(item->grid, jobDirectory(id));
-        return channelNetworkJson(extractChannelNetwork(result,
+        const StoredFlowGraph graph(item->grid, jobDirectory(id));
+        return channelNetworkJson(extractChannelNetwork(item->grid.geometry,
+            item->grid.columns, item->grid.rows, graph.downstream(), graph.upstreamArea(),
             minimum_area_km2 * 1.0e6, 25000, 2000), item->grid);
     }
     catch (const std::exception &ex)
@@ -1853,9 +1885,11 @@ QJsonObject AnalysisService::channelNetworkWindow(const QString &id,
     {
         const HeavyQuerySlot slot(this->heavy_query_slots, nullptr);
         if (!slot.acquired()) throw std::runtime_error(HeavyQueryBusy.toStdString());
-        const AnalysisResult graph = readStoredChannelGraph(item->grid, jobDirectory(id));
+        const StoredFlowGraph graph(item->grid, jobDirectory(id));
         QJsonObject output = channelNetworkJson(extractWindowChannelNetwork(
-            graph, minimum_area_km2 * 1.0e6, window), item->grid);
+            item->grid.geometry, item->grid.columns, item->grid.rows,
+            graph.downstream(), graph.upstreamArea(), minimum_area_km2 * 1.0e6, window),
+            item->grid);
         output.insert(QStringLiteral("window_clipped"), true);
         output.insert(QStringLiteral("local_stream_order"), true);
         return output;
@@ -1955,9 +1989,11 @@ QJsonObject AnalysisService::affectedNetwork(const QString &id,
         }
         const HeavyQuerySlot slot(this->heavy_query_slots, nullptr);
         if (!slot.acquired()) throw std::runtime_error(HeavyQueryBusy.toStdString());
-        const AnalysisResult graph = readStoredChannelGraph(item->grid, jobDirectory(id));
+        const StoredFlowGraph graph(item->grid, jobDirectory(id));
         const PolygonDrainageResult affected = downstreamNetworkFromPolygon(
-            graph, polygons, threshold_value.toDouble() * 1.0e6, window);
+            item->grid.geometry, item->grid.columns, item->grid.rows,
+            graph.downstream(), graph.upstreamArea(), polygons,
+            threshold_value.toDouble() * 1.0e6, window);
         QJsonObject output = channelNetworkJson(affected.network, item->grid);
         output.insert(QStringLiteral("source_cells"), double(affected.source_cells));
         output.insert(QStringLiteral("downstream_affected_cells"),
@@ -2047,11 +2083,21 @@ QJsonObject AnalysisService::basinStorage(const QString &id, const QString &basi
         const std::shared_ptr<const CachedBasinHierarchy> cached = cachedHierarchy(item);
         const DepressionHierarchy &hierarchy = cached->hierarchy;
         const DepressionBasin &selected = findBasin(*cached, basin_uuid);
-        const HeavyQuerySlot slot(this->heavy_query_slots, nullptr);
-        if (!slot.acquired()) throw std::runtime_error(HeavyQueryBusy.toStdString());
-        const ElevationGrid elevation = loadOriginalElevation(folder, item->grid);
-        const BasinStorageState storage = basinStorageAtLevel(elevation, hierarchy,
-                                                              selected.index, level_m);
+        // Only the basin's cells and their neighbours are read from the
+        // mapped DEM; the visited set is one bit per cell. Cheap enough not
+        // to need a heavy-query slot.
+        const MappedRaster dem(QDir(folder).filePath(QStringLiteral("elevation.f32")),
+            std::uint64_t(item->grid.columns) * item->grid.rows * 4,
+            "Missing or incomplete source elevation raster");
+        const std::function<float(std::uint64_t)> elevation = [base = dem.bytes()](std::uint64_t cell)
+        {
+            const quint32 bits = qFromLittleEndian<quint32>(base + cell * 4);
+            float height = 0.0f;
+            std::memcpy(&height, &bits, sizeof(height));
+            return height;
+        };
+        const BasinStorageState storage = basinStorageAtLevel(item->grid.geometry,
+            item->grid.columns, item->grid.rows, elevation, hierarchy, selected.index, level_m);
         QJsonObject output = stateJson(storage);
         output.insert(QStringLiteral("basin_id"), basinUuid(id, selected.index));
         output.insert(QStringLiteral("job_id"), id);
@@ -2084,9 +2130,19 @@ QJsonObject AnalysisService::basinStorageCurve(const QString &id, const QString 
         const DepressionBasin &selected = findBasin(*cached, basin_uuid);
         if (!std::isfinite(selected.spill_elevation_m))
             throw std::invalid_argument("Basin has no known spill elevation");
-        const HeavyQuerySlot slot(this->heavy_query_slots, nullptr);
-        if (!slot.acquired()) throw std::runtime_error(HeavyQueryBusy.toStdString());
-        const ElevationGrid elevation = loadOriginalElevation(folder, item->grid);
+        // Only the basin's cells and their neighbours are read from the
+        // mapped DEM; the visited set is one bit per cell. Cheap enough not
+        // to need a heavy-query slot.
+        const MappedRaster dem(QDir(folder).filePath(QStringLiteral("elevation.f32")),
+            std::uint64_t(item->grid.columns) * item->grid.rows * 4,
+            "Missing or incomplete source elevation raster");
+        const std::function<float(std::uint64_t)> elevation = [base = dem.bytes()](std::uint64_t cell)
+        {
+            const quint32 bits = qFromLittleEndian<quint32>(base + cell * 4);
+            float height = 0.0f;
+            std::memcpy(&height, &bits, sizeof(height));
+            return height;
+        };
         QJsonArray curve;
         for (int index = 0; index < samples; ++index)
         {
@@ -2094,7 +2150,8 @@ QJsonObject AnalysisService::basinStorageCurve(const QString &id, const QString 
                 selected.formation_elevation_m +
                 (selected.spill_elevation_m - selected.formation_elevation_m) *
                 (double(index) / double(samples - 1));
-            const BasinStorageState storage = basinStorageAtLevel(elevation, hierarchy,
+            const BasinStorageState storage = basinStorageAtLevel(item->grid.geometry,
+                item->grid.columns, item->grid.rows, elevation, hierarchy,
                 selected.index, level, 2000000);
             curve.append(stateJson(storage));
         }

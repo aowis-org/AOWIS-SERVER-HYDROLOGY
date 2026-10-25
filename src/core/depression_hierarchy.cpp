@@ -347,15 +347,16 @@ DepressionHierarchy buildDepressionHierarchy(
 }
 
 BasinStorageState basinStorageAtLevel(
-    const ElevationGrid &source, const DepressionHierarchy &hierarchy,
+    const RasterGeometry &geometry, std::uint32_t columns, std::uint32_t rows,
+    const std::function<float(std::uint64_t)> &elevation,
+    const DepressionHierarchy &hierarchy,
     std::uint64_t basin_index, double water_level_m,
     std::uint64_t max_visited_cells,
     const std::atomic<bool> *cancel_requested)
 {
-    if (basin_index >= hierarchy.basins.size() ||
-        source.columns != hierarchy.columns || source.rows != hierarchy.rows ||
-        !std::isfinite(water_level_m) || max_visited_cells == 0 ||
-        std::uint64_t(source.columns) * source.rows != source.elevations_m.size())
+    if (basin_index >= hierarchy.basins.size() || !elevation ||
+        columns != hierarchy.columns || rows != hierarchy.rows ||
+        !std::isfinite(water_level_m) || max_visited_cells == 0)
         throw std::invalid_argument("Invalid basin storage query");
     const DepressionBasin &basin = hierarchy.basins[std::size_t(basin_index)];
     if (!std::isfinite(basin.spill_elevation_m))
@@ -372,17 +373,26 @@ BasinStorageState basinStorageAtLevel(
         result.inundated_cells = basin.cells_below_spill;
         return result;
     }
-    const std::uint64_t count = std::uint64_t(source.columns) * source.rows;
+    const std::uint64_t count = std::uint64_t(columns) * rows;
     if (basin.minimum_cell >= count)
         throw std::invalid_argument("Basin minimum lies outside DEM");
     // Storage queries visit cells in arbitrary BFS order. Lazily calculate
     // each encountered row area once, so even a large connected lake doesn't
     // repeat ellipsoidal-polygon evaluation for every cell.
-    std::vector<double> row_cell_areas(std::size_t(source.rows),
+    std::vector<double> row_cell_areas(std::size_t(rows),
                                        std::numeric_limits<double>::quiet_NaN());
-    std::vector<std::uint8_t> visited(std::size_t(count), 0);
+    // One bit per cell (1/32 of a float DEM).
+    std::vector<std::uint64_t> visited(std::size_t((count + 63) / 64), 0);
+    const auto test_and_set = [&visited](std::uint64_t cell)
+    {
+        std::uint64_t &word = visited[std::size_t(cell / 64)];
+        const std::uint64_t bit = std::uint64_t(1) << (cell % 64);
+        const bool already = (word & bit) != 0;
+        word |= bit;
+        return already;
+    };
     std::queue<std::uint64_t> ready;
-    visited[std::size_t(basin.minimum_cell)] = 1;
+    test_and_set(basin.minimum_cell);
     ready.push(basin.minimum_cell);
     BasinStorageState result;
     result.water_level_m = water_level_m;
@@ -393,26 +403,45 @@ BasinStorageState basinStorageAtLevel(
         ready.pop();
         if (++result.inundated_cells > max_visited_cells)
             throw std::runtime_error("Basin storage query cell limit exceeded");
-        const double elevation = source.elevations_m[std::size_t(index)];
-        const std::size_t row = std::size_t(index / source.columns);
+        const double cell_elevation = elevation(index);
+        const std::size_t row = std::size_t(index / columns);
         double &area = row_cell_areas[row];
         if (std::isnan(area))
-            area = rasterRowCellAreaM2(source.geometry, source.columns,
-                                       std::uint32_t(row));
+            area = rasterRowCellAreaM2(geometry, columns, std::uint32_t(row));
         result.inundated_cell_area_m2 += area;
-        result.water_volume_m3 += std::max(0.0, water_level_m - elevation) * area;
+        result.water_volume_m3 += std::max(0.0, water_level_m - cell_elevation) * area;
+        const std::int64_t x = std::int64_t(index % columns);
+        const std::int64_t y = std::int64_t(index / columns);
         for (int direction = 0; direction < 8; ++direction)
         {
-            std::uint64_t other = 0;
-            if (!adjacent(source, index, direction, &other) || visited[std::size_t(other)] ||
-                !std::isfinite(source.elevations_m[std::size_t(other)]) ||
-                source.elevations_m[std::size_t(other)] > water_level_m)
+            const std::int64_t nx = x + Dx[direction];
+            const std::int64_t ny = y + Dy[direction];
+            if (nx < 0 || ny < 0 || nx >= columns || ny >= rows)
                 continue;
-            visited[std::size_t(other)] = 1;
+            const std::uint64_t other = std::uint64_t(ny) * columns + std::uint64_t(nx);
+            if ((visited[std::size_t(other / 64)] >> (other % 64)) & 1U)
+                continue;
+            const float other_elevation = elevation(other);
+            if (!std::isfinite(other_elevation) || other_elevation > water_level_m)
+                continue;
+            test_and_set(other);
             ready.push(other);
         }
     }
     return result;
+}
+
+BasinStorageState basinStorageAtLevel(
+    const ElevationGrid &source, const DepressionHierarchy &hierarchy,
+    std::uint64_t basin_index, double water_level_m,
+    std::uint64_t max_visited_cells,
+    const std::atomic<bool> *cancel_requested)
+{
+    if (std::uint64_t(source.columns) * source.rows != source.elevations_m.size())
+        throw std::invalid_argument("Invalid basin storage query");
+    return basinStorageAtLevel(source.geometry, source.columns, source.rows,
+        [&source](std::uint64_t cell) { return source.elevations_m[std::size_t(cell)]; },
+        hierarchy, basin_index, water_level_m, max_visited_cells, cancel_requested);
 }
 
 } // namespace Aowis::Hydrology

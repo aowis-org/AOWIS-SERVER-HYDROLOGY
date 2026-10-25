@@ -248,6 +248,65 @@ WatershedBoundary polygonizeCatchment(const ElevationGrid &grid,
     return boundary;
 }
 
+namespace
+{
+void validateWindow(const DrainageWindow &window, const char *message)
+{
+    if (!std::isfinite(window.west) || !std::isfinite(window.east) ||
+        !std::isfinite(window.south) || !std::isfinite(window.north) ||
+        window.west < -180.0 || window.east > 180.0 ||
+        window.south < -90.0 || window.north > 90.0 ||
+        window.west >= window.east || window.south >= window.north)
+        throw std::invalid_argument(message);
+}
+
+bool insideAnyPolygon(const std::vector<GeographicPolygon> &polygons,
+                      const MapCoordinate &coordinate)
+{
+    for (const GeographicPolygon &polygon : polygons)
+    {
+        if (!contains(polygon.exterior, coordinate.x, coordinate.y)) continue;
+        bool in_hole = false;
+        for (const GeographicRing &hole : polygon.holes)
+            if (contains(hole, coordinate.x, coordinate.y)) { in_hole = true; break; }
+        if (!in_hole) return true;
+    }
+    return false;
+}
+}
+
+ChannelNetwork extractWindowChannelNetwork(
+    const RasterGeometry &geometry, std::uint32_t columns, std::uint32_t rows,
+    const DownstreamReader &downstream, const UpstreamAreaReader &upstream_area,
+    double minimum_upstream_area_m2, const DrainageWindow &window,
+    std::uint64_t maximum_selected_channel_cells, std::uint32_t maximum_segments)
+{
+    validateRasterGeometry(geometry, columns, rows);
+    if (!downstream || !upstream_area)
+        throw std::invalid_argument("Invalid drainage network spatial window");
+    validateWindow(window, "Invalid drainage network spatial window");
+    if (!std::isfinite(minimum_upstream_area_m2) || minimum_upstream_area_m2 <= 0.0 ||
+        maximum_selected_channel_cells == 0 || maximum_segments == 0)
+        throw std::invalid_argument("Invalid channel-network extraction limits");
+    const std::uint64_t count = std::uint64_t(columns) * rows;
+    std::vector<std::uint64_t> cells;
+    std::vector<double> areas;
+    for (std::uint64_t cell = 0; cell < count; ++cell)
+    {
+        const double area = upstream_area(cell);
+        if (!(area >= minimum_upstream_area_m2)) continue;
+        const MapCoordinate coordinate = pixelCentreWgs84(geometry,
+            std::uint32_t(cell % columns), std::uint32_t(cell / columns));
+        if (!windowContains(window, coordinate)) continue;
+        if (cells.size() >= maximum_selected_channel_cells)
+            throw std::invalid_argument("Too many selected channel cells; raise the accumulation threshold");
+        cells.push_back(cell);
+        areas.push_back(area);
+    }
+    return channelNetworkFromCells(geometry, columns, rows, cells, areas, downstream,
+                                   minimum_upstream_area_m2, maximum_segments);
+}
+
 ChannelNetwork extractWindowChannelNetwork(
     const AnalysisResult &result, double minimum_upstream_area_m2,
     const DrainageWindow &window, std::uint64_t maximum_selected_channel_cells,
@@ -255,48 +314,32 @@ ChannelNetwork extractWindowChannelNetwork(
 {
     validateRasterGeometry(result.source.geometry, result.source.columns, result.source.rows);
     const std::uint64_t count = std::uint64_t(result.source.columns) * result.source.rows;
-    if (result.downstream.size() != count || result.upstream_area_m2.size() != count ||
-        !std::isfinite(window.west) || !std::isfinite(window.east) ||
-        !std::isfinite(window.south) || !std::isfinite(window.north) ||
-        window.west < -180.0 || window.east > 180.0 ||
-        window.south < -90.0 || window.north > 90.0 ||
-        window.west >= window.east || window.south >= window.north)
+    if (result.downstream.size() != count || result.upstream_area_m2.size() != count)
         throw std::invalid_argument("Invalid drainage network spatial window");
-    AnalysisResult clipped;
-    clipped.source = result.source;
-    clipped.downstream = result.downstream;
-    clipped.upstream_area_m2.assign(std::size_t(count), 0.0);
-    for (std::uint64_t cell = 0; cell < count; ++cell)
-    {
-        if (result.upstream_area_m2[std::size_t(cell)] < minimum_upstream_area_m2)
-            continue;
-        const MapCoordinate coordinate = pixelCentreWgs84(result.source.geometry,
-            std::uint32_t(cell % result.source.columns),
-            std::uint32_t(cell / result.source.columns));
-        if (windowContains(window, coordinate))
-            clipped.upstream_area_m2[std::size_t(cell)] = result.upstream_area_m2[std::size_t(cell)];
-    }
-    return extractChannelNetwork(clipped, minimum_upstream_area_m2,
-        maximum_selected_channel_cells, maximum_segments);
+    return extractWindowChannelNetwork(result.source.geometry, result.source.columns,
+        result.source.rows,
+        [&result](std::uint64_t i) { return result.downstream[std::size_t(i)]; },
+        [&result](std::uint64_t i) { return result.upstream_area_m2[std::size_t(i)]; },
+        minimum_upstream_area_m2, window, maximum_selected_channel_cells, maximum_segments);
 }
 
 PolygonDrainageResult downstreamNetworkFromPolygon(
-    const AnalysisResult &result, const std::vector<GeographicPolygon> &polygons,
+    const RasterGeometry &geometry, std::uint32_t columns, std::uint32_t rows,
+    const DownstreamReader &downstream, const UpstreamAreaReader &upstream_area,
+    const std::vector<GeographicPolygon> &polygons,
     double minimum_upstream_area_m2, const DrainageWindow &window,
     std::uint64_t maximum_source_cells, std::uint64_t maximum_affected_cells,
     std::uint64_t maximum_selected_channel_cells, std::uint32_t maximum_segments)
 {
-    validateRasterGeometry(result.source.geometry, result.source.columns, result.source.rows);
-    const std::uint64_t count = std::uint64_t(result.source.columns) * result.source.rows;
-    if (result.downstream.size() != count || result.upstream_area_m2.size() != count ||
+    validateRasterGeometry(geometry, columns, rows);
+    const std::uint64_t count = std::uint64_t(columns) * rows;
+    if (!downstream || !upstream_area ||
         polygons.empty() || polygons.size() > 32 ||
         !std::isfinite(minimum_upstream_area_m2) || minimum_upstream_area_m2 <= 0.0 ||
-        !std::isfinite(window.west) || !std::isfinite(window.east) ||
-        !std::isfinite(window.south) || !std::isfinite(window.north) ||
-        window.west < -180 || window.east > 180 || window.south < -90 ||
-        window.north > 90 || window.west >= window.east || window.south >= window.north ||
         maximum_source_cells == 0 || maximum_affected_cells == 0)
         throw std::invalid_argument("Invalid downstream polygon query parameters");
+    validateWindow(window, "Invalid downstream polygon query parameters");
+    double west = 180.0, east = -180.0, south = 90.0, north = -90.0;
     for (const GeographicPolygon &polygon : polygons)
     {
         if (polygon.exterior.size() < 4 || polygon.exterior.size() > 2048 ||
@@ -318,87 +361,130 @@ PolygonDrainageResult downstreamNetworkFromPolygon(
                     point.x < -180.0 || point.x > 180.0 || point.y < -90.0 || point.y > 90.0)
                     throw std::invalid_argument("Invalid WGS84 polygon vertex");
         }
+        for (const MapCoordinate &point : polygon.exterior)
+        {
+            west = std::min(west, point.x);
+            east = std::max(east, point.x);
+            south = std::min(south, point.y);
+            north = std::max(north, point.y);
+        }
+    }
+    // Cell centres inside a polygon lie inside its exterior bounding box. For
+    // geographic grids that box maps directly to a pixel range, so only those
+    // cells are tested and read; projected grids scan every cell.
+    std::uint32_t x0 = 0, x1 = columns, y0 = 0, y1 = rows;
+    if (geometry.horizontal_crs == HorizontalCrs::Wgs84Geographic)
+    {
+        const auto clampIndex = [](double value, std::uint32_t limit)
+        {
+            return std::uint32_t(std::clamp(value, 0.0, double(limit)));
+        };
+        x0 = clampIndex(std::floor((west - geometry.origin_x) / geometry.pixel_width - 0.5) - 1.0, columns);
+        x1 = clampIndex(std::ceil((east - geometry.origin_x) / geometry.pixel_width - 0.5) + 2.0, columns);
+        y0 = clampIndex(std::floor((geometry.origin_y - north) / geometry.pixel_height - 0.5) - 1.0, rows);
+        y1 = clampIndex(std::ceil((geometry.origin_y - south) / geometry.pixel_height - 0.5) + 2.0, rows);
     }
     PolygonDrainageResult output;
-    std::vector<std::uint8_t> selected(std::size_t(count), 0);
-    std::vector<std::uint8_t> affected(std::size_t(count), 0);
-    std::vector<std::uint32_t> walk_generation(std::size_t(count), 0);
-    std::vector<std::uint64_t> path;
-    std::uint32_t generation = 0;
-    for (std::uint64_t cell = 0; cell < count; ++cell)
-    {
-        if (result.upstream_area_m2[std::size_t(cell)] <= 0.0) continue;
-        const MapCoordinate coordinate = pixelCentreWgs84(result.source.geometry,
-            std::uint32_t(cell % result.source.columns),
-            std::uint32_t(cell / result.source.columns));
-        bool included = false;
-        for (const GeographicPolygon &polygon : polygons)
+    std::vector<std::uint64_t> sources;
+    for (std::uint32_t y = y0; y < y1; ++y)
+        for (std::uint32_t x = x0; x < x1; ++x)
         {
-            if (!contains(polygon.exterior, coordinate.x, coordinate.y)) continue;
-            bool in_hole = false;
-            for (const GeographicRing &hole : polygon.holes)
-                if (contains(hole, coordinate.x, coordinate.y)) { in_hole = true; break; }
-            if (!in_hole) { included = true; break; }
+            const std::uint64_t cell = std::uint64_t(y) * columns + x;
+            if (upstream_area(cell) <= 0.0) continue;
+            if (!insideAnyPolygon(polygons, pixelCentreWgs84(geometry, x, y))) continue;
+            sources.push_back(cell);
+            if (++output.source_cells > maximum_source_cells)
+                throw std::invalid_argument("Too many rainfall source cells in polygon query");
         }
-        if (!included) continue;
-        selected[std::size_t(cell)] = 1;
-        if (++output.source_cells > maximum_source_cells)
-            throw std::invalid_argument("Too many rainfall source cells in polygon query");
-    }
     if (output.source_cells == 0)
         throw std::invalid_argument("Polygon contains no valid analysis cell centres");
-    for (std::uint64_t source = 0; source < count; ++source)
+    // Sources are ascending (row-major scan), exactly the order of a full scan.
+    std::unordered_map<std::uint64_t, std::uint8_t> affected;
+    std::unordered_map<std::uint64_t, std::uint32_t> walk_generation;
+    std::vector<std::uint64_t> path;
+    std::uint32_t generation = 0;
+    for (const std::uint64_t source : sources)
     {
-        if (!selected[std::size_t(source)] || affected[std::size_t(source)]) continue;
+        if (affected.count(source)) continue;
         if (++generation == 0)
             throw std::runtime_error("Too many polygon trace traversals");
         path.clear();
         std::uint64_t current = source;
-        while (!affected[std::size_t(current)])
+        while (!affected.count(current))
         {
-            if (walk_generation[std::size_t(current)] == generation)
+            const std::unordered_map<std::uint64_t, std::uint32_t>::iterator seen =
+                walk_generation.find(current);
+            if (seen != walk_generation.end() && seen->second == generation)
                 throw std::runtime_error("Flow graph has a cycle");
-            walk_generation[std::size_t(current)] = generation;
+            walk_generation[current] = generation;
             path.push_back(current);
             if (output.downstream_affected_cells + path.size() > maximum_affected_cells)
                 throw std::invalid_argument("Too many downstream affected cells for polygon query");
-            const std::int64_t next = result.downstream[std::size_t(current)];
+            const std::int64_t next = downstream(current);
             if (next == -1) break;
             if (next < 0 || std::uint64_t(next) >= count ||
-                std::abs(std::int64_t(current % result.source.columns) -
-                    (next % result.source.columns)) > 1 ||
-                std::abs(std::int64_t(current / result.source.columns) -
-                    (next / result.source.columns)) > 1 || next == std::int64_t(current))
+                std::abs(std::int64_t(current % columns) - (next % columns)) > 1 ||
+                std::abs(std::int64_t(current / columns) - (next / columns)) > 1 ||
+                next == std::int64_t(current))
                 throw std::runtime_error("Invalid downstream link in polygon query");
             current = std::uint64_t(next);
         }
-        for (std::uint64_t cell : path)
+        for (const std::uint64_t cell : path)
         {
-            affected[std::size_t(cell)] = 1;
+            affected.emplace(cell, 1);
             ++output.downstream_affected_cells;
-            if (touchesBoundary(cell, result.source.columns, result.source.rows))
+            if (touchesBoundary(cell, columns, rows))
                 ++output.affected_boundary_cells;
         }
     }
-    // Build a locally selected channel network using true FULL-DOMAIN
-    // upstream areas, but only links within the affected/visible subset.
-    AnalysisResult local;
-    local.source = result.source;
-    local.downstream = result.downstream;
-    local.upstream_area_m2.assign(std::size_t(count), 0.0);
-    for (std::uint64_t cell = 0; cell < count; ++cell)
+    // Locally selected channel network using true FULL-DOMAIN upstream areas,
+    // but only links within the affected/visible subset.
+    std::vector<std::uint64_t> ordered;
+    ordered.reserve(affected.size());
+    for (const std::pair<const std::uint64_t, std::uint8_t> &entry : affected)
+        ordered.push_back(entry.first);
+    std::sort(ordered.begin(), ordered.end());
+    if (maximum_selected_channel_cells == 0 || maximum_segments == 0)
+        throw std::invalid_argument("Invalid channel-network extraction limits");
+    std::vector<std::uint64_t> cells;
+    std::vector<double> areas;
+    for (const std::uint64_t cell : ordered)
     {
-        if (!affected[std::size_t(cell)]) continue;
-        const MapCoordinate coordinate = pixelCentreWgs84(result.source.geometry,
-            std::uint32_t(cell % result.source.columns),
-            std::uint32_t(cell / result.source.columns));
-        if (windowContains(window, coordinate))
-            local.upstream_area_m2[std::size_t(cell)] = result.upstream_area_m2[std::size_t(cell)];
-        else output.clipped_to_window = true;
+        const MapCoordinate coordinate = pixelCentreWgs84(geometry,
+            std::uint32_t(cell % columns), std::uint32_t(cell / columns));
+        if (!windowContains(window, coordinate))
+        {
+            output.clipped_to_window = true;
+            continue;
+        }
+        const double area = upstream_area(cell);
+        if (!(area >= minimum_upstream_area_m2)) continue;
+        if (cells.size() >= maximum_selected_channel_cells)
+            throw std::invalid_argument("Too many selected channel cells; raise the accumulation threshold");
+        cells.push_back(cell);
+        areas.push_back(area);
     }
-    output.network = extractChannelNetwork(local, minimum_upstream_area_m2,
-        maximum_selected_channel_cells, maximum_segments);
+    output.network = channelNetworkFromCells(geometry, columns, rows, cells, areas,
+        downstream, minimum_upstream_area_m2, maximum_segments);
     return output;
+}
+
+PolygonDrainageResult downstreamNetworkFromPolygon(
+    const AnalysisResult &result, const std::vector<GeographicPolygon> &polygons,
+    double minimum_upstream_area_m2, const DrainageWindow &window,
+    std::uint64_t maximum_source_cells, std::uint64_t maximum_affected_cells,
+    std::uint64_t maximum_selected_channel_cells, std::uint32_t maximum_segments)
+{
+    validateRasterGeometry(result.source.geometry, result.source.columns, result.source.rows);
+    const std::uint64_t count = std::uint64_t(result.source.columns) * result.source.rows;
+    if (result.downstream.size() != count || result.upstream_area_m2.size() != count)
+        throw std::invalid_argument("Invalid downstream polygon query parameters");
+    return downstreamNetworkFromPolygon(result.source.geometry, result.source.columns,
+        result.source.rows,
+        [&result](std::uint64_t i) { return result.downstream[std::size_t(i)]; },
+        [&result](std::uint64_t i) { return result.upstream_area_m2[std::size_t(i)]; },
+        polygons, minimum_upstream_area_m2, window, maximum_source_cells,
+        maximum_affected_cells, maximum_selected_channel_cells, maximum_segments);
 }
 
 } // namespace Aowis::Hydrology

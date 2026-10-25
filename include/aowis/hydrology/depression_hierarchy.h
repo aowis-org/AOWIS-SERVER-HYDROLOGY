@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <vector>
 
@@ -76,6 +77,18 @@ struct BasinStorageState
 // rainfall or shallow-water solver. max_visited_cells bounds query memory/time.
 BasinStorageState basinStorageAtLevel(
     const ElevationGrid &source, const DepressionHierarchy &hierarchy,
+    std::uint64_t basin_index, double water_level_m,
+    std::uint64_t max_visited_cells = 2000000,
+    const std::atomic<bool> *cancel_requested = nullptr);
+
+// Same query against a persisted original-DEM raster through a random-access
+// elevation reader: only the basin's cells and their neighbours are read,
+// and the visited set is a bit per grid cell instead of the full float DEM.
+// Results are identical to the overload above.
+BasinStorageState basinStorageAtLevel(
+    const RasterGeometry &geometry, std::uint32_t columns, std::uint32_t rows,
+    const std::function<float(std::uint64_t)> &elevation,
+    const DepressionHierarchy &hierarchy,
     std::uint64_t basin_index, double water_level_m,
     std::uint64_t max_visited_cells = 2000000,
     const std::atomic<bool> *cancel_requested = nullptr);
