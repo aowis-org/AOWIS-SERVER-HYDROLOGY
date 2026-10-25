@@ -962,46 +962,75 @@ QSharedPointer<AnalysisService::Job> AnalysisService::completedJob(const QString
 std::shared_ptr<const CachedBasinHierarchy> AnalysisService::cachedHierarchy(
     const QSharedPointer<Job> &job) const
 {
+    std::shared_future<std::shared_ptr<const CachedBasinHierarchy>> pending;
+    std::shared_ptr<std::promise<std::shared_ptr<const CachedBasinHierarchy>>> producer;
     {
         QMutexLocker locker(&this->hierarchy_cache_mutex);
-        const std::shared_ptr<const CachedBasinHierarchy> cached =
-            this->hierarchy_cache.value(job->id);
+        const auto cached = this->hierarchy_cache.value(job->id);
         if (cached)
         {
             this->hierarchy_cache_order.removeOne(job->id);
             this->hierarchy_cache_order.enqueue(job->id);
             return cached;
         }
-    }
-    // Decoding plus one UUIDv5 per basin is the expensive part; done once per
-    // analysis while the entry stays cached. Completed analyses are immutable.
-    std::shared_ptr<CachedBasinHierarchy> loaded = std::make_shared<CachedBasinHierarchy>();
-    {
-        const HeavyQuerySlot slot(this->heavy_query_slots, nullptr);
-        if (!slot.acquired()) throw std::runtime_error(HeavyQueryBusy.toStdString());
-        loaded->hierarchy = loadHierarchy(jobDirectory(job->id), job->grid.columns, job->grid.rows);
-        loaded->index_by_uuid.reserve(qsizetype(loaded->hierarchy.basins.size()));
-        for (const DepressionBasin &basin : loaded->hierarchy.basins)
-            loaded->index_by_uuid.insert(basinUuid(job->id, basin.index), basin.index);
-    }
-    const std::uint64_t size = std::max<std::uint64_t>(1, loaded->hierarchy.basins.size());
-    QMutexLocker locker(&this->hierarchy_cache_mutex);
-    if (size <= this->config.hierarchy_cache_basins && !this->hierarchy_cache.contains(job->id))
-    {
-        while (this->hierarchy_cache_size + size > this->config.hierarchy_cache_basins &&
-               !this->hierarchy_cache_order.isEmpty())
+        const auto existing = this->hierarchy_inflight.constFind(job->id);
+        if (existing != this->hierarchy_inflight.cend())
+            pending = existing.value();
+        else
         {
-            const QString evicted = this->hierarchy_cache_order.dequeue();
-            const std::shared_ptr<const CachedBasinHierarchy> old =
-                this->hierarchy_cache.take(evicted);
-            if (old)
-                this->hierarchy_cache_size -= std::max<std::uint64_t>(1, old->hierarchy.basins.size());
+            producer = std::make_shared<
+                std::promise<std::shared_ptr<const CachedBasinHierarchy>>>();
+            pending = producer->get_future().share();
+            this->hierarchy_inflight.insert(job->id, pending);
         }
-        this->hierarchy_cache.insert(job->id, loaded);
-        this->hierarchy_cache_order.enqueue(job->id);
-        this->hierarchy_cache_size += size;
     }
-    return loaded;
+    // Cache misses are single-flight per immutable job. Waiting for the same
+    // decode consumes neither a heavy-query slot nor another large allocation.
+    if (!producer) return pending.get();
+    try
+    {
+        auto loaded = std::make_shared<CachedBasinHierarchy>();
+        {
+            const HeavyQuerySlot slot(this->heavy_query_slots, nullptr);
+            if (!slot.acquired()) throw std::runtime_error(HeavyQueryBusy.toStdString());
+            loaded->hierarchy = loadHierarchy(jobDirectory(job->id),
+                                              job->grid.columns, job->grid.rows);
+            loaded->index_by_uuid.reserve(qsizetype(loaded->hierarchy.basins.size()));
+            for (const DepressionBasin &basin : loaded->hierarchy.basins)
+                loaded->index_by_uuid.insert(basinUuid(job->id, basin.index), basin.index);
+        }
+        const std::uint64_t size = std::max<std::uint64_t>(1, loaded->hierarchy.basins.size());
+        {
+            QMutexLocker locker(&this->hierarchy_cache_mutex);
+            if (size <= this->config.hierarchy_cache_basins)
+            {
+                while (this->hierarchy_cache_size + size > this->config.hierarchy_cache_basins &&
+                       !this->hierarchy_cache_order.isEmpty())
+                {
+                    const QString evicted = this->hierarchy_cache_order.dequeue();
+                    const auto old = this->hierarchy_cache.take(evicted);
+                    if (old)
+                        this->hierarchy_cache_size -=
+                            std::max<std::uint64_t>(1, old->hierarchy.basins.size());
+                }
+                this->hierarchy_cache.insert(job->id, loaded);
+                this->hierarchy_cache_order.enqueue(job->id);
+                this->hierarchy_cache_size += size;
+            }
+            // Publish while holding the cache mutex so no new caller can
+            // miss both the completed entry and the in-flight operation.
+            producer->set_value(loaded);
+            this->hierarchy_inflight.remove(job->id);
+        }
+        return loaded;
+    }
+    catch (...)
+    {
+        QMutexLocker locker(&this->hierarchy_cache_mutex);
+        producer->set_exception(std::current_exception());
+        this->hierarchy_inflight.remove(job->id);
+        throw;
+    }
 }
 
 void AnalysisService::verifyRestoredArtifacts()
@@ -1631,7 +1660,14 @@ bool AnalysisService::cancel(const QString &id)
                  item->state != QStringLiteral("canceled"))
             item->cancelled.store(true);
     }
-    if (persist) writeManifest(item);
+    if (persist)
+    {
+        writeManifest(item);
+        // Removing a blocked FIFO queue head can make the next queued job
+        // eligible even while all currently running jobs are still active.
+        // Schedule outside jobs_mutex to avoid recursively taking that lock.
+        scheduleTerrainJobs();
+    }
     return true;
 }
 

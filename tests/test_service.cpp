@@ -228,6 +228,75 @@ int main(int argc, char **argv)
         assert(error.contains(QStringLiteral("active terrain cell budget")));
         assert(rejected.terrainJobCapacity().value(QStringLiteral("outstanding")).toInt() == 0);
     }
+    // Canceling a budget-blocked FIFO head must immediately schedule the
+    // next eligible queued job, without waiting for the running job to end.
+    {
+        QTemporaryDir head_directory;
+        assert(head_directory.isValid());
+        ServiceConfig head = configuration;
+        head.output_directory = head_directory.path();
+        head.max_concurrent_analyses = 2;
+        head.max_outstanding_analyses = 3;
+        head.max_active_terrain_cells = 1200; // first=912; small tail fits
+        std::mutex gate_mutex;
+        std::condition_variable gate;
+        bool running_started = false;
+        bool release_running = false;
+        bool tail_started = false;
+        const TerrainReader base_reader = configuration.terrain_reader;
+        head.terrain_reader = [&](const ElevationGrid &grid, const QString &dataset,
+                                  const std::atomic<bool> &cancelled)
+        {
+            if (grid.columns == 24 && grid.rows == 38)
+            {
+                std::unique_lock<std::mutex> hold(gate_mutex);
+                running_started = true;
+                gate.notify_all();
+                if (!gate.wait_for(hold, std::chrono::seconds(5),
+                                   [&] { return release_running; }))
+                    throw std::runtime_error("Terrain cancellation scheduling test timed out");
+            }
+            else
+            {
+                std::lock_guard<std::mutex> hold(gate_mutex);
+                tail_started = true;
+                gate.notify_all();
+            }
+            return base_reader(grid, dataset, cancelled);
+        };
+        AnalysisService service(head);
+        QString error;
+        assert(service.initialize(&error));
+        assert(service.waitForArtifactVerification(30000));
+        const QString running = service.submit(smallRequest(), &error);
+        assert(!running.isEmpty());
+        {
+            std::unique_lock<std::mutex> hold(gate_mutex);
+            assert(gate.wait_for(hold, std::chrono::seconds(5),
+                                 [&] { return running_started; }));
+        }
+        const QString blocked = service.submit(smallRequest(), &error);
+        assert(!blocked.isEmpty());
+        AnalysisRequest smaller = smallRequest();
+        smaller.resolution_m = 60.0;
+        const QString tail = service.submit(smaller, &error);
+        assert(!tail.isEmpty());
+        assert(service.job(blocked).value(QStringLiteral("state")) == QStringLiteral("queued"));
+        assert(service.job(tail).value(QStringLiteral("state")) == QStringLiteral("queued"));
+        assert(service.cancel(blocked));
+        bool started_before_release = false;
+        {
+            std::unique_lock<std::mutex> hold(gate_mutex);
+            started_before_release = gate.wait_for(hold, std::chrono::seconds(3),
+                                                   [&] { return tail_started; });
+            release_running = true;
+        }
+        gate.notify_all();
+        assert(started_before_release);
+        waitForState(service, blocked, QStringLiteral("canceled"));
+        waitForState(service, tail, QStringLiteral("completed"));
+        waitForState(service, running, QStringLiteral("completed"));
+    }
     {
         QTemporaryDir concurrent_directory;
         assert(concurrent_directory.isValid());
@@ -526,6 +595,10 @@ int main(int argc, char **argv)
         const QByteArray async_mask = service.catchmentTaskMask(
             successful_id, catchment_task_id, &error);
         assert(error.isEmpty() && async_mask == mask);
+        auto mask_file = service.catchmentTaskMaskFile(successful_id, catchment_task_id, &error);
+        assert(error.isEmpty() && mask_file && mask_file->size() == mask.size());
+        assert(mask_file->readAll() == mask);
+        assert(mask_file->seek(0));
         assert(service.cancelCatchmentTask(successful_id, catchment_task_id, &error));
         assert(service.catchmentTask(successful_id, catchment_task_id, &error)
             .value(QStringLiteral("state")) == QStringLiteral("completed"));
@@ -554,6 +627,11 @@ int main(int argc, char **argv)
         }
         assert(service.catchmentTask(successful_id, catchment_task_id, &error).isEmpty());
         assert(error.startsWith(QStringLiteral("Unknown")));
+#if defined(Q_OS_UNIX)
+        // Evicting the task unlinks its spool path, but an HTTP request that
+        // opened the descriptor earlier must still be able to finish reading.
+        assert(mask_file->seek(0) && mask_file->readAll() == mask);
+#endif
         const QJsonObject watershed = service.watershedBoundary(
             successful_id, columns - 1, rows - 1, &error);
         assert(error.isEmpty());
@@ -910,6 +988,30 @@ int main(int argc, char **argv)
         assert(!basin_job_id.isEmpty() && error.isEmpty());
         waitForState(service, basin_job_id, QStringLiteral("completed"));
         assert(service.job(basin_job_id).value(QStringLiteral("basin_count")).toInt() == 1);
+        // Simultaneous cold basin lookups for one analysis share a single
+        // hierarchy load, rather than competing for heavy-query slots.
+        {
+            constexpr int callers = 8;
+            std::atomic<int> ready {0};
+            std::atomic<bool> begin {false};
+            std::atomic<int> succeeded {0};
+            std::vector<std::thread> requests;
+            for (int i = 0; i < callers; ++i)
+                requests.emplace_back([&]()
+                {
+                    ready.fetch_add(1);
+                    while (!begin.load()) std::this_thread::yield();
+                    QString local_error;
+                    const QJsonObject value = service.basins(basin_job_id, 0, 1,
+                                                              &local_error);
+                    if (local_error.isEmpty() && value.contains(QStringLiteral("basins")))
+                        succeeded.fetch_add(1);
+                });
+            while (ready.load() < callers) std::this_thread::yield();
+            begin.store(true);
+            for (auto &request : requests) request.join();
+            assert(succeeded.load() == callers);
+        }
         const QJsonObject listing = service.basins(basin_job_id, 0, 1, &error);
         assert(error.isEmpty() && listing.value(QStringLiteral("total_basins")).toInt() == 1);
         assert(listing.value(QStringLiteral("basins")).toArray().size() == 1);

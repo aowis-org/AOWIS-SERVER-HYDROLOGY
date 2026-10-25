@@ -194,6 +194,20 @@ if(AOWIS_HYDROLOGY_BUILD_SERVER)
     target_include_directories(aowis-server-hydrology PRIVATE
         "${AOWIS_HYDROLOGY_HTTPLIB_SOURCE}")
     if(BUILD_TESTING)
+        # Exercise cpp-httplib's real content-provider path with a binary mask
+        # larger than the bounded read chunk and Unix unlink-after-open.
+        add_executable(aowis-hydrology-http-file-stream-test
+            tests/test_http_file_stream.cpp
+            src/server/http_adapter.h)
+        target_compile_features(aowis-hydrology-http-file-stream-test PRIVATE cxx_std_20)
+        target_include_directories(aowis-hydrology-http-file-stream-test PRIVATE
+            "${AOWIS_HYDROLOGY_HTTPLIB_SOURCE}")
+        target_link_libraries(aowis-hydrology-http-file-stream-test PRIVATE
+            Qt6::Core Threads::Threads)
+        add_test(NAME aowis-hydrology-http-file-stream
+            COMMAND aowis-hydrology-http-file-stream-test)
+        set_tests_properties(aowis-hydrology-http-file-stream PROPERTIES
+            LABELS "hydrology;aowis;http-contract")
         find_package(Python3 QUIET COMPONENTS Interpreter)
         if(Python3_Interpreter_FOUND)
             add_test(NAME aowis-hydrology-server-config-cli

@@ -6,6 +6,11 @@
 #include <httplib.h>
 #include "http_status.h"
 #include <QByteArray>
+#include <QFile>
+#include <QMutex>
+#include <QMutexLocker>
+#include <algorithm>
+#include <limits>
 #include <QString>
 #include <QUrl>
 #include <functional>
@@ -38,9 +43,31 @@ public:
     HttpResponse(QByteArray mime, QByteArray body,
                  StatusCode status = StatusCode::Ok)
         : mime(std::move(mime)), data(std::move(body)), status(int(status)) {}
+    HttpResponse(QByteArray mime, std::shared_ptr<QFile> source,
+                 StatusCode status = StatusCode::Ok)
+        : mime(std::move(mime)), file(std::move(source)), status(int(status)) {}
     void write(httplib::Response &output) const {
         output.status = status;
-        if (data.size() > 64 * 1024) {
+        if (file) {
+            // File is already opened under the service's task-eviction lock.
+            // The content provider owns it until the response is finished;
+            // its only allocation is one <=64 KiB read at a time.
+            auto source = file;
+            auto read_lock = std::make_shared<QMutex>();
+            const qint64 total = source->size();
+            output.set_content_provider(size_t(total), mime.toStdString(),
+                [source, read_lock, total](size_t offset, size_t length,
+                                           httplib::DataSink &sink) {
+                    if (offset > size_t(total) || length > size_t(total) - offset)
+                        return false;
+                    QMutexLocker guard(read_lock.get());
+                    if (!source->seek(qint64(offset))) return false;
+                    const qsizetype chunk_size = qsizetype(std::min<size_t>(length, 64 * 1024));
+                    const QByteArray chunk = source->read(chunk_size);
+                    return chunk.size() == chunk_size &&
+                        sink.write(chunk.constData(), size_t(chunk.size()));
+                });
+        } else if (data.size() > 64 * 1024) {
             // Stream bounded binary products without duplicating the full
             // QByteArray in an additional std::string response buffer.
             auto payload = std::make_shared<QByteArray>(data);
@@ -58,6 +85,7 @@ public:
 private:
     QByteArray mime;
     QByteArray data;
+    std::shared_ptr<QFile> file;
     int status;
 };
 

@@ -200,3 +200,20 @@ The server enforces an overall 256 KiB inbound body limit; endpoint-specific
 smaller limits remain in effect. Large binary results use a streaming HTTP
 content provider; their *generation* can still require bounded raster buffers,
 which is addressed separately by the resource/large-raster improvements.
+
+### Large catchment results and concurrent hierarchy queries
+
+Completed asynchronous catchment masks are kept in the service's transient
+spool. The HTTP `GET /v1/jobs/{id}/catchment-tasks/{task-id}/mask` route
+opens the result under the task-eviction lock and streams its bytes in chunks
+of at most 64 KiB. It does not materialize a full mask in an HTTP-worker
+`QByteArray`. The existing `AnalysisService::catchmentTaskMask` method still
+returns an in-memory `QByteArray` for embedded callers; integrations that
+need bounded-memory reads can use `catchmentTaskMaskFile` instead. A running
+HTTP download retains its open file descriptor if terminal-task metadata is
+evicted (standard Unix unlink semantics).
+
+Concurrent basin-detail/list requests for the same uncached analysis share
+a single hierarchy decode and UUID-index build. Other analysis IDs remain
+subject to the configured heavy-query admission limit; the hierarchy cache
+retains its existing basin-count-based capacity and eviction policy.

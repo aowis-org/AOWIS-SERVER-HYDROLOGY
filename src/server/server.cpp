@@ -806,10 +806,10 @@ void Server::setupRoutes()
                      [this](const QString &id, const QString &task_id)
     {
         QString error;
-        const QByteArray mask = this->service.catchmentTaskMask(id, task_id, &error);
-        if (!error.isEmpty())
+        const auto source = this->service.catchmentTaskMaskFile(id, task_id, &error);
+        if (!source)
             return errorResponse(error, statusForError(error, Status::InternalServerError));
-        return HttpResponse(QByteArrayLiteral("application/vnd.aowis.catchment-u8"), mask);
+        return HttpResponse(QByteArrayLiteral("application/vnd.aowis.catchment-u8"), source);
     });
 
     this->http.route("/v1/jobs/<arg>/catchment-tasks/<arg>",

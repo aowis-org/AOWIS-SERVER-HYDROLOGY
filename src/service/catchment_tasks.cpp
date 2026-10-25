@@ -187,13 +187,13 @@ QJsonObject AnalysisService::catchmentTask(const QString &id,
     return catchmentTaskJson(task);
 }
 
-QByteArray AnalysisService::catchmentTaskMask(const QString &id,
+std::shared_ptr<QFile> AnalysisService::catchmentTaskMaskFile(const QString &id,
     const QString &task_id, QString *error) const
 {
     if (error) error->clear();
-    // Open under the mutex (task eviction removes spool files under it); an
-    // open descriptor stays valid after unlink, so the up to grid-sized read
-    // happens without blocking status polls and the catchment worker.
+    // Eviction can unlink a spool file; acquire an open descriptor while
+    // holding the task lock. Once opened, it remains readable after unlink
+    // on supported Unix filesystems, even if the task metadata is evicted.
     QMutexLocker lock(&this->catchment_tasks_mutex);
     const auto task = this->catchment_tasks.value(task_id);
     if (!task || task->analysis_id != id)
@@ -206,15 +206,24 @@ QByteArray AnalysisService::catchmentTaskMask(const QString &id,
         if (error) *error = QStringLiteral("Catchment result not ready");
         return {};
     }
-    QFile file(task->mask_path);
-    if (!file.open(QIODevice::ReadOnly))
+    auto file = std::make_shared<QFile>(task->mask_path);
+    if (!file->open(QIODevice::ReadOnly) || file->size() <= 0)
     {
         if (error) *error = QStringLiteral("Catchment result unavailable");
         return {};
     }
-    lock.unlock();
-    const QByteArray mask = file.readAll();
-    if (mask.size() != file.size())
+    return file;
+}
+
+QByteArray AnalysisService::catchmentTaskMask(const QString &id,
+    const QString &task_id, QString *error) const
+{
+    const auto file = catchmentTaskMaskFile(id, task_id, error);
+    if (!file) return {};
+    // Retain the established in-process API. HTTP uses the file handle above
+    // and never needs to materialize the whole mask in a QByteArray.
+    const QByteArray mask = file->readAll();
+    if (mask.size() != file->size())
     {
         if (error) *error = QStringLiteral("Catchment result unavailable");
         return {};

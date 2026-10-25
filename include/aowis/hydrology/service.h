@@ -8,6 +8,7 @@
 #include <aowis/hydrology/terrain_source.h>
 
 #include <QByteArray>
+#include <QFile>
 #include <QHash>
 #include <QJsonArray>
 #include <QJsonObject>
@@ -24,6 +25,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <future>
 
 namespace Aowis::Hydrology
 {
@@ -124,6 +126,10 @@ public:
                               QString *error) const;
     QByteArray catchmentTaskMask(const QString &id, const QString &task_id,
                                  QString *error) const;
+    // Open the immutable spool under its eviction lock. Streaming callers
+    // retain the file descriptor across task eviction without holding the lock.
+    std::shared_ptr<QFile> catchmentTaskMaskFile(const QString &id,
+        const QString &task_id, QString *error) const;
     bool cancelCatchmentTask(const QString &id, const QString &task_id,
                              QString *error);
 
@@ -320,6 +326,10 @@ private:
     mutable QSemaphore heavy_query_slots {0}; // released to the configured count in initialize()
     mutable QMutex hierarchy_cache_mutex;
     mutable QHash<QString, std::shared_ptr<const CachedBasinHierarchy>> hierarchy_cache;
+    // Concurrent misses for the same analysis share a single decode and UUID
+    // index build, including propagation of the same failure to all waiters.
+    mutable QHash<QString, std::shared_future<std::shared_ptr<const CachedBasinHierarchy>>>
+        hierarchy_inflight;
     mutable QQueue<QString> hierarchy_cache_order; // least recently used first
     mutable std::uint64_t hierarchy_cache_size = 0;
     bool initialized = false;
