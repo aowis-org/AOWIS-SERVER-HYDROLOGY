@@ -37,8 +37,10 @@ ui_*.h
 *.qmlc
 *.jsc
 Makefile*
-*build-*
-build/
+# Build trees at the repository root only (build/, build-linux*, ...);
+# never hide source files whose names merely contain "build-".
+/build/
+/build-*/
 *.qm
 *.prl
 *.qmlls.ini
